@@ -1,12 +1,95 @@
 [package]
 name = "ninja"
-description = "ninja 宿主：p0 骨架，钉住 libghostty-vt 公开 C API 的静态链接"
+description = "ninja 宿主：p0 钉版骨架 + p1 单终端面（AppKit + Metal + PTY + vt）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "ninja"
+path = "src/main.rs"
+
 [dependencies]
 # 默认 features = vendored 静态链 libghostty-vt.a + kitty-graphics。
 # 宿主依赖树禁 wasmtime / 任何 JS 运行时（验收用 cargo tree 取证）。
 libghostty-vt.workspace = true
+libc = "0.2"
+
+# p1 终端面：AppKit 壳 + 自研 Metal cell atlas + CoreText 字形。
+# 只用 objc2 家族（同一 runtime），不引 winit/egui/GPUI，不碰 Ghostty 内部 API。
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSArray",
+    "NSAttributedString",
+    "NSDictionary",
+    "NSGeometry",
+    "NSRange",
+    "NSObject",
+    "NSRunLoop",
+    "NSTimer",
+    "NSDate",
+    "NSValue",
+    "NSObjCRuntime",
+    "block2",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "AppKitDefines",
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSResponder",
+    "NSEvent",
+    "NSPasteboard",
+    "NSMenu",
+    "NSMenuItem",
+    "NSTextInputClient",
+    "NSCursor",
+    "NSGraphics",
+] }
+objc2-quartz-core = { version = "0.3", features = [
+    "CALayer",
+    "CAMetalLayer",
+] }
+objc2-metal = { version = "0.3", features = [
+    "MTLDevice",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLRenderCommandEncoder",
+    "MTLRenderPipeline",
+    "MTLRenderPass",
+    "MTLVertexDescriptor",
+    "MTLTexture",
+    "MTLBuffer",
+    "MTLLibrary",
+    "MTLDrawable",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLSampler",
+    "MTLDefines",
+] }
+objc2-core-text = { version = "0.3", features = [
+    "CTFont",
+    "CTFontDescriptor",
+    "CTFontTraits",
+    "CTLine",
+    "CTStringAttributes",
+] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGContext",
+    "CGBitmapContext",
+    "CGColorSpace",
+    "CGImage",
+    "CGAffineTransform",
+] }
+objc2-core-foundation = { version = "0.3", features = [
+    "CFBase",
+    "CFRunLoop",
+    "CFString",
+    "CFDictionary",
+    "CFAttributedString",
+    "CFCGTypes",
+] }
+block2 = "0.6"
