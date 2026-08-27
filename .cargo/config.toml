@@ -1,0 +1,22 @@
+# 仓内 cargo 配置。
+#
+# [env] 会作用于 cargo 拉起的子进程（build script、rustc、测试二进制）。
+# 注意：[env] 默认不覆盖已存在的环境变量，所有条目都 force = true。
+#
+# 1) 代理：libghostty-vt-sys 的 build script 在冷缓存时用 zig 自带 HTTP client
+#    拉 zig 依赖（deps.files.ghostty.org 等），该 client 过本地 HTTP 代理
+#    (127.0.0.1:7897) 会得到 400 Bad Request；把代理变量置空串（等价于未
+#    设置）后走直连。依赖进入 zig 全局缓存（~/.cache/zig）后按哈希命中，
+#    本就不再联网。cargo 自身访问 crates.io 不受 [env] 影响。
+# 2) SDK：xcode-select 当前指向完整 Xcode，其 MacOSX26.5 SDK 的 libSystem.tbd
+#    缺 arm64-macos 目标切片，zig 0.15.2 的 lld 在 aarch64 原生链接时解析不到
+#    任何 libSystem 符号。DEVELOPER_DIR 把 zig 的 SDK 探测（xcrun）切到
+#    CommandLineTools SDK（tbd 含 arm64-macos），原生链接恢复正常。
+[env]
+http_proxy = { value = "", force = true }
+https_proxy = { value = "", force = true }
+HTTP_PROXY = { value = "", force = true }
+HTTPS_PROXY = { value = "", force = true }
+ALL_PROXY = { value = "", force = true }
+all_proxy = { value = "", force = true }
+DEVELOPER_DIR = { value = "/Library/Developer/CommandLineTools", force = true }

@@ -1,0 +1,6 @@
+# rust
+/target
+
+# 本地工具链（zig 钉版 tarball 解压目录），见 tools/README.md
+/tools/*
+!/tools/README.md

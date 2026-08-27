@@ -1,0 +1,12 @@
+[package]
+name = "ninja"
+description = "ninja 宿主：p0 骨架，钉住 libghostty-vt 公开 C API 的静态链接"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 默认 features = vendored 静态链 libghostty-vt.a + kitty-graphics。
+# 宿主依赖树禁 wasmtime / 任何 JS 运行时（验收用 cargo tree 取证）。
+libghostty-vt.workspace = true

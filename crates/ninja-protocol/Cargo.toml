@@ -1,0 +1,9 @@
+[package]
+name = "ninja-protocol"
+description = "ADE 协议：长度前缀 JSON、消息带 v 与 type（p0 空壳，p3 落地）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

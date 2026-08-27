@@ -1,0 +1,9 @@
+[package]
+name = "ninja-preview"
+description = "官方示例插件：文本/代码 pager，独立进程（p0 空壳，p5 落地）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
