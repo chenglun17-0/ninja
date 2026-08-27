@@ -14,6 +14,37 @@
 大头是 Metal/CoreText/AppKit 框架自身；vt 核与 atlas 在其中的占比极小。
 p2 加标签/分屏时，单窗空载基线不应显著高于此数字。
 
+## 渲染修复记录（第二轮验证反馈：空闲首开全黑）
+
+第二轮验证发现 fresh launch 空闲 3-4s 后屏幕只有光标块、零文本（shell
+启动文本已在 vt 网格，但不上屏）；强制改窗口尺寸（无新 PTY 字节）后文本
+立即出现。根因：`renderer.rs` 的 `draw()` 在帧首 drain
+`atlas.take_pending()`，而本帧 cell 循环里 `get_or_rasterize` 光栅化的新字形
+只画 quad 不上传（等下一帧才进纹理）→ 该帧采样到全零槽位、coverage=0、
+alpha=0。且空闲终端没有下一帧：无 PTY 字节，libghostty-vt 默认
+`cursor_blinking=false`（view 的 blink_tick 直接 return 不重画）。
+
+修复：重排 `draw()` 为「组顶点（含光栅化）→ 上传 pending → 编码」。
+`replaceRegion` 是 CPU 侧立即写入（Shared 存储），同一命令缓冲 commit 后
+GPU 才采样 → 本帧新字形当帧可见，不依赖任何后续帧。另：atlas 满版
+reset 会作废本帧已建 quad 的槽位，新增 `atlas.resets()` 计数检测、有
+reset 就重建顶点（≤3 pass，reset 只由新字形触发，空闲不发生）。不调度
+额外重画：无新增槽位时上传 no-op，空闲帧数为 0，无自旋。新增防回归单测
+`renderer::tests::first_frame_glyphs_uploaded_same_frame`（离屏 draw 一帧，
+读回纹理断言 ink>50 且 pending 清空；把上传挪回帧首则测试必红，对缺陷有
+判别力；拿不到 drawable 的纯 headless 环境自动跳过）。
+
+修复后实测（本轮，2026-08-28）：
+
+- 单测（离屏 Metal）：首帧后纹理非零 5123px；临时恢复老顺序重跑同一
+  测试 = panicked（ink 0px）→ 判别力实证。
+- `SHELL=/tmp/fakesh`（固定输出三行）fresh launch 空闲 4s 截图：
+  ink rows 61-80（行1 3498px）、91-115（行2 含中文 1909px）、118-148
+  （提示符+块光标 1028px）→ 启动文本全部可见；atlas 读回 5125px 非零
+  （修复前恰 1px）；idle 4s→6s dump mtime 不变 → 0 帧空转。
+- 真实 `$SHELL`（zsh）同样取证：空闲首开首行 ~30 cell 提示符字形 +
+  块光标可见（截图细粒度像素图可读）。
+
 ## 渲染修复记录（第一轮验证反馈）
 
 第一轮验证发现字形只占 cell 约 40% 高、贴行顶。根因是
@@ -42,12 +73,21 @@ p2 加标签/分屏时，单窗空载基线不应显著高于此数字。
 ## p1 验收取证（复跑命令）
 
 ```bash
-cargo test -p ninja            # 23 全绿（19 lib + 4 FFI），0 warning
+cargo test -p ninja            # 24 全绿（20 lib + 4 FFI），0 warning
 ./target/debug/ninja           # 拉起 $SHELL（-zsh 登录 shell）
+# 空闲首开取证（p1 门禁「打开即 bash」，本轮修复场景）：
+#   printf '#!/bin/bash\nprintf "line1 abc XYZ\\nline2 你好\\nidle%%%% "\nexec sleep 10000\n' >/tmp/fakesh && chmod +x /tmp/fakesh
+#   SHELL=/tmp/fakesh NINJA_DUMP_ATLAS=/tmp/a.pgm ./target/debug/ninja &
+#   sleep 4; screencapture -x -R<x,y,w,h> /tmp/s.png  # 窗口区域（System Events 取 bounds）
+#   swift tools/verify/shot_text.swift /tmp/s.png rows   # 应见行1/行2/提示符+块光标 ink
+#   stat -f %m /tmp/a.pgm（间隔 2s 两次）→ mtime 不变 = 空闲无空转帧
 ```
 
 | 验收项 | 取证方式 | 结果 |
 | --- | --- | --- |
+| **空闲首开即出字**（本轮修复） | `SHELL=/tmp/fakesh` fresh launch 空闲 4s 截图 `shot_text rows` | 行1 3498px、行2 含中文 1909px、提示符+块光标 1028px ✔ |
+| 空闲首开 atlas 当帧上传 | `NINJA_DUMP_ATLAS` 首帧读回非零像素 | 5125px（修复前恰 1px）✔ |
+| 空闲无空转帧 | dump mtime 间隔 2s 两次不变 | 不变 ✔ |
 | 打开即 shell | `pgrep -P <pid>` 唯一子进程 `-zsh` | ✔ |
 | PTY 输入链路 | 终端内 `touch /tmp/x` | 文件出现 ✔ |
 | vt 输出/标题 | 窗口标题 `jal@192: ~/my_repos/ninja`（OSC 0/2） | ✔ |

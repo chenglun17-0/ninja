@@ -44,6 +44,9 @@ pub struct GlyphAtlas {
     /// 1x1 白块：实心 quad（背景/光标/下划线）走同一管线。
     white: GlyphRect,
     total_slots: usize,
+    /// 满版 reset 次数。渲染器用它检测「本帧已建 quad 的槽位被 reset
+    /// 作废」——reset 只由光栅化新字形触发，空闲帧恒为 0。
+    resets: u32,
 }
 
 impl GlyphAtlas {
@@ -73,6 +76,7 @@ impl GlyphAtlas {
             }],
             white,
             total_slots: 0,
+            resets: 0,
         }
     }
 
@@ -140,6 +144,7 @@ impl GlyphAtlas {
         self.map.clear();
         self.total_slots = 0;
         self.pending.clear();
+        self.resets += 1;
         // 白块重传。
         self.pending.push(PendingUpload {
             region: self.white,
@@ -156,6 +161,11 @@ impl GlyphAtlas {
 
     pub fn cached_count(&self) -> usize {
         self.total_slots
+    }
+
+    /// 满版 reset 累计次数（帧首尾各读一次，变了 = 本帧发生过 reset）。
+    pub fn resets(&self) -> u32 {
+        self.resets
     }
 }
 

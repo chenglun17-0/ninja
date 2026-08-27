@@ -178,7 +178,13 @@ impl Renderer {
         })
     }
 
-    /// 画一帧：先上传 atlas 新槽位，再一 pass 画完全部 quad。
+    /// 画一帧：先组顶点（cell 循环里按需光栅化新字形），随后把
+    /// atlas pending（含本帧新字形）上传纹理，最后才编码 draw。
+    /// 顺序是 p1 黑屏缺陷的修复本体：`replaceRegion` 是 CPU 侧立即写入
+    /// （Shared 存储），GPU 在同一命令缓冲 commit 后才采样 —— 本帧
+    /// 光栅化的字形当帧可见，不需要「下一帧」来补上传（空闲终端没有
+    /// 下一帧：无 PTY 字节、光标不闪烁时不重画）。
+    /// 不额外调度重画：无新增槽位时 pending 为空、上传 no-op，无自旋。
     /// 光标可见性/闪烁相位由 view 折进 frame.cursor（None = 不画）。
     pub fn draw(&mut self, frame: &Frame, atlas: &mut GlyphAtlas, font: &mut Font) {
         let (dw, dh) = self.drawable_size;
@@ -193,34 +199,26 @@ impl Renderer {
             return;
         };
 
-        // ---- atlas 上传 ----
-        for up in atlas.take_pending() {
-            let region = objc2_metal::MTLRegion {
-                origin: objc2_metal::MTLOrigin {
-                    x: up.region.x as usize,
-                    y: up.region.y as usize,
-                    z: 0,
-                },
-                size: objc2_metal::MTLSize {
-                    width: up.region.w as usize,
-                    height: up.region.h as usize,
-                    depth: 1,
-                },
-            };
-            // SAFETY: bytes 长度 = w*h，行距 w，与 R8Unorm 匹配。
-            unsafe {
-                self.atlas_texture
-                    .replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                        region,
-                        0,
-                        std::ptr::NonNull::new(up.bytes.as_ptr() as *mut std::ffi::c_void).unwrap(),
-                        up.region.w as usize,
-                    );
+        // ---- 组顶点 ----
+        // atlas 满版 reset 会作废本 pass 已建 quad 的槽位（map 清空、
+        // 槽位重分）→ 有 reset 就重建一遍顶点。上限 3 pass：reset 只
+        // 由光栅化新字形触发，空闲帧不退循环，无自旋。
+        let mut verts: Vec<Vertex> = Vec::with_capacity(frame.cells.len() * 6);
+        for _ in 0..3 {
+            let resets_before = atlas.resets();
+            verts.clear();
+            self.build_verts(&mut verts, frame, atlas, font);
+            if atlas.resets() == resets_before {
+                break;
             }
         }
 
+        // ---- atlas 上传：组完顶点后、编码前，本帧字形当帧进纹理 ----
+        self.upload_pending(atlas.take_pending());
+
         // 取证开关：NINJA_DUMP_ATLAS=/path.pgm 读回 atlas 纹理落盘
-        // （验证字形上传内容用，默认关闭，见 NOTES.md 复跑命令）。
+        // （验证字形上传内容用，上传后读，所见即 GPU 所采，默认关闭，
+        // 见 NOTES.md 复跑命令）。
         if let Some(path) = std::env::var_os("NINJA_DUMP_ATLAS") {
             let edge = atlas.edge() as usize;
             let mut buf = vec![0u8; edge * edge];
@@ -241,125 +239,6 @@ impl Renderer {
             let _ = std::fs::write(&path, out);
         }
 
-        // ---- 组顶点 ----
-        let mut verts: Vec<Vertex> = Vec::with_capacity(frame.cells.len() * 6);
-        let white = atlas.white();
-        let edge = atlas.edge() as f32;
-        let (cw, ch, baseline) = self.cell_px;
-        let default_bg = rgb_to_f32s(frame.bg);
-        let default_fg = rgb_to_f32s(frame.fg);
-
-        for (i, cell) in frame.cells.iter().enumerate() {
-            if matches!(cell.wide, CellWideKind::SpacerTail | CellWideKind::SpacerHead) {
-                continue;
-            }
-            let col = f64::from((i % usize::from(frame.cols)) as u32);
-            let row = f64::from((i / usize::from(frame.cols)) as u32);
-            let x0 = col * cw;
-            let y0 = row * ch;
-
-            // 有效前景/背景：inverse 交换；选区覆盖；块光标再覆盖。
-            let mut fg = cell.fg.map(rgb_to_f32s).unwrap_or(default_fg);
-            let mut bg = cell.bg.map(rgb_to_f32s).unwrap_or(default_bg);
-            if cell.inverse {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            let selected = cell.selected;
-            if selected {
-                bg = rgb_to_f32s(self.theme.selection_bg);
-            }
-
-            let is_cursor_cell = frame.cursor.is_some_and(|c| {
-                usize::from(c.x) == i % usize::from(frame.cols)
-                    && usize::from(c.y) == i / usize::from(frame.cols)
-            });
-            let cursor_block =
-                is_cursor_cell && matches!(frame.cursor_style, CursorVisualStyle::Block);
-
-            if bg != default_bg || selected || cursor_block {
-                let bg_color = if cursor_block {
-                    rgb_to_f32s(self.theme.cursor)
-                } else {
-                    bg
-                };
-                let span = if cell.wide == CellWideKind::Wide { 2.0 } else { 1.0 };
-                push_quad(&mut verts, white, edge, x0, y0, cw * span, ch, bg_color);
-                if cursor_block {
-                    fg = default_bg; // 块光标上字形反色
-                }
-            }
-
-            // 字形。
-            if !cell.text.is_empty() {
-                let weight = match (cell.bold, cell.italic) {
-                    (true, true) => Weight::BoldItalic,
-                    (true, false) => Weight::Bold,
-                    (false, true) => Weight::Italic,
-                    (false, false) => Weight::Regular,
-                };
-                if let Some(rect) = atlas.get_or_rasterize(&cell.text, weight, font) {
-                    // ink 左沿贴 cell（dx = ink.x - 1px 边距）。
-                    let gx = x0 + rect.dx;
-                    let gy = y0 + baseline + rect.baseline_to_top;
-                    push_glyph_quad(
-                        &mut verts,
-                        &rect,
-                        edge,
-                        gx,
-                        gy,
-                        rect.w as f32,
-                        rect.h as f32,
-                        fg,
-                    );
-                }
-            }
-
-            // 下划线 / 删除线。
-            if cell.underline {
-                push_quad(&mut verts, white, edge, x0, y0 + baseline + 1.0, cw, 1.0, fg);
-            }
-            if cell.strikethrough {
-                push_quad(
-                    &mut verts,
-                    white,
-                    edge,
-                    x0,
-                    y0 + baseline - ch * 0.28,
-                    cw,
-                    1.0,
-                    fg,
-                );
-            }
-        }
-
-        // IME 预编辑串：从光标 cell 起按字符宽度逐字落格，下划线标记。
-        if let Some(marked) = &frame.marked {
-            self.draw_marked(&mut verts, white, edge, marked, frame, default_fg, atlas, font);
-        }
-
-        // 非块光标样式：条 / 下划线 / 空心块。
-        if let Some(c) = frame.cursor {
-            let x0 = f64::from(c.x) * cw;
-            let y0 = f64::from(c.y) * ch;
-            let color = rgb_to_f32s(self.theme.cursor);
-            match frame.cursor_style {
-                CursorVisualStyle::Bar => {
-                    push_quad(&mut verts, white, edge, x0, y0, 2.0, ch, color);
-                }
-                CursorVisualStyle::Underline => {
-                    push_quad(&mut verts, white, edge, x0, y0 + baseline + 1.0, cw, 2.0, color);
-                }
-                CursorVisualStyle::BlockHollow => {
-                    let t = 2.0;
-                    push_quad(&mut verts, white, edge, x0, y0, cw, t, color);
-                    push_quad(&mut verts, white, edge, x0, y0 + ch - t, cw, t, color);
-                    push_quad(&mut verts, white, edge, x0, y0, t, ch, color);
-                    push_quad(&mut verts, white, edge, x0 + cw - t, y0, t, ch, color);
-                }
-                _ => {}
-            }
-        }
-
         // ---- 编码并呈现 ----
         let Some(cmdbuf) = self.queue.commandBuffer() else {
             return;
@@ -371,9 +250,9 @@ impl Renderer {
         attachment.setLoadAction(MTLLoadAction::Clear);
         attachment.setStoreAction(MTLStoreAction::Store);
         attachment.setClearColor(MTLClearColor {
-            red: f64::from(default_bg[0]),
-            green: f64::from(default_bg[1]),
-            blue: f64::from(default_bg[2]),
+            red: f64::from(frame.bg.0) / 255.0,
+            green: f64::from(frame.bg.1) / 255.0,
+            blue: f64::from(frame.bg.2) / 255.0,
             alpha: 1.0,
         });
 
@@ -414,6 +293,164 @@ impl Renderer {
         cmdbuf.presentDrawable(drawable);
         cmdbuf.commit();
         self.frames_drawn += 1;
+    }
+
+    /// 组一帧的全部顶点：cell 循环（背景/字形/装饰）→ IME 预编辑 →
+    /// 非块光标。会经 `atlas.get_or_rasterize` 光栅化新字形并压进
+    /// atlas pending（上传由 `upload_pending` 在 draw 内随后消费）。
+    fn build_verts(
+        &mut self,
+        verts: &mut Vec<Vertex>,
+        frame: &Frame,
+        atlas: &mut GlyphAtlas,
+        font: &mut Font,
+    ) {
+        let white = atlas.white();
+        let edge = atlas.edge() as f32;
+        let (cw, ch, baseline) = self.cell_px;
+        let default_bg = rgb_to_f32s(frame.bg);
+        let default_fg = rgb_to_f32s(frame.fg);
+
+        for (i, cell) in frame.cells.iter().enumerate() {
+            if matches!(cell.wide, CellWideKind::SpacerTail | CellWideKind::SpacerHead) {
+                continue;
+            }
+            let col = f64::from((i % usize::from(frame.cols)) as u32);
+            let row = f64::from((i / usize::from(frame.cols)) as u32);
+            let x0 = col * cw;
+            let y0 = row * ch;
+
+            // 有效前景/背景：inverse 交换；选区覆盖；块光标再覆盖。
+            let mut fg = cell.fg.map(rgb_to_f32s).unwrap_or(default_fg);
+            let mut bg = cell.bg.map(rgb_to_f32s).unwrap_or(default_bg);
+            if cell.inverse {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            let selected = cell.selected;
+            if selected {
+                bg = rgb_to_f32s(self.theme.selection_bg);
+            }
+
+            let is_cursor_cell = frame.cursor.is_some_and(|c| {
+                usize::from(c.x) == i % usize::from(frame.cols)
+                    && usize::from(c.y) == i / usize::from(frame.cols)
+            });
+            let cursor_block =
+                is_cursor_cell && matches!(frame.cursor_style, CursorVisualStyle::Block);
+
+            if bg != default_bg || selected || cursor_block {
+                let bg_color = if cursor_block {
+                    rgb_to_f32s(self.theme.cursor)
+                } else {
+                    bg
+                };
+                let span = if cell.wide == CellWideKind::Wide { 2.0 } else { 1.0 };
+                push_quad(verts, white, edge, x0, y0, cw * span, ch, bg_color);
+                if cursor_block {
+                    fg = default_bg; // 块光标上字形反色
+                }
+            }
+
+            // 字形。
+            if !cell.text.is_empty() {
+                let weight = match (cell.bold, cell.italic) {
+                    (true, true) => Weight::BoldItalic,
+                    (true, false) => Weight::Bold,
+                    (false, true) => Weight::Italic,
+                    (false, false) => Weight::Regular,
+                };
+                if let Some(rect) = atlas.get_or_rasterize(&cell.text, weight, font) {
+                    // ink 左沿贴 cell（dx = ink.x - 1px 边距）。
+                    let gx = x0 + rect.dx;
+                    let gy = y0 + baseline + rect.baseline_to_top;
+                    push_glyph_quad(
+                        verts,
+                        &rect,
+                        edge,
+                        gx,
+                        gy,
+                        rect.w as f32,
+                        rect.h as f32,
+                        fg,
+                    );
+                }
+            }
+
+            // 下划线 / 删除线。
+            if cell.underline {
+                push_quad(verts, white, edge, x0, y0 + baseline + 1.0, cw, 1.0, fg);
+            }
+            if cell.strikethrough {
+                push_quad(
+                    verts,
+                    white,
+                    edge,
+                    x0,
+                    y0 + baseline - ch * 0.28,
+                    cw,
+                    1.0,
+                    fg,
+                );
+            }
+        }
+
+        // IME 预编辑串：从光标 cell 起按字符宽度逐字落格，下划线标记。
+        if let Some(marked) = &frame.marked {
+            self.draw_marked(verts, white, edge, marked, frame, default_fg, atlas, font);
+        }
+
+        // 非块光标样式：条 / 下划线 / 空心块。
+        if let Some(c) = frame.cursor {
+            let x0 = f64::from(c.x) * cw;
+            let y0 = f64::from(c.y) * ch;
+            let color = rgb_to_f32s(self.theme.cursor);
+            match frame.cursor_style {
+                CursorVisualStyle::Bar => {
+                    push_quad(verts, white, edge, x0, y0, 2.0, ch, color);
+                }
+                CursorVisualStyle::Underline => {
+                    push_quad(verts, white, edge, x0, y0 + baseline + 1.0, cw, 2.0, color);
+                }
+                CursorVisualStyle::BlockHollow => {
+                    let t = 2.0;
+                    push_quad(verts, white, edge, x0, y0, cw, t, color);
+                    push_quad(verts, white, edge, x0, y0 + ch - t, cw, t, color);
+                    push_quad(verts, white, edge, x0, y0, t, ch, color);
+                    push_quad(verts, white, edge, x0 + cw - t, y0, t, ch, color);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 把 atlas 的 pending 槽位写入纹理（CPU 侧立即写入，Shared 存储；
+    /// 在本帧命令缓冲编码前调用，commit 后 GPU 采样即所见）。
+    fn upload_pending(&mut self, uploads: Vec<crate::atlas::PendingUpload>) {
+        for up in uploads {
+            let region = objc2_metal::MTLRegion {
+                origin: objc2_metal::MTLOrigin {
+                    x: up.region.x as usize,
+                    y: up.region.y as usize,
+                    z: 0,
+                },
+                size: objc2_metal::MTLSize {
+                    width: up.region.w as usize,
+                    height: up.region.h as usize,
+                    depth: 1,
+                },
+            };
+            // SAFETY: bytes 长度 = w*h，行距 w，与 R8Unorm 匹配。
+            unsafe {
+                self.atlas_texture
+                    .replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                        region,
+                        0,
+                        std::ptr::NonNull::new(up.bytes.as_ptr() as *mut std::ffi::c_void)
+                            .unwrap(),
+                        up.region.w as usize,
+                    );
+            }
+        }
     }
     fn draw_marked(
         &mut self,
@@ -560,4 +597,82 @@ fn push_glyph_quad(
         Vertex { x: x1, y: y1, u: u1, v: v1, r, g, b, a },
         Vertex { x: x0, y: y1, u: u0, v: v1, r, g, b, a },
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::term::{CursorView, FrameCell};
+
+    /// 回归（p1 黑屏缺陷）：首帧光栅化的字形必须同帧进 atlas 纹理。
+    /// 老实现在帧首 drain pending，本帧新字形只画 quad 不上传（下一帧
+    /// 才进纹理）；空闲终端无 PTY 字节、光标不闪烁 → 没有下一帧，
+    /// 首屏全黑。本测试离屏跑一次 draw，读回纹理取证。
+    /// 拿不到 Metal 设备/drawable（纯 headless 无窗口服务）时跳过。
+    #[test]
+    fn first_frame_glyphs_uploaded_same_frame() {
+        let scale = 2.0;
+        let mut font = Font::new(13.0, scale);
+        let cw = (font.metrics.cell_w * scale).ceil() as u32;
+        let ch = (font.metrics.cell_h * scale).ceil() as u32;
+        let layer = CAMetalLayer::new();
+        layer.setContentsScale(scale);
+        let Some(mut r) = Renderer::new(
+            layer,
+            GlyphAtlas::EDGE,
+            (f64::from(cw), f64::from(ch), font.baseline_offset() * scale),
+        ) else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        r.drawable_size = (f64::from(cw) * 10.0, f64::from(ch) * 4.0);
+
+        // 一帧 "bash$ " + 空白格（bash 启动提示符的最小化身）。
+        let mut frame = Frame {
+            cols: 10,
+            rows: 4,
+            fg: Rgb(255, 255, 255),
+            bg: Rgb(0, 0, 0),
+            cursor: Some(CursorView { x: 5, y: 0, at_wide_tail: false }),
+            cursor_style: CursorVisualStyle::Block,
+            cursor_blinking: false,
+            dirty: libghostty_vt::render::Dirty::Clean,
+            cells: vec![FrameCell::default(); 40],
+            marked: None,
+        };
+        for (i, c) in "bash$ ".chars().enumerate() {
+            frame.cells[i].text = c.to_string();
+        }
+
+        let mut atlas = GlyphAtlas::new(ch);
+        r.draw(&frame, &mut atlas, &mut font);
+
+        // 离屏 layer 拿不到 drawable → 帧没画成，headless 环境跳过。
+        if r.frames_drawn == 0 {
+            eprintln!("skip: no drawable (headless)");
+            return;
+        }
+        assert_eq!(r.frames_drawn, 1);
+
+        // pending 已被本帧消费干净，不留给「可能永远不会来的下一帧」。
+        assert!(atlas.take_pending().is_empty());
+
+        // 纹理读回：白块 (0,0) 之外必须有字形 ink。
+        let edge = atlas.edge() as usize;
+        let mut buf = vec![0u8; edge * edge];
+        // SAFETY: 布局与 R8Unorm 匹配，读回整版。
+        unsafe {
+            r.atlas_texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                std::ptr::NonNull::new(buf.as_mut_ptr().cast()).unwrap(),
+                edge,
+                objc2_metal::MTLRegion {
+                    origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: objc2_metal::MTLSize { width: edge, height: edge, depth: 1 },
+                },
+                0,
+            );
+        }
+        let ink = buf[1..].iter().filter(|&&v| v > 0).count();
+        assert!(ink > 50, "atlas ink beyond white block: {ink} (want >50)");
+    }
 }
