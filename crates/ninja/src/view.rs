@@ -608,6 +608,14 @@ impl TerminalView {
 
         install_wake(&view);
         pty::set_wake_hook(Some(wake_hook));
+        // D1 修复（启动期唤醒注册竞态）：Pty::spawn 在上面、hook 注册在这里，
+        // 中间隔着 Renderer::new 的运行时着色器编译——快 shell 的首批 PTY
+        // 字节可能在 WAKE_HOOK==0 时就入队 rx（读线程 wake_main 空转丢信号），
+        // 字节滞留队列、vt 永远收不到（空闲 shell 无后续字节补发信号）。
+        // 注册完立即补一次信号：runloop 起转后 source_perform → on_pty_data
+        // 会把窗口期内到达的字节全部 drain 进 vt。rx 为空时只是多一帧空画。
+        // 之后到达的字节走正常路径（hook 已就位），无丢失窗口。
+        wake_hook();
         install_blink_timer(&view);
         view.grid_changed();
         view

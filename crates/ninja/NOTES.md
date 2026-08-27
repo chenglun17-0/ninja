@@ -14,7 +14,44 @@
 大头是 Metal/CoreText/AppKit 框架自身；vt 核与 atlas 在其中的占比极小。
 p2 加标签/分屏时，单窗空载基线不应显著高于此数字。
 
+## 修复记录（第三轮验证反馈 D1：启动期唤醒注册竞态）
+
+第二轮「同帧上传」修复后，验证员用同款探针（SHELL=立即输出的脚本 +
+NINJA_DUMP_ATLAS）复测 6/6 仍黑：atlas 恒 1px（仅白块），上一轮声称的
+5125px 不可复现。本轮复现 + 插桩实证：
+
+- 本机 HEAD c3a5c20 探针 6 次：**5/6 BLACK**（4066px vs 1px）——上一轮
+  的「过」是运气（快 shell 首批字节碰巧晚于 hook 注册到达）。
+- 临时插桩（跑完即还原）：3/3 运行中「first rx enqueue」比
+  「wake hook installed」早 6-9ms（Renderer::new 运行时着色器编译的
+  时长），wake_hook / source_perform / on_pty_data 全程零调用——
+  字节滞留 rx 队列，vt 从未收到，空闲 shell 无后续字节永不自愈。
+
+根因：`TerminalView::new` 里 `Pty::spawn` 在 `set_wake_hook` 之前执行，
+中间隔 Renderer::new；快 shell 首批 PTY 字节在 `WAKE_HOOK==0` 时入队，
+`wake_main()` 空转丢信号。真实交互 shell（bash/zsh）启动慢于注册，
+碰巧赢过竞态，掩盖缺陷。
+
+修复（view.rs，1 行 + 注释）：`set_wake_hook` 注册完后立即补发一次
+`wake_hook()`——信号 source + 唤醒主 runloop，起转后 source_perform →
+`on_pty_data` 把 [spawn, 注册] 窗口期内到达的字节全部 drain 进 vt；
+rx 为空时只多一帧空画，无自旋；之后到达的字节走正常路径，无丢失窗口。
+
+修复后取证：同探针 **6/6 TEXT**（每次 4066px）；删除该行重测 **3/3 FAILED
+（ink=1）**→ 判别力实证。新增门控回归测试
+`tests/fast_shell_first_frame.rs`（拉真实二进制 + 同款 atlas 探针，
+display 无关，锁屏下也有效；默认 skip，`NINJA_E2E=1` 启用；fakesh 用
+`read` 阻塞到 master 关闭，不留孤儿进程）。
+
+注：本轮验证会话屏幕同样锁定（CGSSessionScreenIsLocked=1，全屏截图全黑），
+屏幕级取证不可用；atlas 探针不受影响（离屏 drawable 照常渲染）。
+
 ## 渲染修复记录（第二轮验证反馈：空闲首开全黑）
+
+**事后勘误（第三轮）**：本节 fakesh 5125px 屏照证据是真实数据但属运气，
+快 shell 首批字节碰巧晚于 hook 注册到达（见上节：启动期唤醒注册竞态）；
+同款探针在第三轮 6/6 黑。同帧上传修复本身正确（缺陷独立存在，判别
+单测仍红），但首开黑屏的另一半根因是竞态，第三轮才修净。
 
 第二轮验证发现 fresh launch 空闲 3-4s 后屏幕只有光标块、零文本（shell
 启动文本已在 vt 网格，但不上屏）；强制改窗口尺寸（无新 PTY 字节）后文本
@@ -73,7 +110,8 @@ reset 就重建顶点（≤3 pass，reset 只由新字形触发，空闲不发�
 ## p1 验收取证（复跑命令）
 
 ```bash
-cargo test -p ninja            # 24 全绿（20 lib + 4 FFI），0 warning
+cargo test -p ninja            # 25 全绿（20 lib + 1 E2E 门控默认 skip + 4 FFI），0 warning
+NINJA_E2E=1 cargo test -p ninja --test fast_shell_first_frame   # 快 shell 首帧回归（拉真窗口）
 ./target/debug/ninja           # 拉起 $SHELL（-zsh 登录 shell）
 # 空闲首开取证（p1 门禁「打开即 bash」，本轮修复场景）：
 #   printf '#!/bin/bash\nprintf "line1 abc XYZ\\nline2 你好\\nidle%%%% "\nexec sleep 10000\n' >/tmp/fakesh && chmod +x /tmp/fakesh
@@ -115,6 +153,11 @@ scale=2、含 56px 标题栏。
 
 ## 已知残留
 
+- **待补测（第三轮 D2，环境受限）**：验证会话屏幕锁定
+  （CGSSessionScreenIsLocked=1，Window Server Display Shield 遮屏，
+  CGEvent 无法送达应用），IME、拖选/Cmd+C/Cmd+V（真实 CGEvent）、
+  resize reflow、滚轮、空闲截图像素取证近两轮未能复测；需解锁会话后
+  按上表复跑（上表历史 ✔ 均为解锁会话下的取证）。
 - `OscParser CHANGE_WINDOW_TITLE_STR` 上游恒空（p0 记录）：不影响
   `Terminal::title()`，窗口标题正常。
 - 拖选自动滚动（autoscroll tick）未接：拖到窗口外不滚屏（vt gesture 提供
