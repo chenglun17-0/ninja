@@ -15,9 +15,10 @@ curl -L -o zig-0.15.2.tar.xz \
 tar xJf zig-0.15.2.tar.xz && rm zig-0.15.2.tar.xz   # -> zig-aarch64-macos-0.15.2/
 ```
 
-本机历史上 `/usr/local/bin/zig` 指向损坏的 Homebrew Intel 前缀 zig 0.13
-（缺 `libz3.4.13.dylib`，`zig version` 即 abort）。p0 已把该符号链接重指向
-本目录的钉版：
+本机 `/usr/local/bin/zig` 曾指向损坏的 Homebrew Intel 前缀 zig 0.13（缺
+`libz3.4.13.dylib`，`zig version` 即 abort）。该 Homebrew zig（0.13.0 与一个
+2024 年的 HEAD 构建）已整体卸载，现在 `/usr/local/bin/zig` 是指向本目录钉版
+的符号链接：
 
 ```sh
 ln -sf "$PWD/zig-aarch64-macos-0.15.2/zig" /usr/local/bin/zig
