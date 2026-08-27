@@ -214,7 +214,11 @@ impl Font {
             return None;
         }
 
-        // SAFETY: ctx 有效；位图坐标原点在左下，基线放 y = ascent + 1。
+        // SAFETY: ctx 有效；位图坐标原点在左下（y 向上）。
+        // 基线放距位图底 descent + 1：descender 在基线下最多 descent，
+        // 底部留 1px 边距；基线上方剩余高度 = 位图高 - (descent+1) = ascent+1，
+        // 正好容纳 ascender + 1px 顶边距。（此前误放 ascent+1，26pt 字形
+        // 基线上方只剩 ~8px，上半被裁——验证阶段的「字形只占 cell 40%」。）
         // ink 左沿贴位图 x=1：文本起点 x = 1 - ink.x。
         // 背景填白（coverage=0），字形用黑填充（coverage=255）。
         unsafe {
@@ -230,7 +234,7 @@ impl Font {
                 },
             );
             CGContext::set_gray_fill_color(Some(&*ctx), 0.0, 1.0);
-            CGContext::set_text_position(Some(&*ctx), 1.0 - ink.origin.x, ascent + 1.0);
+            CGContext::set_text_position(Some(&*ctx), 1.0 - ink.origin.x, descent + 1.0);
             line.draw(&*ctx);
             CGContextRelease(ctx);
         }
@@ -351,5 +355,61 @@ mod tests {
         let a = f.rasterize("A", Weight::Regular, 320.0).unwrap();
         let cjk = f.rasterize("中", Weight::Regular, 320.0).unwrap();
         assert!(cjk.w > a.w, "CJK {} not wider than A {}", cjk.w, a.w);
+    }
+
+    /// 防回归：验证阶段发现的基线错位（基线误放距底 ascent+1）会把
+    /// 26pt 字形裁到只剩基线上方 ~8px、贴位图顶。修复后：
+    /// - 'M' 的 ink 高度应占位图高的大头（cap ≈ 0.73×字号，26px 字号 ≈ 19px）；
+    /// - 'g' 必须跨基线：descender 在基线下（ink 底行距位图底 < descent+2），
+    ///   x-height 在基线上（ink 顶行远离位图底）。
+    #[test]
+    fn rasterize_baseline_not_clipped() {
+        let mut f = Font::new(13.0, 2.0);
+        let max_w = 4.0 * f.metrics.cell_w * f.scale;
+        let ascent = f.metrics.ascent * f.scale;
+        let descent = f.metrics.descent * f.scale;
+
+        let m = f.rasterize("M", Weight::Regular, max_w).unwrap();
+        let ink_rows = |g: &RasterGlyph| -> (usize, usize) {
+            let mut top = usize::MAX;
+            let mut bottom = 0usize;
+            for y in 0..g.h as usize {
+                let row = &g.coverage[y * g.w as usize..(y + 1) * g.w as usize];
+                if row.iter().any(|&c| c > 60) {
+                    top = top.min(y);
+                    bottom = bottom.max(y);
+                }
+            }
+            (top, bottom)
+        };
+        let (mt, mb) = ink_rows(&m);
+        let m_h = (mb - mt + 1) as f64;
+        assert!(
+            m_h >= (m.h as f64) * 0.5,
+            "M ink only {m_h}px of {}px bitmap — clipped?",
+            m.h
+        );
+        // M 无 descender：ink 底行应就在基线附近（距位图底 ≈ descent+1）。
+        assert!(
+            (m.h as usize - 1 - mb) <= (descent + 3.0) as usize,
+            "M bottom row {mb} too far above bitmap bottom {}",
+            m.h
+        );
+        // M 顶行不应贴位图顶（顶边距 ≈ ascent+1-cap ≈ 5-7px）。
+        assert!(mt >= 2, "M ink touches bitmap top (row {mt}) — baseline misplaced");
+
+        let g_glyph = f.rasterize("g", Weight::Regular, max_w).unwrap();
+        let (gt, gb) = ink_rows(&g_glyph);
+        // 跨基线：ink 底行在基线下方（距位图底 < descent），顶行在基线上方。
+        assert!(
+            gb >= ((descent + 1.0 + 3.0) as usize).min(g_glyph.h as usize - 1),
+            "g ink bottom row {gb} does not cross baseline (descent+1={})",
+            descent + 1.0
+        );
+        assert!(
+            (gt as f64) < (g_glyph.h as f64) - descent - 1.0,
+            "g ink top row {gt} not above baseline"
+        );
+        let _ = ascent;
     }
 }

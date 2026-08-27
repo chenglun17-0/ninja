@@ -4,7 +4,7 @@ use ninja::font::{Font, Weight};
 fn main() {
     let mut font = Font::new(13.0, 2.0);
     let max_w = 4.0 * font.metrics.cell_w * font.scale;
-    for text in ["g", "A", "n", "|"] {
+    for text in ["M", "g", "A", "n", "|"] {
         let g = font.rasterize(text, Weight::Regular, max_w).expect("rasterize");
         let total = g.coverage.len();
         let solid = g.coverage.iter().filter(|&&c| c > 200).count();
@@ -15,7 +15,7 @@ fn main() {
             g.w, g.h
         );
         // 打印 'A' 的 ASCII 覆盖图
-        if text == "g" {
+        if text == "M" {
             for y in 0..g.h as usize {
                 let mut line = String::new();
                 for x in 0..g.w as usize {

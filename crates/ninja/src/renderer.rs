@@ -219,6 +219,28 @@ impl Renderer {
             }
         }
 
+        // 取证开关：NINJA_DUMP_ATLAS=/path.pgm 读回 atlas 纹理落盘
+        // （验证字形上传内容用，默认关闭，见 NOTES.md 复跑命令）。
+        if let Some(path) = std::env::var_os("NINJA_DUMP_ATLAS") {
+            let edge = atlas.edge() as usize;
+            let mut buf = vec![0u8; edge * edge];
+            // SAFETY: 布局与 R8Unorm 匹配，读回整版。
+            unsafe {
+                self.atlas_texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                    std::ptr::NonNull::new(buf.as_mut_ptr().cast()).unwrap(),
+                    edge,
+                    objc2_metal::MTLRegion {
+                        origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                        size: objc2_metal::MTLSize { width: edge, height: edge, depth: 1 },
+                    },
+                    0,
+                );
+            }
+            let mut out = format!("P5\n{edge} {edge}\n255\n").into_bytes();
+            out.extend_from_slice(&buf);
+            let _ = std::fs::write(&path, out);
+        }
+
         // ---- 组顶点 ----
         let mut verts: Vec<Vertex> = Vec::with_capacity(frame.cells.len() * 6);
         let white = atlas.white();
