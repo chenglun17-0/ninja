@@ -19,7 +19,12 @@ libc = "0.2"
 # p2 配置：~/.config/ninja/ninja.toml（shell/字体/键位/主题色）。
 # 只在启动时解析一次，不进空载常驻路径。
 toml = "0.9"
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
+
+# p3 ADE 协议：纯 serde 数据类型 + JSON 编解码（无运行时、无线程、
+# 无 socket 逻辑——socket 在宿主自己的 plugins.rs）。宿主依赖它只为
+# 同源类型；协议本身仍只经 Unix socket 交换字节。
+ninja-protocol.workspace = true
 
 # p1 终端面：AppKit 壳 + 自研 Metal cell atlas + CoreText 字形。
 # 只用 objc2 家族（同一 runtime），不引 winit/egui/GPUI，不碰 Ghostty 内部 API。

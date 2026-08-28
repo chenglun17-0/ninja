@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::plugins::PluginsConfig;
 use crate::term::Rgb;
 
 // ---------------------------------------------------------------------------
@@ -123,9 +124,7 @@ pub const ACTION_NAMES: &[(&str, &str)] = &[
 pub fn default_keys() -> HashMap<String, KeyBinding> {
     ACTION_NAMES
         .iter()
-        .filter_map(|(name, def)| {
-            parse_binding(def).map(|b| (name.to_string(), b))
-        })
+        .filter_map(|(name, def)| parse_binding(def).map(|b| (name.to_string(), b)))
         .collect()
 }
 
@@ -145,6 +144,8 @@ pub struct Config {
     pub cursor: Rgb,
     /// 动作名 → 键绑定（含全部默认，缺项由默认表补齐）。
     pub keys: HashMap<String, KeyBinding>,
+    /// p3：插件开关。默认空 = 关（空载不建 socket、不拉进程）。
+    pub plugins: PluginsConfig,
 }
 
 impl Default for Config {
@@ -156,6 +157,7 @@ impl Default for Config {
             selection_bg: Rgb(0x35, 0x4B, 0x8C),
             cursor: Rgb(0xE6, 0xE6, 0xE6),
             keys: default_keys(),
+            plugins: PluginsConfig::default(),
         }
     }
 }
@@ -196,6 +198,13 @@ struct ThemeToml {
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
+struct PluginsToml {
+    /// 启用的插件名。缺省/空 = 插件全关（空载门禁）。
+    enabled: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 struct FileToml {
     shell: Option<String>,
     /// 字段名两种写法都收：`font-family`（TOML 惯例）/ `font_family`。
@@ -205,6 +214,7 @@ struct FileToml {
     font_size: Option<f64>,
     theme: ThemeToml,
     keys: HashMap<String, String>,
+    plugins: PluginsToml,
 }
 
 impl Config {
@@ -265,6 +275,25 @@ impl Config {
                 None => eprintln!("ninja: keys.{name} = {binding:?} 解析失败，保留默认"),
             }
         }
+        // p3：[plugins] enabled；空/缺省 = 关。名字去空白去重，
+        // 未知名字先收下（宿主在启动时找不到对应插件只警告，拉起在 p5）。
+        if let Some(enabled) = parsed.plugins.enabled {
+            let mut seen = std::collections::BTreeSet::new();
+            let names: Vec<String> = enabled
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| {
+                    if s.is_empty() {
+                        return false;
+                    }
+                    seen.insert(s.clone())
+                })
+                .collect();
+            if !names.is_empty() {
+                eprintln!("ninja: 插件已启用 {names:?}（ADE socket 将监听；拉起在 p5）");
+            }
+            cfg.plugins = PluginsConfig { enabled: names };
+        }
         cfg
     }
 
@@ -306,6 +335,8 @@ pub fn default_toml() -> String {
     s.push_str("[keys]\n");
     s.push_str("# new_window = \"cmd+n\"\n");
     s.push_str("# split_right = \"cmd+d\"\n\n");
+    s.push_str("[plugins]\n");
+    s.push_str("# enabled = [\"preview\"]   # 默认空 = 插件关：不建 ADE socket、不拉进程\n");
     s
 }
 
@@ -381,7 +412,10 @@ focus_down = "not a key"
         assert_eq!(c.font_size_pt, 14.5);
         assert_eq!(c.selection_bg, Rgb(0x10, 0x10, 0x10));
         assert_eq!(c.cursor, Rgb(0xFF, 0x00, 0x00));
-        assert_eq!(c.keys[&"split_right".to_string()].flags(), MASK_CTRL | MASK_CMD);
+        assert_eq!(
+            c.keys[&"split_right".to_string()].flags(),
+            MASK_CTRL | MASK_CMD
+        );
         // 未覆盖的动作保留默认。
         assert_eq!(
             c.keys[&"split_down".to_string()],
@@ -407,6 +441,50 @@ focus_down = "not a key"
     fn default_toml_is_valid_and_noop() {
         // 文档里给的默认片段：解析后应与内置默认一致（全注释 = 无改动）。
         let c = Config::from_toml_str(&default_toml());
+        assert_eq!(c, Config::default());
+    }
+
+    // ------------------------------------------------------------------
+    // p3 [plugins]
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn plugins_default_off() {
+        // 空载门禁：缺 [plugins] / 空 enabled / 空串 / 全空白 → 关。
+        assert!(Config::default().plugins.enabled.is_empty());
+        assert!(Config::from_toml_str("").plugins.enabled.is_empty());
+        assert!(
+            Config::from_toml_str(
+                r#"[plugins]
+enabled = []"#
+            )
+            .plugins
+            .enabled
+            .is_empty()
+        );
+        assert!(
+            Config::from_toml_str(
+                r#"[plugins]
+enabled = ["  ", ""]"#
+            )
+            .plugins
+            .enabled
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn plugins_enabled_parses_and_dedupes() {
+        let c = Config::from_toml_str(
+            r#"[plugins]
+enabled = [" preview ", "preview", "doc"]"#,
+        );
+        assert_eq!(
+            c.plugins.enabled,
+            vec!["preview".to_string(), "doc".to_string()]
+        );
+        // 未知 [plugins] 字段：整体降级默认（同其他节的行为）。
+        let c = Config::from_toml_str("[plugins]\nwat = 1");
         assert_eq!(c, Config::default());
     }
 }

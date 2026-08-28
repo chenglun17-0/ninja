@@ -1,22 +1,24 @@
 //! AppKit 引导（p2）：NSApplication（Regular）+ 多窗口 + 原生标签 +
 //! 菜单（App/File/Panes/Window/Edit，键位来自 TOML 配置）+ delegate。
-//! 空载不建任何插件相关的东西（无 socket、无子进程除 PTY shell）。
+//! p3：[plugins] enabled 非空才绑 ADE socket（plugins.rs）；默认空载
+//! 无 socket、无子进程除 PTY shell。
 
 #![allow(non_snake_case)] // ObjC selector 方法名
 use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
+use objc2::runtime::NSObjectProtocol;
 use objc2::runtime::{ProtocolObject, Sel};
-use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSEventModifierFlags,
     NSMenu, NSMenuItem, NSWindow, NSWindowDelegate,
 };
-use objc2::runtime::NSObjectProtocol;
 use objc2_foundation::{NSNotification, NSObject, NSString};
 
 use crate::config::{self, Config};
 use crate::pane::PaneContainer;
+use crate::plugins;
 use crate::shell;
 
 pub struct Ivars {
@@ -332,18 +334,14 @@ fn add_submenu(mtm: MainThreadMarker, main_menu: &NSMenu, title: &str) -> Retain
 /// 按 spec 造菜单项（键位查 config；查不到用默认绑定——config 默认表
 /// 覆盖全部动作名，这里只是防御）。
 fn add_item(mtm: MainThreadMarker, menu: &NSMenu, spec: &ItemSpec, config: &Config) {
-    let binding = config
-        .keys
-        .get(spec.action)
-        .cloned()
-        .unwrap_or_else(|| {
-            eprintln!("ninja: 动作 {} 无绑定（用默认表）", spec.action);
-            config::default_keys()
-                .into_iter()
-                .find(|(n, _)| n == spec.action)
-                .map(|(_, b)| b)
-                .expect("default table covers all actions")
-        });
+    let binding = config.keys.get(spec.action).cloned().unwrap_or_else(|| {
+        eprintln!("ninja: 动作 {} 无绑定（用默认表）", spec.action);
+        config::default_keys()
+            .into_iter()
+            .find(|(n, _)| n == spec.action)
+            .map(|(_, b)| b)
+            .expect("default table covers all actions")
+    });
     let item = unsafe {
         let sel = std::ffi::CString::new(spec.selector).expect("selector cstr");
         NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -389,7 +387,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, config: &Config) {
             &NSString::from_str("]"),
         )
     };
-    next_tab.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+    next_tab
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
     window_menu.addItem(&next_tab);
     let prev_tab = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -399,7 +398,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, config: &Config) {
             &NSString::from_str("["),
         )
     };
-    prev_tab.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+    prev_tab
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
     window_menu.addItem(&prev_tab);
 
     let edit_menu = add_submenu(mtm, &main_menu, "Edit");
@@ -412,6 +412,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, config: &Config) {
 
 /// 进程入口：读配置 → 起 AppKit、上菜单（配置键位）、挂 delegate、
 /// 跑 runloop。多窗口；最后窗关闭 / ⌘Q / 各 pane shell 全退 → 退出。
+/// p3：[plugins] enabled 非空才绑 ADE socket，默认空载不建。
 pub fn run() {
     let mtm = MainThreadMarker::new().expect("ninja must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -420,6 +421,12 @@ pub fn run() {
     // p2 配置：缺文件 = 内置默认（可启动门禁）；坏字段降级默认 + 警告。
     let config = Config::load();
     build_menu(mtm, &app, &config);
+
+    // p3 ADE 插件门：默认（enabled 空）不建 socket、不拉任何插件进程
+    //（空载门禁）。启用时绑 Unix socket；accept/拉起在 p5。
+    // 生命周期：住在 run() 栈上，app.run() 返回（退出）时 drop 并删
+    // socket 文件。
+    let _plugin_host = plugins::PluginHost::start(&config.plugins);
 
     // 两阶段初始化（同 view）：先放 ivars 再走 NSObject 的 init。
     let this = AppDelegate::alloc(mtm).set_ivars(Ivars {
@@ -451,10 +458,7 @@ impl AppDelegate {
     /// windowWillClose 时调：安排下一拍释放强引用。close 尚在
     /// 进行中，不能立即 drop。
     fn schedule_release(&self, w: &NSWindow) {
-        self.ivars()
-            .closing
-            .borrow_mut()
-            .push(w as *const NSWindow);
+        self.ivars().closing.borrow_mut().push(w as *const NSWindow);
         if self.ivars().prune_scheduled.get() {
             return;
         }

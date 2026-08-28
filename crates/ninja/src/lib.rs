@@ -20,11 +20,13 @@
 //! - [`shell`]：多窗口 + 原生标签 + pane EOF 汇聚
 //! - [`config`]：`~/.config/ninja/ninja.toml`（shell/字体/键位/主题色）
 //! - [`app`]：NSApplication 引导、菜单（键位来自配置）、delegate
+//! - [`plugins`]：p3 ADE 插件门——[plugins] enabled 非空才绑 Unix
+//!   socket（默认空载不建）；协议类型来自 ninja-protocol
 //!
 //! 空载路径 = 本 crate + 依赖。没有插件运行时、没有 wasmtime、没有 JS
 //! 引擎、没有插件 socket 或子进程（PTY 的 shell 不算插件）。
-//! 插件以独立进程 + JSON 协议（ninja-protocol）在 p3+ 落地，永远不进宿主
-//! 地址空间。
+//! 插件是独立进程，只经 ninja-protocol 的 JSON 消息（Unix socket）与
+//! 宿主说话，永远不进宿主地址空间。
 //!
 //! [libghostty-vt]: https://libghostty.tip.ghostty.org/
 
@@ -37,6 +39,7 @@ pub mod config;
 pub mod font;
 pub mod keymap;
 pub mod pane;
+pub mod plugins;
 pub mod pty;
 pub mod renderer;
 pub mod select;
