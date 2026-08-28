@@ -202,7 +202,8 @@ struct PluginsToml {
     /// 启用的插件名。缺省/空 = 插件全关（空载门禁）。
     enabled: Option<Vec<String>>,
     /// 插件名 → 二进制路径（p5：首次命中分发时按名拉起）。缺省时
-    /// 按名字在 NINJA_PLUGIN_DIR / 宿主二进制同目录解析。
+    /// 按名字在 NINJA_PLUGIN_DIR / ~/.config/ninja/plugins / 宿主二进制
+    /// 同目录解析。
     paths: Option<HashMap<String, String>>,
 }
 
@@ -358,7 +359,7 @@ pub fn default_toml() -> String {
     s.push_str("[plugins]\n");
     s.push_str("# enabled = [\"preview\"]   # 默认空 = 插件关：不建 ADE socket、不拉进程\n");
     s.push_str("# [plugins.paths]\n");
-    s.push_str("# preview = \"/usr/local/bin/ninja-preview\"   # 缺省按名在 NINJA_PLUGIN_DIR / 宿主同目录找\n");
+    s.push_str("# preview = \"/usr/local/bin/ninja-preview\"   # 缺省按名在 NINJA_PLUGIN_DIR / ~/.config/ninja/plugins / 宿主同目录找\n");
     s
 }
 

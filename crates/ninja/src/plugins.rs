@@ -13,9 +13,10 @@
 //!
 //! 启用时：绑定 [`socket_path`] 约定的路径并 listen。**启用 ≠ 常驻**
 //! （PRODUCT 规则）：进程拉起发生在**首次命中分发**——按名解析二进制
-//! （`[plugins] paths` → `$NINJA_PLUGIN_DIR/<name>` → 宿主二进制同目录），
-//! spawn 并以 `NINJA_ADE_SOCK` 告知 socket 路径；解析失败/拉不起 =
-//! 该插件降级为不存在（stderr 一行警告，绝不弹 UI）。
+//! （`[plugins] paths` → `$NINJA_PLUGIN_DIR/<name>` →
+//! `~/.config/ninja/plugins/<name>`（p7 分发缺省安装位）→ 宿主二进制
+//! 同目录（开发布局回退）），spawn 并以 `NINJA_ADE_SOCK` 告知 socket 路径；
+//! 解析失败/拉不起 = 该插件降级为不存在（stderr 一行警告，绝不弹 UI）。
 //!
 //! 命中分发（p4）：点击时把 [`Hit`] 广播给已连插件（连接由插件连进来，
 //! 分发时按需非阻塞 accept），收集 `hit.claim` / `hit.ignore` 回执——
@@ -49,7 +50,8 @@ pub struct PluginsConfig {
     /// 启用的插件名列表。空 = 关。首次命中分发时按名拉起（启用≠常驻）。
     pub enabled: Vec<String>,
     /// 插件名 → 二进制路径（p5 拉起用）。缺省时按名在
-    /// `$NINJA_PLUGIN_DIR/<name>` / 宿主二进制同目录解析。
+    /// `$NINJA_PLUGIN_DIR/<name>` / `~/.config/ninja/plugins/<name>` /
+    /// 宿主二进制同目录解析。
     pub paths: std::collections::HashMap<String, String>,
 }
 
@@ -173,9 +175,26 @@ fn effective_socket_path() -> PathBuf {
     }
 }
 
+/// 用户级插件目录（p7 分发的缺省安装位）：`~/.config/ninja/plugins`。
+/// `HOME` 缺失（异常环境）→ None：该搜索段整体跳过（其余段照常）。
+pub fn user_plugin_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/ninja/plugins"))
+}
+
 /// 按名解析插件二进制：`[plugins.paths]` 显式路径 → `$NINJA_PLUGIN_DIR/
-/// <name>` → 宿主二进制同目录 `<name>`。都不存在 → None（调用方降级）。
+/// <name>` → `~/.config/ninja/plugins/<name>`（p7 用户缺省安装位）→
+/// 宿主二进制同目录 `<name>`。都不存在 → None（调用方降级）。
 pub fn resolve_plugin_binary(name: &str, cfg: &PluginsConfig) -> Option<PathBuf> {
+    resolve_plugin_binary_in(name, cfg, user_plugin_dir().as_deref())
+}
+
+/// [`resolve_plugin_binary`] 的实现核心：用户插件目录可注入（单测用
+/// 隔离 HOME，不碰真实 `~/.config`）。段次序见外层文档。
+fn resolve_plugin_binary_in(
+    name: &str,
+    cfg: &PluginsConfig,
+    user_dir: Option<&Path>,
+) -> Option<PathBuf> {
     if name.is_empty() || name.contains('/') {
         return None; // 名字即文件系统注入向量：只收裸名
     }
@@ -192,6 +211,19 @@ pub fn resolve_plugin_binary(name: &str, cfg: &PluginsConfig) -> Option<PathBuf>
             return Some(p);
         }
     }
+    // p7 用户缺省段：分发文档钉的装/卸位（拷进目录 + enabled 即装，
+    // 移出 enabled + 删文件即卸——p6 shutdown 保证删文件时无残留）。
+    if let Some(dir) = user_dir {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // 宿主二进制同目录（p5 起的开发布局回退：cargo 把 ninja 与
+    // ninja-preview 放同一 target 目录）。分发场景该目录是 .app 的
+    // Contents/MacOS/——**在已签名 bundle 里增删文件会破坏签名封条**，
+    // 分发链路不承诺此段（文档只教 ~/.config/ninja/plugins）；保留
+    // 仅为本地开发布局的无害读取（只探测存在性，不写）。
     if let Ok(exe) = std::env::current_exe() {
         let p = exe.parent()?.join(name);
         if p.is_file() {
@@ -288,7 +320,7 @@ impl PluginHost {
             }
             let Some(bin) = resolve_plugin_binary(&name, &self.cfg) else {
                 eprintln!(
-                    "ninja: 插件 {name:?} 找不到二进制（[plugins.paths] / NINJA_PLUGIN_DIR / 宿主同目录），本次降级为未启用"
+                    "ninja: 插件 {name:?} 找不到二进制（[plugins.paths] / NINJA_PLUGIN_DIR / ~/.config/ninja/plugins / 宿主同目录），本次降级为未启用"
                 );
                 continue;
             };
@@ -1140,6 +1172,52 @@ mod tests {
             )]),
         };
         assert!(resolve_plugin_binary("preview", &cfg2).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_resolution_user_plugin_dir() {
+        // p7 用户级缺省段：~/.config/ninja/plugins/<name>（注入隔离 HOME，
+        // 不碰真实 ~/.config）。
+        let dir = sandbox("resolve_user");
+        let plugdir = dir.join("home/.config/ninja/plugins");
+        std::fs::create_dir_all(&plugdir).unwrap();
+        let bin = plugdir.join("preview");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+
+        let cfg = PluginsConfig {
+            enabled: vec!["preview".into()],
+            ..PluginsConfig::default()
+        };
+        // 命中：paths/env 都没给时用户目录生效。
+        assert_eq!(
+            resolve_plugin_binary_in("preview", &cfg, Some(plugdir.as_path())),
+            Some(bin.clone())
+        );
+
+        // 显式 paths 优先于用户目录。
+        let explicit = dir.join("plug-explicit");
+        std::fs::write(&explicit, b"#!/bin/sh\n").unwrap();
+        let cfg2 = PluginsConfig {
+            enabled: vec!["preview".into()],
+            paths: std::collections::HashMap::from([(
+                "preview".to_string(),
+                explicit.to_string_lossy().into_owned(),
+            )]),
+        };
+        assert_eq!(
+            resolve_plugin_binary_in("preview", &cfg2, Some(plugdir.as_path())),
+            Some(explicit)
+        );
+
+        // 未命中：目录在但名字不在 → None；用户目录段缺席（HOME 异常）
+        //  → 整段跳过不报错。
+        assert!(resolve_plugin_binary_in("ghost", &cfg, Some(plugdir.as_path())).is_none());
+        assert!(resolve_plugin_binary_in("preview", &cfg, None).is_none());
+
+        // 目录还没创建（装了但没拷文件）→ 同样安静跳过。
+        let unmade = dir.join("home2/.config/ninja/plugins");
+        assert!(resolve_plugin_binary_in("preview", &cfg, Some(unmade.as_path())).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
