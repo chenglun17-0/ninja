@@ -31,3 +31,21 @@ zig）。macOS 之外或别的机器同理：保证 `zig version` 是 0.15.x 即
 
 首次 `cargo build/test` 会联网 clone ghostty 钉点并拉 zig 依赖
 （离线场景可用 `GHOSTTY_SOURCE_DIR` / `GHOSTTY_ZIG_SYSTEM_DIR` 预置）。
+
+## D-C 渲染跳帧取证脚本（p6 后定点修复）
+
+三个可复跑的 CPU 取证脚本（修前/修后用同一脚本同一时长对比）：
+
+```sh
+./tools/cpu_pressure_probe.sh <标签> [秒]     # yes 式全速输出（滚动型 Full 帧）
+./tools/spinner_pressure_probe.sh <标签> [秒] # \r 重写型输出（进度条类 Partial 帧）
+./tools/idle_cpu_probe.sh [秒]                # 空闲红线：稳态 CPU 必须为 0
+```
+
+读数是 `ps -o cputime=`（宿主进程累计 CPU 时间）。注意：debug 构建下
+`yes` 洪峰的 CPU ~95% 在 vendored zig 库 `vt_write` 的 debug 完整性校验
+（`PageList.grow → Page.verifyIntegrity`，`sample` 取证），渲染路径占比
+<5%，所以该项修前修后基本持平——D-C 的 renderer 收益要看 spinner 项
+（Partial 帧单行解码）与 idle 项（Clean 帧零提交）。帧级计数取证用
+`NINJA_FRAME_STATS=<path>` 环境变量（宿主周期落盘 drawn/skipped），
+E2E 回归见 `crates/ninja/tests/dirty_frame_skip.rs`。

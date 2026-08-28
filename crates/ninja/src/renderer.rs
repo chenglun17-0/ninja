@@ -5,7 +5,7 @@
 //! 顶点走 setVertexBytes + vertex_id 解引用，无需 vertex descriptor。
 //! 坐标系：设备像素，左上原点；viewport uniform 换算 NDC。
 
-use libghostty_vt::render::CursorVisualStyle;
+use libghostty_vt::render::{CursorVisualStyle, Dirty};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString};
@@ -107,6 +107,25 @@ impl Default for Theme {
     }
 }
 
+/// 上次已呈现帧的视觉签名（D-C 跳帧判据）。vt 对纯光标移动（`\r`、
+/// CSI 列定位）与 OSC 10/11 颜色变更不标脏（Dirty::Clean 但屏幕要变），
+/// 所以光标/颜色必须进对比；尺寸/层存在性由宿主侧变化驱动，一并对比。
+#[derive(Clone, Debug)]
+struct LastPresent {
+    drawable_size: (f64, f64),
+    cols: u16,
+    rows: u16,
+    fg: Rgb,
+    bg: Rgb,
+    /// 已画出的光标（含闪烁抑制后的 None）；坐标 + 样式。
+    cursor: Option<(u16, u16)>,
+    cursor_style: CursorVisualStyle,
+    /// IME 预编辑串（文本/选区/落点）。
+    marked: Option<(String, usize, usize, u16, u16)>,
+    /// 呈现时是否合成过层（层摘除后必须重画一次把层抹掉）。
+    had_layers: bool,
+}
+
 pub struct Renderer {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -124,6 +143,12 @@ pub struct Renderer {
     /// 上传过的 atlas 版本号（白块只需传一次，reset 后要重传——
     /// 由 atlas pending 列表自动覆盖，这里只做统计观察）。
     pub frames_drawn: u64,
+    /// 跳帧计数（D-C 取证：Clean 且视觉未变而不提交 drawable 的次数）。
+    pub frames_skipped: u64,
+    /// 顶点复用缓冲（跨帧保留容量；跳帧时不碰）。
+    verts: Vec<Vertex>,
+    /// 上次已呈现帧的视觉签名（None = 还没画成过任何帧）。
+    last_present: Option<LastPresent>,
 }
 
 impl Renderer {
@@ -216,9 +241,79 @@ impl Renderer {
             drawable_size: (0.0, 0.0),
             cell_px,
             frames_drawn: 0,
+            frames_skipped: 0,
+            verts: Vec::new(),
+            last_present: None,
         })
     }
+}
 
+fn should_present_with(
+    last: Option<&LastPresent>,
+    drawable_size: (f64, f64),
+    frame: &Frame,
+    layers_nonempty: bool,
+    atlas_has_pending: bool,
+) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    if frame.dirty != Dirty::Clean {
+        return true;
+    }
+    if layers_nonempty || last.had_layers {
+        return true;
+    }
+    if atlas_has_pending {
+        return true;
+    }
+    if drawable_size != last.drawable_size
+        || frame.cols != last.cols
+        || frame.rows != last.rows
+        || frame.fg != last.fg
+        || frame.bg != last.bg
+        || frame.cursor_style != last.cursor_style
+    {
+        return true;
+    }
+    let cursor = frame.cursor.map(|c| (c.x, c.y));
+    if cursor != last.cursor {
+        return true;
+    }
+    match (&frame.marked, &last.marked) {
+        (None, None) => {}
+        (Some(m), Some(l)) => {
+            if m.text != l.0
+                || m.selected.0 != l.1
+                || m.selected.1 != l.2
+                || m.x != l.3
+                || m.y != l.4
+            {
+                return true;
+            }
+        }
+        _ => return true,
+    }
+    false
+}
+
+/// 跳帧判据入口（薄封装，见 [`should_present_with`]）。
+fn renderer_should_present(
+    r: &Renderer,
+    frame: &Frame,
+    layers_nonempty: bool,
+    atlas_has_pending: bool,
+) -> bool {
+    should_present_with(
+        r.last_present.as_ref(),
+        r.drawable_size,
+        frame,
+        layers_nonempty,
+        atlas_has_pending,
+    )
+}
+
+impl Renderer {
     /// 画一帧：先组顶点（cell 循环里按需光栅化新字形），随后把
     /// atlas pending（含本帧新字形）上传纹理，最后才编码 draw。
     /// p5：cell pass 之后编码层 pass（插件 IOSurface 纹理按矩形盖上，
@@ -229,30 +324,41 @@ impl Renderer {
     /// 下一帧：无 PTY 字节、光标不闪烁时不重画）。
     /// 不额外调度重画：无新增槽位时 pending 为空、上传 no-op，无自旋。
     /// 光标可见性/闪烁相位由 view 折进 frame.cursor（None = 不画）。
+    ///
+    /// D-C：跳帧判据（`renderer_should_present`）判为不必画时直接返回（不 nextDrawable、
+    /// 不组顶点、不提交命令缓冲）——Clean 且视觉未变的帧零成本跳过；
+    /// 空闲 CPU 为零的红线由此保证（跳帧不调度任何后续工作）。
+    /// 返回是否真的提交了一帧。
     pub fn draw(
         &mut self,
         frame: &Frame,
         atlas: &mut GlyphAtlas,
         font: &mut Font,
         layers: &[LayerDraw],
-    ) {
+    ) -> bool {
         let (dw, dh) = self.drawable_size;
         if dw < 1.0 || dh < 1.0 || frame.cols == 0 || frame.rows == 0 {
-            return;
+            return false;
+        }
+        if !renderer_should_present(self, frame, !layers.is_empty(), atlas.has_pending()) {
+            self.frames_skipped += 1;
+            return false;
         }
         self.layer.setDrawableSize(CGSize {
             width: dw,
             height: dh,
         });
         let Some(drawable) = self.layer.nextDrawable() else {
-            return;
+            return false;
         };
 
-        // ---- 组顶点 ----
+        // ---- 组顶点（复用缓冲，跨帧保容量；编码完归还 self）----
         // atlas 满版 reset 会作废本 pass 已建 quad 的槽位（map 清空、
         // 槽位重分）→ 有 reset 就重建一遍顶点。上限 3 pass：reset 只
         // 由光栅化新字形触发，空闲帧不退循环，无自旋。
-        let mut verts: Vec<Vertex> = Vec::with_capacity(frame.cells.len() * 6);
+        let mut verts = std::mem::take(&mut self.verts);
+        verts.clear();
+        verts.reserve(frame.cells.len() * 6);
         for _ in 0..3 {
             let resets_before = atlas.resets();
             verts.clear();
@@ -290,7 +396,8 @@ impl Renderer {
 
         // ---- 编码并呈现 ----
         let Some(cmdbuf) = self.queue.commandBuffer() else {
-            return;
+            self.verts = verts;
+            return false;
         };
         let pass = MTLRenderPassDescriptor::new();
         let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
@@ -306,26 +413,34 @@ impl Renderer {
         });
 
         let Some(encoder) = cmdbuf.renderCommandEncoderWithDescriptor(&pass) else {
-            return;
+            self.verts = verts;
+            return false;
         };
         // SAFETY: verts 生存期覆盖 commit；顶点字节数 < 4KB 限制之外时
         // setVertexBytes 仍允许更大上限（Metal 文档上限 4KB，超限走 buffer）。
         // p1 终端尺寸上限下先按 buffer 走，避免踩 4KB 语义争议。
         let byte_len = verts.len() * std::mem::size_of::<Vertex>();
-        // SAFETY: verts 指针与长度匹配，生存期覆盖 commit。
-        let vertex_buffer = unsafe {
-            self.device.newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(verts.as_ptr() as *mut std::ffi::c_void).unwrap(),
-                byte_len,
-                MTLResourceOptions::StorageModeShared,
-            )
+        let vertex_buffer = if byte_len == 0 {
+            None
+        } else {
+            // SAFETY: verts 指针与长度匹配，生存期覆盖 commit。
+            unsafe {
+                self.device.newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(verts.as_ptr() as *mut std::ffi::c_void).unwrap(),
+                    byte_len,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
         };
-        let Some(vertex_buffer) = vertex_buffer else {
-            return;
-        };
+        if byte_len > 0 && vertex_buffer.is_none() {
+            self.verts = verts;
+            return false;
+        }
         encoder.setRenderPipelineState(&self.pipeline);
         unsafe {
-            encoder.setVertexBuffer_offset_atIndex(Some(&vertex_buffer), 0, 0);
+            if let Some(vb) = &vertex_buffer {
+                encoder.setVertexBuffer_offset_atIndex(Some(vb), 0, 0);
+            }
             let vp = [dw as f32, dh as f32];
             encoder.setVertexBytes_length_atIndex(std::ptr::NonNull::new(vp.as_ptr() as *mut std::ffi::c_void).unwrap(), 8, 1);
             encoder.setFragmentTexture_atIndex(Some(&self.atlas_texture), 0);
@@ -374,6 +489,22 @@ impl Renderer {
         cmdbuf.presentDrawable(drawable);
         cmdbuf.commit();
         self.frames_drawn += 1;
+        // 已呈现：记录视觉签名（后续 Clean 帧跳帧判据）。
+        self.last_present = Some(LastPresent {
+            drawable_size: (dw, dh),
+            cols: frame.cols,
+            rows: frame.rows,
+            fg: frame.fg,
+            bg: frame.bg,
+            cursor: frame.cursor.map(|c| (c.x, c.y)),
+            cursor_style: frame.cursor_style,
+            marked: frame
+                .marked
+                .as_ref()
+                .map(|m| (m.text.clone(), m.selected.0, m.selected.1, m.x, m.y)),
+            had_layers: !layers.is_empty(),
+        });
+        self.verts = verts;
 
         // 取证开关：NINJA_LAYER_PROBE=<dir> 时把每个已呈现层的纹理读回
         // 落盘 <dir>/<handle>.ppm（E2E 断言「层内确有文本墨迹」用；
@@ -384,6 +515,7 @@ impl Renderer {
                 self.dump_layer_ppm(l, std::path::Path::new(&dir));
             }
         }
+        true
     }
 
     /// 层纹理读回 → PPM（BGRA→RGB）。失败静默（取证钩子不炸产品路径）。
@@ -790,5 +922,176 @@ mod tests {
         }
         let ink = buf[1..].iter().filter(|&&v| v > 0).count();
         assert!(ink > 50, "atlas ink beyond white block: {ink} (want >50)");
+    }
+
+    /// D-C 回归（需 drawable，headless 自动跳过）：Clean 且视觉未变的
+    /// 第二帧不提交 drawable（frames_drawn 不涨、frames_skipped 涨）；
+    /// 光标动了的 Clean 帧（`\r` 语义）仍然提交。
+    #[test]
+    fn clean_unchanged_frame_skips_drawable() {
+        let scale = 2.0;
+        let mut font = Font::new(13.0, scale);
+        let cw = (font.metrics.cell_w * scale).ceil() as u32;
+        let ch = (font.metrics.cell_h * scale).ceil() as u32;
+        let layer = CAMetalLayer::new();
+        layer.setContentsScale(scale);
+        let Some(mut r) = Renderer::new(
+            layer,
+            GlyphAtlas::EDGE,
+            (f64::from(cw), f64::from(ch), font.baseline_offset() * scale),
+        ) else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        r.drawable_size = (f64::from(cw) * 10.0, f64::from(ch) * 4.0);
+
+        let mk_frame = |cur_x: u16| Frame {
+            cols: 10,
+            rows: 4,
+            fg: Rgb(255, 255, 255),
+            bg: Rgb(0, 0, 0),
+            cursor: Some(CursorView { x: cur_x, y: 0, at_wide_tail: false }),
+            cursor_style: CursorVisualStyle::Block,
+            cursor_blinking: false,
+            dirty: libghostty_vt::render::Dirty::Clean,
+            cells: vec![FrameCell::default(); 40],
+            marked: None,
+        };
+
+        let mut atlas = GlyphAtlas::new(ch);
+        let f1 = mk_frame(5);
+        r.draw(&f1, &mut atlas, &mut font, &[]);
+        if r.frames_drawn == 0 {
+            eprintln!("skip: no drawable (headless)");
+            return;
+        }
+        assert_eq!(r.frames_drawn, 1);
+
+        // 同帧再来：Clean 且签名一致 → 跳。
+        r.draw(&f1, &mut atlas, &mut font, &[]);
+        assert_eq!(r.frames_drawn, 1, "Clean 未变帧不得提交 drawable");
+        assert_eq!(r.frames_skipped, 1);
+
+        // 光标移动的 Clean 帧（vt 对 `\r` 不标脏）：必须提交。
+        let f2 = mk_frame(0);
+        r.draw(&f2, &mut atlas, &mut font, &[]);
+        assert_eq!(r.frames_drawn, 2, "Clean 但光标变了必须重画");
+        assert_eq!(r.frames_skipped, 1);
+    }
+
+    /// D-C 回归（纯函数，headless）：跳帧判据。
+    /// Clean 且视觉签名一致 → 跳；任一「vt 不标脏但屏幕要变」路径
+    ///（光标移动/OSC 颜色/预编辑/尺寸/层摘除）→ 画；首帧/帧脏/有层/
+    /// atlas 有待传 → 画。
+    #[test]
+    fn should_present_covers_clean_but_visible_changes() {
+        use crate::term::Marked;
+
+        let frame = |dirty: Dirty, cursor: Option<(u16, u16)>, fg: Rgb, marked: Option<Marked>| Frame {
+            cols: 10,
+            rows: 4,
+            fg,
+            bg: Rgb(0, 0, 0),
+            cursor: cursor.map(|(x, y)| CursorView { x, y, at_wide_tail: false }),
+            cursor_style: CursorVisualStyle::Block,
+            cursor_blinking: false,
+            dirty,
+            cells: Vec::new(),
+            marked,
+        };
+
+        // 首帧必画。
+        assert!(should_present_with(
+            None,
+            (800.0, 600.0),
+            &frame(Dirty::Clean, Some((0, 0)), Rgb(255, 255, 255), None),
+            false,
+            false
+        ));
+
+        let last = LastPresent {
+            drawable_size: (800.0, 600.0),
+            cols: 10,
+            rows: 4,
+            fg: Rgb(255, 255, 255),
+            bg: Rgb(0, 0, 0),
+            cursor: Some((3, 1)),
+            cursor_style: CursorVisualStyle::Block,
+            marked: None,
+            had_layers: false,
+        };
+        let same = frame(Dirty::Clean, Some((3, 1)), Rgb(255, 255, 255), None);
+
+        // Clean + 全一致 → 跳（不提交 drawable / 不重建顶点）。
+        assert!(!should_present_with(Some(&last), (800.0, 600.0), &same, false, false));
+
+        // vt 不标脏但屏幕要变：`\r` 类光标移动。
+        assert!(should_present_with(
+            Some(&last),
+            (800.0, 600.0),
+            &frame(Dirty::Clean, Some((0, 1)), Rgb(255, 255, 255), None),
+            false,
+            false
+        ));
+        // 光标消失（闪烁抑制相位翻转）。
+        assert!(should_present_with(
+            Some(&last),
+            (800.0, 600.0),
+            &frame(Dirty::Clean, None, Rgb(255, 255, 255), None),
+            false,
+            false
+        ));
+        // OSC 10/11 改默认前景。
+        assert!(should_present_with(
+            Some(&last),
+            (800.0, 600.0),
+            &frame(Dirty::Clean, Some((3, 1)), Rgb(1, 2, 3), None),
+            false,
+            false
+        ));
+        // IME 预编辑出现。
+        let with_marked = frame(
+            Dirty::Clean,
+            Some((3, 1)),
+            Rgb(255, 255, 255),
+            Some(Marked { text: "你".into(), selected: (0, 0), x: 3, y: 1 }),
+        );
+        assert!(should_present_with(
+            Some(&last),
+            (800.0, 600.0),
+            &with_marked,
+            false,
+            false
+        ));
+        // resize（drawable 尺寸变化）。
+        assert!(should_present_with(Some(&last), (801.0, 600.0), &same, false, false));
+        // 帧脏（Partial/Full）。
+        assert!(should_present_with(
+            Some(&last),
+            (800.0, 600.0),
+            &frame(Dirty::Partial, Some((3, 1)), Rgb(255, 255, 255), None),
+            false,
+            false
+        ));
+        // 有层 → 每帧重画（层内容宿主无法脏跟踪）。
+        assert!(should_present_with(Some(&last), (800.0, 600.0), &same, true, false));
+        let last_with_layer = LastPresent { had_layers: true, ..last.clone() };
+        assert!(should_present_with(
+            Some(&last_with_layer),
+            (800.0, 600.0),
+            &same,
+            true,
+            false
+        ));
+        // 上次带层、这次无层 → 必画（把层从屏幕上抹掉）。
+        assert!(should_present_with(
+            Some(&last_with_layer),
+            (800.0, 600.0),
+            &same,
+            false,
+            false
+        ));
+        // atlas 还有待上传（首帧字形同帧上传兜底）。
+        assert!(should_present_with(Some(&last), (800.0, 600.0), &same, false, true));
     }
 }

@@ -74,6 +74,17 @@ impl PtyInner {
         (chunks, eof)
     }
 
+    /// rx 队列里是否还有事件（非阻塞 peek）。D-C 洪峰合帧用：读线程
+    /// 在本次 perform 期间又压入了字节就先不重画——下一个 perform
+    /// 会带上最新状态再画（push 先于 signal，看到 push 必有后续
+    /// fire，不会丢帧）。
+    pub fn has_pending(&self) -> bool {
+        match self.rx.try_lock() {
+            Ok(q) => !q.is_empty(),
+            Err(_) => true, // 主线程正持有（不可能：drain 已还锁）→保守画
+        }
+    }
+
     /// 子进程 pid（用于关窗时 SIGHUP 整个进程组）。
     pub fn child_pid(&self) -> libc::pid_t {
         self.child.load(Ordering::Acquire)
@@ -373,6 +384,36 @@ mod tests {
 
         // resize ioctl 不报错（shell 侧效果不在此断言）。
         pty.resize(100, 30, 10, 20);
+    }
+
+    /// D-C 回归：has_pending peek——drain 后为 false，写过去回声到达后
+    /// 为 true（洪峰合帧的判据；push 先于 signal，看到 true 必有后续 fire）。
+    #[test]
+    fn has_pending_tracks_rx_queue() {
+        let pty = Pty::spawn(Some("/bin/cat"), 40, 10).unwrap();
+        // 静默期：队列空。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pty.inner.has_pending() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = pty.inner.drain();
+        }
+        assert!(!pty.inner.has_pending(), "静默期队列应空");
+
+        // 写入 → cat 回声 → 读线程压进 rx → has_pending 为真。
+        pty.inner.write(b"peek\n".to_vec());
+        let mut got = false;
+        while std::time::Instant::now() < deadline {
+            if pty.inner.has_pending() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(got, "回声入队后 has_pending 应为真");
+
+        // drain 干净 → 回 false。
+        let _ = pty.inner.drain();
+        assert!(!pty.inner.has_pending());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! 回调捕获 `Arc` 共享状态，因此 `Terminal<'static, 'static>` 可以搬进 ivars。
 
 use libghostty_vt::error::Result;
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator};
+use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIteration, RowIterator};
 use libghostty_vt::screen::{CellWide, Screen};
 use libghostty_vt::selection::gesture::Gesture;
 use libghostty_vt::style::{RgbColor, Style, Underline};
@@ -107,6 +107,12 @@ pub struct TermState {
     cells: CellIterator<'static>,
     pub key_encoder: key::Encoder<'static>,
     pub gesture: Gesture<'static>,
+    /// 行解码复用缓冲（Partial 帧只解码脏行，先落这里再搬进帧 cells；
+    /// 常驻免每行每帧分配）。
+    row_scratch: Vec<FrameCell>,
+    /// 帧调用方那份 cells 缓存是否可信（上一次 frame_into 完整解码过）。
+    /// 解码中途出错会置 false，防 Partial 帧拿到残缺缓存。
+    cells_valid: bool,
 }
 
 impl TermState {
@@ -123,6 +129,8 @@ impl TermState {
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
             terminal,
+            row_scratch: Vec::new(),
+            cells_valid: false,
         })
     }
 
@@ -228,9 +236,31 @@ impl TermState {
 
     /// 刷新渲染快照，产出帧。调用方渲染后无需手动清 dirty（这里统一
     /// set_dirty(Clean) + 行 dirty 清零，下一次 update 重新累计）。
+    ///
+    /// D-C 脏标记跳帧：帧 cells 是跨调用复用的缓存——
+    ///
+    /// - `Dirty::Full`（或缓存不可信/尺寸变了）：全量解码；
+    /// - `Dirty::Partial`：只解码脏行，干净行沿用缓存（vt 的行脏标记
+    ///   就是「本行快照重建过」的语义，干净行内容未变）；
+    /// - `Dirty::Clean`：不碰 cells，也不迭代行（零 FFI）。
+    ///
+    /// 帧级 cursor/颜色始终刷新——vt 对纯光标移动（如 `\r`）和
+    /// OSC 10/11 不标脏，这两类「Clean 但屏幕要变」由渲染器对比
+    /// cursor/fg/bg 兑现（见 renderer 的跳帧判据）。
     pub fn frame_into(&mut self, frame: &mut Frame) -> Result<()> {
+        // 本调用开始时缓存的信任状态（上一次 frame_into 是否完整走完）。
+        let cache_was_valid = self.cells_valid;
+        self.cells_valid = false;
         {
-            let snapshot = self.render_state.update(&self.terminal)?;
+            let TermState {
+                terminal,
+                render_state,
+                rows,
+                cells,
+                row_scratch,
+                ..
+            } = self;
+            let snapshot = render_state.update(terminal)?;
             let colors = snapshot.colors()?;
             frame.cols = snapshot.cols()?;
             frame.rows = snapshot.rows()?;
@@ -245,47 +275,90 @@ impl TermState {
                 at_wide_tail: c.at_wide_tail,
             });
 
-            frame.cells.clear();
-            frame.cells.reserve(usize::from(frame.cols) * usize::from(frame.rows));
+            let cols = usize::from(frame.cols);
+            let rows_n = usize::from(frame.rows);
+            // Partial 复用前提：上次完整解码过 + 缓存尺寸与当前网格一致
+            //（resize 途中 cols/rows 变化即作废，走全量）。
+            let cache_usable = cache_was_valid
+                && cols > 0
+                && rows_n > 0
+                && frame.cells.len() == cols * rows_n;
 
-            let mut row_iter = self.rows.update(&snapshot)?;
+            let mut row_iter = rows.update(&snapshot)?;
             let mut row_index: usize = 0;
-            while let Some(row) = row_iter.next() {
-                let mut cell_iter = self.cells.update(row)?;
-                let mut x: usize = 0;
-                while let Some(cell) = cell_iter.next() {
-                    let style: Style = cell.style().unwrap_or_default();
-                    let text = {
-                        let mut s = String::new();
-                        cell.graphemes_utf8(&mut s).ok();
-                        s
-                    };
-                    frame.cells.push(FrameCell {
-                        text,
-                        wide: cell.raw_cell().map(|c| c.wide().unwrap_or(CellWide::Narrow).into()).unwrap_or_default(),
-                        fg: cell.fg_color().ok().flatten().map(Into::into),
-                        bg: cell.bg_color().ok().flatten().map(Into::into),
-                        inverse: style.inverse,
-                        bold: style.bold,
-                        italic: style.italic,
-                        faint: style.faint,
-                        underline: style.underline != Underline::None,
-                        strikethrough: style.strikethrough,
-                        selected: cell.is_selected().unwrap_or(false),
-                    });
-                    x += 1;
-                    let _ = x;
+            match frame.dirty {
+                // Clean：无行重建过，不迭代（行脏标记本就全 false）。
+                Dirty::Clean => {}
+                Dirty::Partial if cache_usable => {
+                    while let Some(row) = row_iter.next() {
+                        if row.dirty()? {
+                            decode_row_into(row, cells, row_scratch)?;
+                            let base = row_index * cols;
+                            for (dst, src) in frame.cells[base..base + cols]
+                                .iter_mut()
+                                .zip(row_scratch.drain(..))
+                            {
+                                *dst = src;
+                            }
+                        }
+                        let _ = row.set_dirty(false);
+                        row_index += 1;
+                    }
                 }
-                let _ = row.set_dirty(false);
-                row_index += 1;
-                let _ = row_index;
+                _ => {
+                    frame.cells.clear();
+                    frame.cells.reserve(cols * rows_n);
+                    while let Some(row) = row_iter.next() {
+                        decode_row_into(row, cells, row_scratch)?;
+                        frame.cells.append(row_scratch);
+                        let _ = row.set_dirty(false);
+                        row_index += 1;
+                    }
+                }
             }
+            let _ = row_index;
             snapshot.set_dirty(Dirty::Clean)?;
         }
+        self.cells_valid = true;
         Ok(())
     }
+}
 
-    /// 视口坐标 → grid ref（选区用）。y 在视口内，x 夹在 [0, cols)。
+/// 把一行 cell 解码进 `out`（先 clear）。逐 cell 读样式/文本/颜色，
+/// 与旧全量路径同一套字段，只是按行调用（D-C：Partial 帧只解码脏行）。
+fn decode_row_into<'a>(
+    row: &RowIteration<'a, '_>,
+    cells: &mut CellIterator<'a>,
+    out: &mut Vec<FrameCell>,
+) -> Result<()> {
+    out.clear();
+    let mut cell_iter = cells.update(row)?;
+    while let Some(cell) = cell_iter.next() {
+        let style: Style = cell.style().unwrap_or_default();
+        let mut text = String::new();
+        cell.graphemes_utf8(&mut text).ok();
+        out.push(FrameCell {
+            text,
+            wide: cell
+                .raw_cell()
+                .map(|c| c.wide().unwrap_or(CellWide::Narrow).into())
+                .unwrap_or_default(),
+            fg: cell.fg_color().ok().flatten().map(Into::into),
+            bg: cell.bg_color().ok().flatten().map(Into::into),
+            inverse: style.inverse,
+            bold: style.bold,
+            italic: style.italic,
+            faint: style.faint,
+            underline: style.underline != Underline::None,
+            strikethrough: style.strikethrough,
+            selected: cell.is_selected().unwrap_or(false),
+        });
+    }
+    Ok(())
+}
+
+/// 视口坐标 → grid ref（选区用）。y 在视口内，x 夹在 [0, cols)。
+impl TermState {
     pub fn grid_ref_viewport(
         &self,
         x: u16,
@@ -448,5 +521,68 @@ mod tests {
         term.feed(b"\x1b[?1004h");
         assert_eq!(term.encode_focus(true), Some(b"\x1b[I".to_vec()));
         assert_eq!(term.encode_focus(false), Some(b"\x1b[O".to_vec()));
+    }
+
+    /// D-C 回归：帧 cells 缓存跟随脏标记。
+    /// 1) 首帧 Full 全量解码；
+    /// 2) 单行更新 Partial：只重解码脏行，干净行沿用缓存且内容正确；
+    /// 3) 无字节 Clean：cells 原样（不解码也不清空）；
+    /// 4) vt 对 `\r` 不标脏（Clean）但光标变了——cells 不变、cursor 变，
+    ///    渲染器跳帧判据必须对比光标（见 renderer 的 should_present 测试）。
+    #[test]
+    fn dirty_frame_decode_reuses_clean_rows() {
+        let mut term = TermState::new(10, 4, 100).unwrap();
+        let mut f = empty_frame();
+
+        term.feed(b"aaabbb\r\ncccddd");
+        term.frame_into(&mut f).unwrap();
+        assert_eq!(f.dirty, Dirty::Full); // 首帧维度变化必 Full
+        assert_eq!(&f.cells[0].text, "a");
+        assert_eq!(&f.cells[10].text, "c");
+
+        // 只改第 1 行（`\r` 归零后写入）：Partial，第 0 行（脏行集外）
+        // 缓存直接复用。
+        term.feed(b"\rXYZ");
+        term.frame_into(&mut f).unwrap();
+        assert_eq!(f.dirty, Dirty::Partial);
+        assert_eq!(&f.cells[10].text, "X");
+        assert_eq!(&f.cells[12].text, "Z");
+        // 第 0 行未被重解码也能对上当前网格（缓存即最新）。
+        assert_eq!(&f.cells[0].text, "a");
+        assert_eq!(&f.cells[4].text, "b");
+
+        // 无输入：Clean，cells 保持上一次内容（不清空、不重解码）。
+        let cells_before = f.cells.clone();
+        term.frame_into(&mut f).unwrap();
+        assert_eq!(f.dirty, Dirty::Clean);
+        assert_eq!(f.cells.len(), cells_before.len());
+        assert!(f
+            .cells
+            .iter()
+            .zip(cells_before.iter())
+            .all(|(a, b)| a.text == b.text));
+
+        // `\r` 光标归零：Clean 但光标坐标变化（跳帧判据的光标对比由此驱动）。
+        term.feed(b"\r");
+        term.frame_into(&mut f).unwrap();
+        assert_eq!(f.dirty, Dirty::Clean);
+        assert_eq!(f.cursor.map(|c| (c.x, c.y)), Some((0, 1)));
+    }
+
+    /// D-C 回归：resize 后缓存作废——Partial 帧不会拿旧网格的 cells
+    /// 拼。resize 触发 vt 全量重建（Full），新尺寸全量解码。
+    #[test]
+    fn resize_invalidates_cells_cache() {
+        let mut term = TermState::new(8, 3, 100).unwrap();
+        let mut f = empty_frame();
+        term.feed(b"hello");
+        term.frame_into(&mut f).unwrap();
+        assert_eq!(f.cells.len(), 8 * 3);
+
+        term.resize(12, 3, 8, 16);
+        term.frame_into(&mut f).unwrap();
+        assert_eq!(f.dirty, Dirty::Full);
+        assert_eq!(f.cells.len(), 12 * 3);
+        assert_eq!(&f.cells[0].text, "h");
     }
 }

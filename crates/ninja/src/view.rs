@@ -152,6 +152,9 @@ pub struct Ivars {
     /// 上一次 setFrameSize 的尺寸（点）：AppKit 在窗口装配/居中阶段会
     /// 重复投递同尺寸事件；同尺寸 = 几何未变 = 不收层（见 set_frame_size）。
     last_size: Cell<(f64, f64)>,
+    /// D-C 取证钩子状态：NINJA_FRAME_STATS 路径 + 上次落盘时刻
+    ///（无 env 时零开销；Instant 非 Copy，套 RefCell）。
+    stats_probe: RefCell<Option<(std::ffi::OsString, std::time::Instant)>>,
 }
 
 define_class!(
@@ -727,6 +730,7 @@ impl TerminalView {
             blink_timer: Cell::new(None),
             wake: Cell::new(None),
             last_size: Cell::new((0.0, 0.0)),
+            stats_probe: RefCell::new(None),
         };
 
         // 两阶段初始化：先放 ivars，再走 NSView 的 initWithFrame:。
@@ -954,10 +958,12 @@ impl TerminalView {
     // ---- PTY 数据泵 ----
 
     fn on_pty_data(&self) {
-        let (eof, new_title) = {
+        let (eof, new_title, p_still_pending) = {
             let mut st = self.state();
             let Some(p) = &st.pty else { return };
             let (chunks, eof) = p.inner.drain();
+            // 洪峰合帧 peek（见函数尾）：队里还有字节 = 后续 perform 会重画。
+            let pending = p.inner.has_pending();
             for c in chunks {
                 st.term.feed(&c);
             }
@@ -969,7 +975,7 @@ impl TerminalView {
             } else {
                 None
             };
-            (eof, new_title)
+            (eof, new_title, pending)
         };
         if let Some(title) = new_title {
             if let Some(w) = self.window() {
@@ -982,6 +988,12 @@ impl TerminalView {
             // 才退出，由 applicationShouldTerminateAfterLastWindowClosed 汇聚）。
             self.shutdown();
             crate::shell::handle_pane_eof(self);
+            return;
+        }
+        // D-C 洪峰合帧：本次 perform 期间读线程又压入了字节 → 中间态
+        // 不值得画，等下一个 perform（必会到某：push 先于 signal）
+        // 带最新状态再画。稳态（零星输出）队列空，照常重画，无延迟。
+        if p_still_pending {
             return;
         }
         self.render_now();
@@ -1034,6 +1046,33 @@ impl TerminalView {
             frame_buf.marked = None;
         }
         r.draw(frame_buf, atlas, font, &layers);
+        // D-C 取证钩子：NINJA_FRAME_STATS=<path> 时周期性（≥200ms）落盘
+        // 画帧/跳帧计数（E2E dirty_skip 回归用；无 env 时零开销）。
+        if let Some(path) = std::env::var_os("NINJA_FRAME_STATS") {
+            let now = std::time::Instant::now();
+            let mut probe = self.ivars().stats_probe.borrow_mut();
+            if let Some(p) = probe.as_mut() {
+                if now.duration_since(p.1) >= std::time::Duration::from_millis(200) {
+                    p.1 = now;
+                    let _ = std::fs::write(
+                        &p.0,
+                        format!(
+                            "{{\"drawn\":{},\"skipped\":{},\"dirty\":{:?}\"}}\n",
+                            r.frames_drawn, r.frames_skipped, frame_buf.dirty
+                        ),
+                    );
+                }
+            } else {
+                *probe = Some((path.clone(), now));
+                let _ = std::fs::write(
+                    &path,
+                    format!(
+                        "{{\"drawn\":{},\"skipped\":{},\"dirty\":{:?}\"}}\n",
+                        r.frames_drawn, r.frames_skipped, frame_buf.dirty
+                    ),
+                );
+            }
+        }
     }
 
     // ---- 键盘/焦点/剪贴板 ----

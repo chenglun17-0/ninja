@@ -4,3 +4,7 @@
 # 本地工具链（zig 钉版 tarball 解压目录），见 tools/README.md
 /tools/*
 !/tools/README.md
+# D-C 取证脚本（CPU 压力/空闲探针，可复跑对比）：入库
+!/tools/cpu_pressure_probe.sh
+!/tools/spinner_pressure_probe.sh
+!/tools/idle_cpu_probe.sh

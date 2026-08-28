@@ -3,6 +3,11 @@
 //! 分配是简单的 shelf/行分配器：行高等于 cell 行高（设备像素），一行放满
 //! 换下一行；整版放满就清空重来（缓存条目同时作废，按需重新光栅化）。
 //! p1 不做 LRU 淘汰——2000+ 槽位对单终端足够，满了整版重排成本也可接受。
+//!
+//! D-C：槽位表按字重分四张 `HashMap<String, GlyphRect>`，命中查询走
+//! `Borrow<str>`（零分配）——旧实现每 cell 每帧 `text.to_string()` 建
+//! 查询 key，重画热路径上 1920 次/帧的堆分配是 debug 构建大量输出
+//! 吃力的直接成分之一。
 
 use std::collections::HashMap;
 
@@ -21,16 +26,20 @@ pub struct GlyphRect {
     pub dx: f64,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct GlyphKey {
-    text: String,
-    weight: Weight,
-}
-
 /// 待上传到 GPU 的区域（渲染器每帧消费）。
 pub struct PendingUpload {
     pub region: GlyphRect,
     pub bytes: Vec<u8>,
+}
+
+/// 字重 → 槽位表下标（四变体固定）。
+fn weight_idx(w: Weight) -> usize {
+    match w {
+        Weight::Regular => 0,
+        Weight::Bold => 1,
+        Weight::Italic => 2,
+        Weight::BoldItalic => 3,
+    }
 }
 
 pub struct GlyphAtlas {
@@ -39,7 +48,8 @@ pub struct GlyphAtlas {
     /// 当前行已用宽。
     cursor_x: u32,
     cursor_y: u32,
-    map: HashMap<GlyphKey, GlyphRect>,
+    /// 四张槽位表（Regular/Bold/Italic/BoldItalic）；查询走 Borrow<str>。
+    maps: [HashMap<String, GlyphRect>; 4],
     pending: Vec<PendingUpload>,
     /// 1x1 白块：实心 quad（背景/光标/下划线）走同一管线。
     white: GlyphRect,
@@ -69,7 +79,7 @@ impl GlyphAtlas {
             row_h,
             cursor_x: white.w,
             cursor_y: 0,
-            map: HashMap::new(),
+            maps: [HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new()],
             pending: vec![PendingUpload {
                 region: white,
                 bytes: vec![255],
@@ -89,17 +99,14 @@ impl GlyphAtlas {
     }
 
     /// 取槽位；未命中则光栅化并占位。返回 None = 没法画（光栅化失败）。
+    /// 命中路径零分配（Borrow<str> 查询，见模块头 D-C 注）。
     pub fn get_or_rasterize(
         &mut self,
         text: &str,
         weight: Weight,
         font: &mut Font,
     ) -> Option<GlyphRect> {
-        let key = GlyphKey {
-            text: text.to_string(),
-            weight,
-        };
-        if let Some(&r) = self.map.get(&key) {
+        if let Some(&r) = self.maps[weight_idx(weight)].get(text) {
             return Some(r);
         }
 
@@ -126,7 +133,7 @@ impl GlyphAtlas {
             dx: glyph.dx,
         };
         self.cursor_x += glyph.w;
-        self.map.insert(key, rect);
+        self.maps[weight_idx(weight)].insert(text.to_string(), rect);
         self.total_slots += 1;
         self.pending.push(PendingUpload {
             region: rect,
@@ -141,7 +148,9 @@ impl GlyphAtlas {
     }
 
     fn reset(&mut self) {
-        self.map.clear();
+        for m in &mut self.maps {
+            m.clear();
+        }
         self.total_slots = 0;
         self.pending.clear();
         self.resets += 1;
@@ -157,6 +166,12 @@ impl GlyphAtlas {
     /// 渲染器每帧取走上传列表。
     pub fn take_pending(&mut self) -> Vec<PendingUpload> {
         std::mem::take(&mut self.pending)
+    }
+
+    /// 是否还有待上传槽位（渲染器跳帧判据之一：有 pending 必须画，
+    /// 否则字形滞留 CPU 侧——空闲首开同帧上传语义依赖此兜底）。
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     pub fn cached_count(&self) -> usize {
