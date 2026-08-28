@@ -81,7 +81,7 @@ codesign --verify --deep --verbose=2 dist/Ninja.app   # 应通过（Apple Develo
 spctl -a -vv dist/Ninja.app                            # 预期不通过（非 Developer ID，见公证残留）
 ```
 
-## p7 本机取证摘要（2025-12，macOS 26.6.1 arm64）
+## p7 本机取证摘要（2026-08，macOS 26.6.1 arm64）
 
 实施者与验证员各自复跑（证据见 workflow 记录）：
 
