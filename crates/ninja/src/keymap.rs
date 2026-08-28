@@ -5,6 +5,12 @@
 //!    `insertText` / `doCommandBySelector` 回调里落字节。
 //! 2. 功能键（F1-F12、无字符键）和宿主直通键在 keyDown 里直接编码。
 //!
+//! 例外（D-B）：Ctrl 组合（非 Cmd）必须整类走第 2 条路——AppKit 键绑定
+//! 把 Ctrl+字母翻译成编辑命令（^a→moveToBeginningOfParagraph:），
+//! 未绑定的 ^c 在 IME 输入源下被 interpretKeyEvents 整体吞掉（零回调），
+//! 而控制字符又过不了 sanitize 文本路径（C0 被剥）——只有按 vt 键 +
+//! CTRL 修饰编码才能得到终端语义的 C0 字节（^C→0x03）。
+//!
 //! macOS 虚拟键码是固定值（HIToolbox Events.h），与键盘布局无关。
 
 use libghostty_vt::key::{Key, Mods};
@@ -245,6 +251,25 @@ pub fn sanitize_utf8(text: &str) -> Option<String> {
     }
 }
 
+/// D-B：Ctrl 组合是否必须绕过 interpretKeyEvents、在 keyDown 里按
+/// vt 键直接编码。条件：CTRL 修饰 + 键码有逻辑键映射（SUPER 组合在
+/// 调用方上游已被单独截走）。无映射键码的 Ctrl 组合（罕见）回落
+/// interpret 兜底，行为不劣于修复前。
+pub fn ctrl_bypasses_interpret(code: u16, mods: Mods) -> bool {
+    mods.contains(Mods::CTRL) && key_from_code(code).is_some()
+}
+
+/// D-B：Ctrl 直通路径喂给 vt 编码器的 utf8。取
+/// charactersIgnoringModifiers 小写化后过 sanitize——编码器要求
+/// 「未修饰、无控制字符」的文本（key::Event::set_utf8 文档），据此
+/// 派生 C0 字节；小写化让 ⇧^C 也归到 ^C=0x03（终端惯例：shift 不
+/// 参与 C0 派生，编码器对大写 "C" 会改产 CSI u 序列）。
+/// PUA 功能键码（Ctrl+方向键的 U+F702 等）剥成 None，编码器按
+/// 逻辑键 + CTRL 产出 CSI 修饰序列。
+pub fn ctrl_key_utf8(chars_ignoring_mods: &str) -> Option<String> {
+    sanitize_utf8(&chars_ignoring_mods.to_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +304,32 @@ mod tests {
         assert_eq!(sanitize_utf8("").as_deref(), None);
         // 中文正常保留（IME 提交路径不走这里，但别误伤）。
         assert_eq!(sanitize_utf8("你").as_deref(), Some("你"));
+    }
+
+    #[test]
+    fn ctrl_bypass_rules() {
+        // D-B：Ctrl + 有映射键码 → 绕过 interpretKeyEvents 直通编码。
+        assert!(ctrl_bypasses_interpret(0x08, Mods::CTRL)); // C
+        assert!(ctrl_bypasses_interpret(0x08, Mods::CTRL | Mods::SHIFT)); // ⇧^C
+        assert!(ctrl_bypasses_interpret(0x7B, Mods::CTRL)); // ←
+        assert!(ctrl_bypasses_interpret(0x31, Mods::CTRL)); // Space
+        // 无 Ctrl、或键码无映射 → 仍走 interpret 文本路径。
+        assert!(!ctrl_bypasses_interpret(0x08, Mods::empty()));
+        assert!(!ctrl_bypasses_interpret(0x0A, Mods::CTRL)); // 表外键码
+    }
+
+    #[test]
+    fn ctrl_key_utf8_lowers_and_sanitizes() {
+        // 编码器要「未修饰」文本：^C 与 ⇧^C 的 charactersIgnoringModifiers
+        // （"c"/"C"）统一小写化 → 0x03，而非大写路径的 CSI u 序列。
+        assert_eq!(ctrl_key_utf8("c").as_deref(), Some("c"));
+        assert_eq!(ctrl_key_utf8("C").as_deref(), Some("c"));
+        // PUA 功能键码与 C0 控制字符剥除（同 sanitize 语义）。
+        assert_eq!(ctrl_key_utf8("\u{f702}"), None);
+        assert_eq!(ctrl_key_utf8("\u{3}"), None);
+        assert_eq!(ctrl_key_utf8(""), None);
+        // 空格保留（^Space → 0x00 由编码器派生）。
+        assert_eq!(ctrl_key_utf8(" ").as_deref(), Some(" "));
     }
 
     #[test]

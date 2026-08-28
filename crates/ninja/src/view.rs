@@ -279,6 +279,27 @@ define_class!(
                 return;
             }
 
+            // D-B：Ctrl 组合不能走 interpretKeyEvents——AppKit 键绑定表会把
+            // Ctrl+字母翻译成编辑命令（^a→moveToBeginningOfParagraph:，
+            // 终端要的是 0x01），未绑定的 ^c 在 IME 输入源下被整体吞掉
+            //（interpretKeyEvents 零回调，复现取证见
+            // tests/ctrl_c_interrupts.rs）；而控制字符又过不了 sanitize
+            // 文本路径（C0 被剥）。唯一正确路径：按 vt 键 + CTRL 修饰编码
+            // 出 C0 字节（^C→0x03，同 Ghostty 语义；⇧^C 同归 0x03，
+            // Ctrl+方向键归 CSI 修饰序列）。
+            if keymap::ctrl_bypasses_interpret(code, mods) {
+                let utf8 = chars.as_deref().and_then(keymap::ctrl_key_utf8);
+                // Ctrl 打断 IME 预编辑（同 insertText: 的清理语义）。
+                {
+                    let mut st = self.state();
+                    if st.marked.take().is_some() {
+                        st.blink_on = true;
+                    }
+                }
+                self.encode_and_send(keymap::key_from_code(code), mods, utf8.as_deref());
+                return;
+            }
+
             // 其余（含 IME 输入态）走 interpretKeyEvents：
             // 文本 → insertText:；编辑键 → doCommandBySelector:。
             {

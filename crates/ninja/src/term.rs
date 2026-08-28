@@ -397,6 +397,51 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_letter_encodes_c0_byte() {
+        // D-B 回归：Ctrl+字母按 vt 键编码出 C0 控制字节（宿主 keyDown 的
+        // Ctrl 直通路径，绕过 interpretKeyEvents/sanitize 文本路径）。
+        // 交互程序（pi、bash）依赖 ^C=SIGINT（ISIG）、^A/^E/^U 行编辑。
+        let mut term = TermState::new(80, 24, 100).unwrap();
+        let mut out = Vec::new();
+        assert!(term.encode_key(key::Key::C, key::Mods::CTRL, Some("c"), &mut out));
+        assert_eq!(out, b"\x03", "^C 必须 0x03");
+
+        // ⇧^C 同归 0x03：小写化后的未修饰文本，shift 不参与 C0 派生
+        //（大写 "C" 会被编码器改产 CSI 99;5u）。终端惯例。
+        out.clear();
+        assert!(term.encode_key(
+            key::Key::C,
+            key::Mods::CTRL | key::Mods::SHIFT,
+            Some("c"),
+            &mut out
+        ));
+        assert_eq!(out, b"\x03");
+
+        // 常用 C0 家族：^A/^H/^U/^Z/^Space。^H=0x08 与退格 0x7f 区分。
+        for (key, text, want) in [
+            (key::Key::A, "a", b"\x01".as_slice()),
+            (key::Key::H, "h", b"\x08".as_slice()),
+            (key::Key::U, "u", b"\x15".as_slice()),
+            (key::Key::Z, "z", b"\x1a".as_slice()),
+            (key::Key::Space, " ", b"\x00".as_slice()),
+        ] {
+            out.clear();
+            assert!(term.encode_key(key, key::Mods::CTRL, Some(text), &mut out));
+            assert_eq!(out, want, "{text:?}+Ctrl");
+        }
+
+        // Ctrl+方向键（PUA 文本剥成 None）：CSI 修饰序列（shell 词跳）。
+        out.clear();
+        assert!(term.encode_key(key::Key::ArrowLeft, key::Mods::CTRL, None, &mut out));
+        assert_eq!(out, b"\x1b[1;5D");
+
+        // Ctrl+Alt+字母：ESC 前缀的 meta+C0。
+        out.clear();
+        assert!(term.encode_key(key::Key::C, key::Mods::CTRL | key::Mods::ALT, Some("c"), &mut out));
+        assert_eq!(out, b"\x1b\x03");
+    }
+
+    #[test]
     fn focus_encode_gated_by_mode() {
         let mut term = TermState::new(20, 5, 100).unwrap();
         assert!(term.encode_focus(true).is_none());
