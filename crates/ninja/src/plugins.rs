@@ -1,4 +1,6 @@
-//! p3：宿主侧 ADE 插件门（Unix socket，默认关）；p4：命中分发。
+//! p3：宿主侧 ADE 插件门（Unix socket，默认关）；p4：命中分发；
+//! p5：插件监督器（首次命中拉起进程）+ 层状态机（open→ready→present/
+//! close）+ 层前台输入路由。
 //!
 //! 空载门禁：`[plugins] enabled` 为空（默认）时**不创建 socket 文件、
 //! 不拉任何插件进程**——[`PluginHost::start`] 直接返回 `None`，宿主
@@ -6,16 +8,26 @@
 //! wasmtime/tokio；默认配置启动后 socket 路径不存在，见
 //! `tests/idle_no_plugins.rs` 的运行时取证）。
 //!
-//! 启用时：绑定 [`socket_path`] 约定的路径并 listen；拉插件进程/
-//! 握手是 p5 的事。p4 只做**命中分发**：点击时把 [`Hit`] 广播给已
-//! 连上的插件（连接由插件自己连进来，分发时按需非阻塞 accept），
-//! 收集 `hit.claim` / `hit.ignore` 回执——全 ignore / 静默 / 断连
-//! 一律视为不认领，走系统默认打开。消息编解码类型来自
-//! `ninja-protocol`（协议仍只经 socket 交换字节，双方不共享地址空间）。
+//! 启用时：绑定 [`socket_path`] 约定的路径并 listen。**启用 ≠ 常驻**
+//! （PRODUCT 规则）：进程拉起发生在**首次命中分发**——按名解析二进制
+//! （`[plugins] paths` → `$NINJA_PLUGIN_DIR/<name>` → 宿主二进制同目录），
+//! spawn 并以 `NINJA_ADE_SOCK` 告知 socket 路径；解析失败/拉不起 =
+//! 该插件降级为不存在（stderr 一行警告，绝不弹 UI）。
 //!
-//! 超时策略：**同步短超时**（[`HIT_REPLY_TIMEOUT`]，默认 500ms）——只
-//! 在 Cmd+点击的手势路径上发生一次，不新增任何常驻线程；超预算即
-//! 降级为 ignore，绝不卡死主 runloop。
+//! 命中分发（p4）：点击时把 [`Hit`] 广播给已连插件（连接由插件连进来，
+//! 分发时按需非阻塞 accept），收集 `hit.claim` / `hit.ignore` 回执——
+//! 全 ignore / 静默 / 断连一律视为不认领，走系统默认打开。
+//!
+//! 层状态机（p5）：claim 后继续读认领方连接——`layer.open` → 建
+//! IOSurface（跨进程共享，插件往里写像素）→ 回 `layer.ready`；
+//! `layer.present` → 合成（layer 注册表 + 渲染器层 pass）；
+//! `layer.close`（双向）→ 摘层还焦点。层打开期间主 runloop 上挂一个
+//! 150ms 轮询 timer 消化插件异步消息（pump；无层时不存在，空载零开销）。
+//!
+//! 超时策略：**同步短超时**——claim 汇集 [`HIT_REPLY_TIMEOUT`]（500ms），
+//! 层握手 [`LAYER_HANDSHAKE_TIMEOUT`]（1.5s，只在有插件认领时进入）；
+//! 都发生在点击手势路径上的一次性开销，不新增常驻线程；超预算即降级，
+//! 绝不卡死主 runloop。
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,16 +36,21 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use ninja_protocol::frame::{FrameDecoder, encode_frame};
-use ninja_protocol::{Hit, Message};
+use ninja_protocol::{Hit, InputKey, LayerClose, Message, Modifier};
+
+use crate::layer::{self, LayerGeom};
 
 /// `[plugins]` 配置（ninja.toml）。默认空 = 插件全关（空载门禁）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginsConfig {
-    /// 启用的插件名列表。空 = 关。p5 才真正按名字拉起插件进程。
+    /// 启用的插件名列表。空 = 关。首次命中分发时按名拉起（启用≠常驻）。
     pub enabled: Vec<String>,
+    /// 插件名 → 二进制路径（p5 拉起用）。缺省时按名在
+    /// `$NINJA_PLUGIN_DIR/<name>` / 宿主二进制同目录解析。
+    pub paths: std::collections::HashMap<String, String>,
 }
 
-/// 已绑定的 ADE socket 句柄。Drop 时删除 socket 文件（不留残骸）。
+/// 已绑定的 ADE socket 句柄。Drop 时删除 socket 文件、收割子进程。
 #[derive(Debug)]
 pub struct PluginHost {
     listener: UnixListener,
@@ -43,10 +60,20 @@ pub struct PluginHost {
     conns: Vec<Conn>,
     /// hit id 发号器（回执配对用；从 1 起，0 留给「未知」）。
     next_hit_id: u64,
+    /// conn id 发号器（层条目回程路由用）。
+    next_conn_id: u64,
+    /// p5 监督器：已拉起（或已放弃）的插件名。启用≠常驻：真正的 spawn
+    /// 发生在首次分发（`ensure_spawned`），这里只记「别再试」。
+    spawned: std::collections::BTreeSet<String>,
+    /// 拉起的插件进程（Drop 收割；宿主退出时它们也会因 socket EOF 自退）。
+    children: Vec<std::process::Child>,
+    /// 配置快照（按名解析二进制用）。
+    cfg: PluginsConfig,
 }
 
 #[derive(Debug)]
 struct Conn {
+    id: u64,
     stream: UnixStream,
     decoder: FrameDecoder,
 }
@@ -66,14 +93,27 @@ pub enum DispatchOutcome {
 /// 超时 = ignore 降级，永不卡死 runloop）。
 pub const HIT_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// 冷启动（spawn→connect）预算：与回执预算解耦——首次点击才发生，
+/// 只约束「等插件进程连上」。release 二进制 spawn+connect <50ms；debug
+/// 构建/系统繁忙时可达数百毫秒，太紧会让首击随机降级（E2E 实测）。
+/// 超预算 = 本次 NoPlugins 降级（下次点击时插件已连上，正常分发）。
+const COLD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// claim 后层握手（open→ready→present）的同步预算。只在认领方要层的
+/// 路径上花；预算耗尽 = 放弃等 present（层仍开着，靠 pump timer 兜）。
+pub const LAYER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// 层打开期间插件连接的轮询周期（主 runloop timer；无层时不存在）。
+const PUMP_INTERVAL: f64 = 0.15;
+
 /// socket 路径约定：`${TMPDIR:-/tmp}/ninja-ade-{pid}.sock`。
 pub fn socket_path() -> PathBuf {
     let pid = std::process::id();
     std::env::temp_dir().join(format!("ninja-ade-{pid}.sock"))
 }
 
-/// 实际生效路径：`NINJA_ADE_SOCK` 覆盖（测试钩子；p5 拉插件进程时
-/// 也经同名环境变量告知路径）。
+/// 实际生效路径：`NINJA_ADE_SOCK` 覆盖（拉起插件进程时经同名环境变量
+/// 告知路径；测试钩子同途）。
 fn effective_socket_path() -> PathBuf {
     match std::env::var_os("NINJA_ADE_SOCK") {
         Some(p) => PathBuf::from(p),
@@ -81,28 +121,62 @@ fn effective_socket_path() -> PathBuf {
     }
 }
 
+/// 按名解析插件二进制：`[plugins.paths]` 显式路径 → `$NINJA_PLUGIN_DIR/
+/// <name>` → 宿主二进制同目录 `<name>`。都不存在 → None（调用方降级）。
+pub fn resolve_plugin_binary(name: &str, cfg: &PluginsConfig) -> Option<PathBuf> {
+    if name.is_empty() || name.contains('/') {
+        return None; // 名字即文件系统注入向量：只收裸名
+    }
+    if let Some(p) = cfg.paths.get(name) {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+        eprintln!("ninja: plugins.paths.{name} = {} 不存在，跳过该路径", p.display());
+    }
+    if let Some(dir) = std::env::var_os("NINJA_PLUGIN_DIR") {
+        let p = Path::new(&dir).join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let p = exe.parent()?.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// env 门控的调度调试（stderr 一行一步；取证用，不设不打印）。
+fn ade_debug(msg: &str) {
+    if std::env::var_os("NINJA_ADE_DEBUG").is_some() {
+        eprintln!("ninja[ade]: {msg}");
+    }
+}
+
 impl PluginHost {
     /// 唯一入口：按配置决定绑不绑 socket。
     ///
-    /// - `enabled` 为空 → `None`：**不建 socket、不碰文件系统**（空载
-    ///   不变量）。
-    /// - 非空 → 绑定 + listen（非阻塞：p3 不 accept，内核排队）；
-    ///   绑定失败不炸终端：stderr 警告 + `None`（同配置模块的降级哲学）。
+    /// - `enabled` 为空 → `None`：**不建 socket、不碰文件系统、不拉
+    ///   进程**（空载不变量）。
+    /// - 非空 → 绑定 + listen（非阻塞）；绑定失败不炸终端：stderr
+    ///   警告 + `None`（同配置模块的降级哲学）。
     pub fn start(cfg: &PluginsConfig) -> Option<PluginHost> {
         if cfg.enabled.is_empty() {
             return None;
         }
-        Self::bind(effective_socket_path())
+        Self::bind(effective_socket_path(), cfg.clone())
     }
 
     /// 在给定路径上绑定（start 的实现核心；测试用隔离目录直调）。
-    fn bind(path: PathBuf) -> Option<PluginHost> {
+    fn bind(path: PathBuf, cfg: PluginsConfig) -> Option<PluginHost> {
         // 极端场景：同 pid 复用留下陈旧文件。先清再绑。
         let _ = std::fs::remove_file(&path);
         match UnixListener::bind(&path) {
             Ok(listener) => {
-                // p3 不 accept：非阻塞，避免任何路径卡 runloop；连接在
-                // 内核 backlog 排队，等 p5 的监督器接管。
+                // 非阻塞 accept：分发/泵路径按需收，无任何路径卡 runloop。
                 if let Err(e) = listener.set_nonblocking(true) {
                     eprintln!("ninja: ADE socket 设非阻塞失败（{e}），插件禁用");
                     let _ = std::fs::remove_file(&path);
@@ -113,6 +187,10 @@ impl PluginHost {
                     path,
                     conns: Vec::new(),
                     next_hit_id: 0,
+                    next_conn_id: 0,
+                    spawned: std::collections::BTreeSet::new(),
+                    children: Vec::new(),
+                    cfg,
                 })
             }
             Err(e) => {
@@ -127,13 +205,57 @@ impl PluginHost {
         &self.path
     }
 
-    /// 监听器引用（p5 监督器接管 accept 用）。
+    /// 监听器引用（监督器接管 accept 用；p5 分发/泵路径直接经本结构）。
     pub fn listener(&self) -> &UnixListener {
         &self.listener
     }
 
     // ------------------------------------------------------------------
-    // p4 命中分发
+    // p5 监督器：首次分发时拉起启用的插件
+    // ------------------------------------------------------------------
+
+    /// 拉起尚未尝试过的启用插件。PRODUCT：启用≠常驻——只在命中分发
+    /// 路径调用（首次点击才 spawn）。已有连接在（如外部自连的测试
+    /// 插件/插件已拉起）时不重复拉：v0 无握手，宿主无法把连接映射回
+    /// 名字，按「有连接就够」处理。
+    fn ensure_spawned(&mut self) {
+        if !self.conns.is_empty() {
+            return;
+        }
+        for name in self.cfg.enabled.clone() {
+            if !self.spawned.insert(name.clone()) {
+                continue; // 已试过（成功或失败都不重试本次会话）
+            }
+            let Some(bin) = resolve_plugin_binary(&name, &self.cfg) else {
+                eprintln!(
+                    "ninja: 插件 {name:?} 找不到二进制（[plugins.paths] / NINJA_PLUGIN_DIR / 宿主同目录），本次降级为未启用"
+                );
+                continue;
+            };
+            match std::process::Command::new(&bin)
+                .env("NINJA_ADE_SOCK", &self.path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+            {
+                Ok(child) => {
+                    eprintln!(
+                        "ninja: 已拉起插件 {name:?}（pid {}，socket {:?}）",
+                        child.id(),
+                        self.path
+                    );
+                    self.children.push(child);
+                }
+                Err(e) => {
+                    eprintln!("ninja: 插件 {name:?}（{}）拉起失败：{e}", bin.display());
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // p4 命中分发（p5 扩展：冷启动等待 + claim 后层握手）
     // ------------------------------------------------------------------
 
     /// 发下一个 hit id（回执配对用）。点击路径主线程调用。
@@ -142,15 +264,16 @@ impl PluginHost {
         self.next_hit_id
     }
 
-    /// 把 hit 广播给所有已连插件，收集 claim/ignore，仲裁出结果。
+    /// 把 hit 广播给所有已连插件，收集 claim/ignore，仲裁出结果；
+    /// 有人认领且给了 `geom` 时继续层握手（open→ready→present）。
     /// 超时用 [`HIT_REPLY_TIMEOUT`]（生产入口；单测用带超时参数的
     /// [`PluginHost::dispatch_hit_with_timeout`]）。
-    pub fn dispatch_hit(&mut self, hit: &Hit) -> DispatchOutcome {
-        self.dispatch_hit_with_timeout(hit, HIT_REPLY_TIMEOUT)
+    pub fn dispatch_hit(&mut self, hit: &Hit, geom: Option<&LayerGeom>) -> DispatchOutcome {
+        self.dispatch_hit_with_timeout(hit, HIT_REPLY_TIMEOUT, geom)
     }
 
     /// 按需非阻塞 accept：把内核 backlog 里排队的插件连接收进来。
-    /// 不新增线程、不拉进程——没连接就是空操作（p5 才有监督器）。
+    /// 不新增线程；没连接就是空操作。
     fn pump_accept(&mut self) {
         loop {
             match self.listener.accept() {
@@ -158,7 +281,9 @@ impl PluginHost {
                     // 分发路径用阻塞读 + 读超时（收口在超时预算内）。
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(HIT_REPLY_TIMEOUT));
+                    self.next_conn_id += 1;
                     self.conns.push(Conn {
+                        id: self.next_conn_id,
                         stream,
                         decoder: FrameDecoder::new(),
                     });
@@ -171,18 +296,49 @@ impl PluginHost {
 
     /// dispatch_hit 的实现核心（超时可注入，单测用短预算）。
     ///
-    /// 流程：accept 排队连接 → 广播 hit 帧 → 逐连接收回执（共享
-    /// deadline；静默/断连/坏消息部视为 ignore，坏协议断开连接）。
-    /// 仲裁：claim 的 priority 最大者胜，平局先连者胜。
+    /// 流程：accept 排队连接 →（无连接时）首次拉起插件 + 等冷启动
+    /// connect → 广播 hit 帧 → 逐连接收回执（共享 deadline；静默/断连/
+    /// 坏消息一律 ignore，坏协议断开连接）→ 仲裁（claim 的 priority
+    /// 最大者胜，平局先连者胜）→ 认领方层握手。
     pub(crate) fn dispatch_hit_with_timeout(
         &mut self,
         hit: &Hit,
         timeout: Duration,
+        geom: Option<&LayerGeom>,
     ) -> DispatchOutcome {
         self.pump_accept();
         if self.conns.is_empty() {
-            return DispatchOutcome::NoPlugins;
+            // p5 冷启动：首次分发才拉插件；等 connect 的预算独立于回执
+            // 预算（拉起只付一次，回执仍钉 HIT_REPLY_TIMEOUT）。测试注入
+            // 的短 timeout 也约束冷启动等待；全部插件都试过（拉不起/
+            // 已死）就即刻降级，不再等。
+            let can_spawn = self
+                .cfg
+                .enabled
+                .iter()
+                .any(|n| !self.spawned.contains(n));
+            if !can_spawn {
+                return DispatchOutcome::NoPlugins;
+            }
+            ade_debug("dispatch: 无连接，冷启动拉插件");
+            let t_spawn = Instant::now();
+            self.ensure_spawned();
+            let connect_deadline = Instant::now() + COLD_CONNECT_TIMEOUT.min(timeout);
+            while self.conns.is_empty() && Instant::now() < connect_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+                self.pump_accept();
+            }
+            ade_debug(&format!(
+                "dispatch: 冷启动等待 {:?}，连接数 {}",
+                t_spawn.elapsed(),
+                self.conns.len()
+            ));
+            if self.conns.is_empty() {
+                return DispatchOutcome::NoPlugins;
+            }
         }
+        // 回执预算从广播后起算（冷启动等待不侵占 500ms 回执窗口）。
+        let deadline = Instant::now() + timeout;
 
         // 写阶段：广播 hit 帧。写失败（断连/缓冲满）→ 摘连接，视为 ignore。
         let frame = match encode_frame(&Message::Hit(hit.clone())) {
@@ -203,8 +359,8 @@ impl PluginHost {
         }
 
         // 收阶段：共享 deadline，逐连接收；responded 后不再读它。
-        let deadline = Instant::now() + timeout;
-        let mut best: Option<u32> = None;
+        // 认领者按**连接 id** 记（下方会摘除断连，数组下标不稳）。
+        let mut best: Option<(u32, u64)> = None; // (priority, conn id)
         let mut responded = vec![false; self.conns.len()];
         let mut dead: Vec<usize> = Vec::new();
         let mut buf = [0u8; 4096];
@@ -240,15 +396,15 @@ impl PluginHost {
                                 }
                                 Ok(p) => match Message::decode_host(&p) {
                                     Ok(Message::HitClaim(m)) if m.id == hit.id => {
-                                        if best.is_none_or(|pr| m.priority > pr) {
-                                            best = Some(m.priority);
+                                        if best.is_none_or(|(pr, _)| m.priority > pr) {
+                                            best = Some((m.priority, c.id));
                                         }
                                         responded[i] = true;
                                     }
                                     Ok(Message::HitIgnore(m)) if m.id == hit.id => {
                                         responded[i] = true;
                                     }
-                                    Ok(_) => {} // 其余消息/别的 id：忽略（p5 消化）
+                                    Ok(_) => {} // 其余消息/别的 id：先记下，握手阶段消化
                                     Err(_) => {
                                         // 坏协议（版本/JSON）：断开，视为 ignore
                                         //（p3 契约：宿主断连）。
@@ -286,16 +442,340 @@ impl PluginHost {
         for i in dead.iter().rev() {
             self.conns.remove(*i);
         }
-        match best {
-            Some(priority) => DispatchOutcome::Claimed { priority },
-            None => DispatchOutcome::AllIgnored,
+        let Some((priority, claim_conn)) = best else {
+            ade_debug("dispatch: 全 ignore/静默");
+            return DispatchOutcome::AllIgnored;
+        };
+        ade_debug(&format!("dispatch: claim priority={priority} conn={claim_conn}"));
+        // 层握手（p5）：认领方在同一连接上要层。geom 为 None（如取证钩子
+        // 无渲染上下文）时跳过——认领仍然成立，只是宿主不处理层。
+        if let Some(geom) = geom {
+            if let Some(idx) = self.conns.iter().position(|c| c.id == claim_conn) {
+                self.layer_handshake(idx, geom, LAYER_HANDSHAKE_TIMEOUT);
+            }
         }
+        DispatchOutcome::Claimed { priority }
+    }
+
+    /// claim 后的层握手：读认领方连接直到 present/close/断连/预算尽。
+    /// `layer.open` → 建 IOSurface 回 `layer.ready`；`layer.present` →
+    /// 注册表标记呈现 + 触发重画 + 起泵 timer；`layer.close` → 摘层。
+    fn layer_handshake(&mut self, conn_idx: usize, geom: &LayerGeom, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        let conn_id = self.conns[conn_idx].id;
+        let mut buf = [0u8; 8192];
+        loop {
+            // 1) 先消化解码器里**已缓冲**的帧——claim 与 layer.open 常在同
+            //    一个读块到达（分发阶段只弹到回执就停），不先弹会在等新
+            //    字节上白耗整个预算（E2E 实测过的竞态）。
+            let mut quit = false;
+            let mut dead = false;
+            while let Some(conn) = self.conns.get_mut(conn_idx)
+                && let Some(payload) = conn.decoder.pop()
+            {
+                match self.handshake_frame(payload, conn_idx, conn_id, geom) {
+                    HandshakeStep::Continue => {}
+                    HandshakeStep::Presented => {
+                        quit = true;
+                        break;
+                    }
+                    HandshakeStep::Dead => {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+            if dead {
+                self.conns.remove(conn_idx);
+                return;
+            }
+            if quit {
+                return;
+            }
+            // 2) 解码器空了才阻塞读（预算内）。
+            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                break; // 预算尽：层可能仍开着（等 present），pump 兜底
+            };
+            if self.conns[conn_idx].stream.set_read_timeout(Some(rem)).is_err() {
+                self.conns.remove(conn_idx);
+                return;
+            }
+            let n = match self.conns[conn_idx].stream.read(&mut buf) {
+                Ok(0) => {
+                    self.conns.remove(conn_idx); // 插件退了：层交由 pump 清
+                    return;
+                }
+                Ok(n) => n,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break // 静默超预算：不再等
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.conns.remove(conn_idx);
+                    return;
+                }
+            };
+            if self.conns[conn_idx].decoder.extend(&buf[..n]).is_err() {
+                self.conns.remove(conn_idx);
+                return;
+            }
+        }
+    }
+
+    /// 握手期单帧处置。返回是否继续等下一帧。
+    fn handshake_frame(
+        &mut self,
+        payload: Result<Vec<u8>, ninja_protocol::FrameError>,
+        conn_idx: usize,
+        conn_id: u64,
+        geom: &LayerGeom,
+    ) -> HandshakeStep {
+        let payload = match payload {
+            Ok(p) => p,
+            Err(_) => return HandshakeStep::Dead,
+        };
+        match Message::decode_host(&payload) {
+            Ok(Message::LayerOpen(m)) => {
+                let geom = LayerGeom { conn: conn_id, ..geom_clone(geom) };
+                match layer::open(&geom, m.anchor_row, m.anchor_col) {
+                    Some(mut ready) => {
+                        ready.id = m.id; // 回执 = layer.open 的 id
+                        let f =
+                            encode_frame(&Message::LayerReady(ready)).expect("LayerReady 编码");
+                        if self.conns[conn_idx].stream.write_all(&f).is_err() {
+                            return HandshakeStep::Dead;
+                        }
+                    }
+                    None => {
+                        eprintln!("ninja: 层分配失败（IOSurface/Metal），拒层");
+                        let f = encode_frame(&Message::LayerClose(LayerClose::new(0)))
+                            .expect("LayerClose 编码");
+                        let _ = self.conns[conn_idx].stream.write_all(&f);
+                    }
+                }
+                HandshakeStep::Continue
+            }
+            Ok(Message::LayerPresent(m)) => {
+                layer::present(m.layer);
+                ensure_pump_timer();
+                HandshakeStep::Presented
+            }
+            Ok(Message::LayerClose(m)) => {
+                let _ = layer::close(m.layer);
+                stop_pump_timer_if_idle();
+                HandshakeStep::Continue
+            }
+            Ok(_) => HandshakeStep::Continue, // 别的 id / 别的消息：握手期忽略
+            Err(_) => HandshakeStep::Dead, // 坏协议：断（p3 契约）
+        }
+    }
+
+    /// 泵：层打开期间轮询所有连接，消化插件异步消息（present 重合成 /
+    /// close 摘层）。主 runloop timer 调用（见 [`ensure_pump_timer`]）。
+    pub fn pump_plugins(&mut self) {
+        self.pump_accept();
+        let mut buf = [0u8; 8192];
+        let mut i = 0;
+        while i < self.conns.len() {
+            let conn = &mut self.conns[i];
+            if conn.stream.set_read_timeout(Some(Duration::from_millis(1))).is_err() {
+                self.conns.remove(i);
+                continue;
+            }
+            match conn.stream.read(&mut buf) {
+                Ok(0) => {
+                    self.conns.remove(i);
+                    continue;
+                }
+                Ok(n) => {
+                    if conn.decoder.extend(&buf[..n]).is_err() {
+                        self.conns.remove(i);
+                        continue;
+                    }
+                    let mut dead = false;
+                    while let Some(payload) = conn.decoder.pop() {
+                        match payload {
+                            Err(_) => dead = true,
+                            Ok(p) => match Message::decode_host(&p) {
+                                Ok(Message::LayerPresent(m)) => {
+                                    layer::present(m.layer);
+                                }
+                                Ok(Message::LayerClose(m)) => {
+                                    for _ in layer::close(m.layer) {}
+                                    stop_pump_timer_if_idle();
+                                }
+                                Ok(_) => {}
+                                Err(_) => dead = true,
+                            },
+                        }
+                        if dead {
+                            break;
+                        }
+                    }
+                    if dead {
+                        self.conns.remove(i);
+                        continue;
+                    }
+                    i += 1;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    i += 1
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    self.conns.remove(i);
+                    continue;
+                }
+            }
+        }
+        if !layer::any_layers() {
+            stop_pump_timer_if_idle();
+        }
+    }
+
+    /// 按连接 id 发消息（input.key / layer.close 回程）。找不到连接
+    ///（已断）→ Err。
+    fn send_to_conn(&mut self, conn_id: u64, msg: &Message) -> std::io::Result<()> {
+        let frame =
+            encode_frame(msg).map_err(|e| std::io::Error::other(format!("encode: {e}")))?;
+        let c = self
+            .conns
+            .iter_mut()
+            .find(|c| c.id == conn_id)
+            .ok_or_else(|| std::io::Error::other("plugin conn gone"))?;
+        c.stream.write_all(&frame)
+    }
+}
+
+/// 握手循环的单步结果。
+enum HandshakeStep {
+    Continue,
+    Presented,
+    Dead,
+}
+
+/// LayerGeom 的浅拷贝（Retained 字段 clone；主线程）。
+fn geom_clone(g: &LayerGeom) -> LayerGeom {
+    LayerGeom {
+        pane: g.pane,
+        cell_px: g.cell_px,
+        view_px: g.view_px,
+        scale: g.scale,
+        device: g.device.clone(),
+        view: g.view,
+        conn: g.conn,
     }
 }
 
 impl Drop for PluginHost {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        // 收割子进程（正常路径它们已因 EOF 自退；kill 只兜孤儿）。
+        for c in self.children.iter_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 泵 timer（层打开期间存在；主 runloop）
+// ---------------------------------------------------------------------------
+
+/// CFRunLoopTimer 的存储（CF 类型不自动 Send；只在主线程碰，手工标注
+/// 满足 static 要求——纪律同 layer::Registry）。
+struct TimerSlot(Option<objc2_core_foundation::CFRetained<objc2_core_foundation::CFRunLoopTimer>>);
+unsafe impl Send for TimerSlot {}
+
+static PUMP_TIMER: Mutex<TimerSlot> = Mutex::new(TimerSlot(None));
+
+/// 泵回调（CFRunLoopTimer callout，主线程）：无分发器 = 宿主在退出，
+/// 停表。
+unsafe extern "C-unwind" fn pump_tick(
+    _timer: *mut objc2_core_foundation::CFRunLoopTimer,
+    _info: *mut std::ffi::c_void,
+) {
+    pump_now();
+}
+
+/// 起泵（幂等）：首个层打开后由 layer_handshake 调用。
+fn ensure_pump_timer() {
+    let main = match objc2_core_foundation::CFRunLoop::main() {
+        Some(rl) => rl,
+        None => return,
+    };
+    let mut slot = match PUMP_TIMER.lock() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if slot.0.is_some() {
+        return;
+    }
+    let mut context = objc2_core_foundation::CFRunLoopTimerContext {
+        version: 0,
+        info: std::ptr::null_mut(),
+        retain: None,
+        release: None,
+        copyDescription: None,
+    };
+    // SAFETY: context 布局正确；callout 只跑在主 runloop。
+    let timer = unsafe {
+        objc2_core_foundation::CFRunLoopTimer::new(
+            None,
+            0.0, // 立即首发
+            PUMP_INTERVAL,
+            0,
+            0,
+            Some(pump_tick),
+            &raw mut context,
+        )
+    };
+    if let Some(t) = timer {
+        // SAFETY: t 合法；加入主 runloop common modes。
+        unsafe { main.add_timer(Some(&t), objc2_core_foundation::kCFRunLoopCommonModes) };
+        slot.0 = Some(t);
+    }
+}
+
+/// 停泵（幂等）：最后一个层关闭后由 pump/close 路径调用。
+fn stop_pump_timer_if_idle() {
+    if layer::any_layers() {
+        return;
+    }
+    if let Ok(mut slot) = PUMP_TIMER.lock() {
+        if let Some(t) = slot.0.take() {
+            if let Some(main) = objc2_core_foundation::CFRunLoop::main() {
+                // SAFETY: t 曾加入主 runloop。
+                unsafe {
+                    main.remove_timer(
+                        Some(&t),
+                        objc2_core_foundation::kCFRunLoopCommonModes,
+                    )
+                };
+            }
+        }
+    }
+}
+
+/// 泵入口（timer 回调直调；测试可直调）。
+pub fn pump_now() {
+    if !layer::any_layers() {
+        stop_pump_timer_if_idle();
+        return;
+    }
+    match take_dispatcher() {
+        Some(host) => {
+            if let Ok(mut h) = host.lock() {
+                h.pump_plugins();
+            }
+        }
+        None => stop_pump_timer_if_idle(),
     }
 }
 
@@ -333,16 +813,50 @@ pub fn next_hit_id() -> u64 {
     }
 }
 
-/// 点击路径一站式入口：广播 hit 并仲裁。无分发器/锁坏 → NoPlugins
-///（即未启用插件 → 系统默认打开）。
-pub fn dispatch_hit(hit: &Hit) -> DispatchOutcome {
+/// 点击路径一站式入口：广播 hit 并仲裁；认领且能开层时走层握手。
+/// 无分发器/锁坏 → NoPlugins（即未启用插件 → 系统默认打开）。
+pub fn dispatch_hit(hit: &Hit, geom: Option<&LayerGeom>) -> DispatchOutcome {
     match take_dispatcher() {
         Some(host) => host
             .lock()
-            .map(|mut h| h.dispatch_hit(hit))
+            .map(|mut h| h.dispatch_hit(hit, geom))
             .unwrap_or(DispatchOutcome::NoPlugins),
         None => DispatchOutcome::NoPlugins,
     }
+}
+
+/// 层前台键盘：把按键转成 `input.key` 发给拥有该层的插件连接。
+/// 返回 false = 无层/连接已断（调用方回落普通终端路径）。
+pub fn forward_input_key(
+    pane: u32,
+    key: &str,
+    text: &str,
+    modifiers: Vec<Modifier>,
+) -> bool {
+    let Some((layer, conn)) = layer::foreground(pane) else {
+        return false;
+    };
+    let msg = Message::InputKey(InputKey::new(layer, key, text, modifiers));
+    match take_dispatcher() {
+        Some(host) => host
+            .lock()
+            .map(|mut h| h.send_to_conn(conn, &msg).is_ok())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// 宿主关层（Esc 兜底 / resize / pane 关闭）：摘层 + 通知插件
+/// `layer.close` + 重画。PRODUCT：「任何插件层都能立刻关掉」。
+pub fn host_close_layers_of_pane(pane: u32) {
+    for (handle, conn, _) in layer::close_pane(pane) {
+        if let Some(host) = take_dispatcher() {
+            if let Ok(mut h) = host.lock() {
+                let _ = h.send_to_conn(conn, &Message::LayerClose(LayerClose::new(handle)));
+            }
+        }
+    }
+    stop_pump_timer_if_idle();
 }
 
 #[cfg(test)]
@@ -363,7 +877,7 @@ mod tests {
     #[test]
     fn default_config_starts_nothing() {
         // 空载门禁的核心：默认（空）配置 → None。bind 永不发生，
-        // 因此任何路径上都不会出现 socket 文件/监听。
+        // 因此任何路径上都不会出现 socket 文件/监听/子进程。
         let cfg = PluginsConfig::default();
         assert!(cfg.enabled.is_empty());
         assert!(
@@ -377,10 +891,11 @@ mod tests {
         let dir = sandbox("bind");
         let sock = dir.join("ade.sock");
         {
-            let host = PluginHost::bind(sock.clone()).expect("显式绑定应成功");
+            let host = PluginHost::bind(sock.clone(), PluginsConfig::default())
+                .expect("显式绑定应成功");
             assert_eq!(host.path(), sock.as_path());
             assert!(sock.exists(), "绑定后 socket 文件应在");
-            // listen 已生效：客户端能连上（内核排队，p3 不 accept）。
+            // listen 已生效：客户端能连上（内核排队）。
             UnixStream::connect(&sock).expect("启用后可连接（排队，不 accept）");
         } // host drop → 文件清除
         assert!(!sock.exists(), "drop 后 socket 文件应删除");
@@ -390,9 +905,11 @@ mod tests {
     #[test]
     fn enabled_via_start_uses_convention_path() {
         // 走真实 start()（含 env 覆盖逻辑）：启用非空 → 绑生效路径
-        //（NINJA_ADE_SOCK 设置时用它，否则约定路径）。
+        //（NINJA_ADE_SOCK 设置时用它，否则约定路径）。不触发任何 spawn
+        //（拉起只在首次分发；本测试不分发）。
         let cfg = PluginsConfig {
             enabled: vec!["preview".into()],
+            ..PluginsConfig::default()
         };
         let expected = match std::env::var_os("NINJA_ADE_SOCK") {
             Some(p) => PathBuf::from(p),
@@ -402,6 +919,7 @@ mod tests {
             let host = PluginHost::start(&cfg).expect("启用即绑");
             assert_eq!(host.path(), expected.as_path());
             assert!(expected.exists());
+            assert!(host.children.is_empty(), "启用不等于拉起（首次分发才拉）");
         }
         if std::env::var_os("NINJA_ADE_SOCK").is_none() {
             assert!(!expected.exists(), "drop 后约定路径应删除");
@@ -424,7 +942,41 @@ mod tests {
         // 路径不可达（父目录不存在）→ None，不 panic。
         let dir = sandbox("nope");
         let bad = dir.join("missing-dir/ade.sock");
-        assert!(PluginHost::bind(bad).is_none());
+        assert!(PluginHost::bind(bad, PluginsConfig::default()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_resolution_order() {
+        // 名字卫生：路径注入拒绝。
+        assert!(resolve_plugin_binary("../evil", &PluginsConfig::default()).is_none());
+        assert!(resolve_plugin_binary("", &PluginsConfig::default()).is_none());
+
+        // paths 表优先于 env/同目录。
+        let dir = sandbox("resolve");
+        let explicit = dir.join("plug-explicit");
+        std::fs::write(&explicit, b"#!/bin/sh\n").unwrap();
+        let cfg = PluginsConfig {
+            enabled: vec!["preview".into()],
+            paths: std::collections::HashMap::from([(
+                "preview".to_string(),
+                explicit.to_string_lossy().into_owned(),
+            )]),
+        };
+        assert_eq!(resolve_plugin_binary("preview", &cfg), Some(explicit.clone()));
+
+        // 名字不在任何来源 → None。
+        assert!(resolve_plugin_binary("ghost", &cfg).is_none());
+
+        // paths 指向不存在的文件 → 落到 env/同目录（都没有 → None）。
+        let cfg2 = PluginsConfig {
+            enabled: vec!["preview".into()],
+            paths: std::collections::HashMap::from([(
+                "preview".to_string(),
+                dir.join("nope").to_string_lossy().into_owned(),
+            )]),
+        };
+        assert!(resolve_plugin_binary("preview", &cfg2).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -432,12 +984,12 @@ mod tests {
     // p4 命中分发（进程内 UnixStream 对端；不拉任何真实进程）
     // ------------------------------------------------------------------
 
-    use ninja_protocol::{HitClaim, HitIgnore, HitKind, Modifier};
+    use ninja_protocol::{HitClaim, HitIgnore, HitKind};
     use std::io::{Read, Write};
     use std::thread::{self, JoinHandle};
 
     fn sample_hit(id: u64) -> Hit {
-        Hit::new(id, HitKind::Path, "/tmp/x.rs:1:2", 3, 5, 9, vec![Modifier::Cmd])
+        Hit::new(id, HitKind::Path, "/tmp/x.rs:1:2", "/tmp", 3, 5, 9, vec![Modifier::Cmd])
     }
 
     /// 对端脚本：读完 hit 帧后怎么回。
@@ -487,7 +1039,8 @@ mod tests {
     fn host_with_peers(tag: &str, peers: Vec<PeerReply>) -> (PluginHost, Vec<JoinHandle<Vec<u8>>>) {
         let dir = sandbox(tag);
         let sock = dir.join("ade.sock");
-        let host = PluginHost::bind(sock.clone()).expect("bind");
+        let host =
+            PluginHost::bind(sock.clone(), PluginsConfig::default()).expect("bind");
         let handles = peers
             .into_iter()
             .map(|r| spawn_peer(sock.clone(), r))
@@ -500,10 +1053,11 @@ mod tests {
     #[test]
     fn dispatch_without_peers_is_no_plugins() {
         let dir = sandbox("disp0");
-        let mut host = PluginHost::bind(dir.join("a.sock")).unwrap();
+        let mut host = PluginHost::bind(dir.join("a.sock"), PluginsConfig::default()).unwrap();
         let hit = sample_hit(host.next_hit_id());
+        // 短预算：无对端且无可拉插件（enabled 空 → 不 spawn）→ NoPlugins。
         assert_eq!(
-            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(10)),
+            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(10), None),
             DispatchOutcome::NoPlugins
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -514,7 +1068,7 @@ mod tests {
         let (mut host, handles) = host_with_peers("dispign", vec![PeerReply::Ignore]);
         let hit = sample_hit(host.next_hit_id());
         assert_eq!(
-            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300)),
+            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300), None),
             DispatchOutcome::AllIgnored
         );
         let payload = handles.into_iter().next().unwrap().join().unwrap();
@@ -523,6 +1077,7 @@ mod tests {
             Message::Hit(h) => {
                 assert_eq!(h.kind, HitKind::Path);
                 assert_eq!(h.text, "/tmp/x.rs:1:2");
+                assert_eq!(h.cwd, "/tmp");
                 assert_eq!(h.row, 3);
                 assert_eq!(h.col, 5);
                 assert_eq!(h.pane, 9);
@@ -535,11 +1090,11 @@ mod tests {
 
     #[test]
     fn dispatch_claim_wins_by_priority() {
-        // 单 claim。
+        // 单 claim（无 geom：不进层握手）。
         let (mut host, handles) = host_with_peers("dispc1", vec![PeerReply::Claim(7)]);
         let hit = sample_hit(host.next_hit_id());
         assert_eq!(
-            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300)),
+            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300), None),
             DispatchOutcome::Claimed { priority: 7 }
         );
         for h in handles {
@@ -551,7 +1106,7 @@ mod tests {
             host_with_peers("dispc2", vec![PeerReply::Claim(3), PeerReply::Claim(9)]);
         let hit = sample_hit(host.next_hit_id());
         assert_eq!(
-            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300)),
+            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300), None),
             DispatchOutcome::Claimed { priority: 9 }
         );
         for h in handles {
@@ -563,7 +1118,7 @@ mod tests {
             host_with_peers("dispc3", vec![PeerReply::Ignore, PeerReply::Claim(4)]);
         let hit = sample_hit(host.next_hit_id());
         assert_eq!(
-            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300)),
+            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300), None),
             DispatchOutcome::Claimed { priority: 4 }
         );
         for h in handles {
@@ -578,7 +1133,7 @@ mod tests {
         let hit = sample_hit(host.next_hit_id());
         let t0 = Instant::now();
         assert_eq!(
-            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(80)),
+            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(80), None),
             DispatchOutcome::AllIgnored
         );
         assert!(t0.elapsed() >= Duration::from_millis(70), "应等满预算再降级");
@@ -592,7 +1147,7 @@ mod tests {
         let (mut host, handles) = host_with_peers("dispdead", vec![PeerReply::Disconnect]);
         let hit = sample_hit(host.next_hit_id());
         assert_eq!(
-            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300)),
+            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(300), None),
             DispatchOutcome::AllIgnored
         );
         for h in handles {
@@ -606,7 +1161,7 @@ mod tests {
         // socket 的生命周期不变量）。
         let dir = sandbox("dispwk");
         let arc = Arc::new(Mutex::new(
-            PluginHost::bind(dir.join("a.sock")).unwrap(),
+            PluginHost::bind(dir.join("a.sock"), PluginsConfig::default()).unwrap(),
         ));
         install_dispatcher(&arc);
         assert!(take_dispatcher().is_some());
@@ -615,9 +1170,15 @@ mod tests {
         assert!(take_dispatcher().is_none());
         // 失效后走自由函数：NoPlugins（即系统默认），不 panic。
         assert_eq!(
-            dispatch_hit(&sample_hit(1)),
+            dispatch_hit(&sample_hit(1), None),
             DispatchOutcome::NoPlugins
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forward_input_key_without_layer_is_false() {
+        // 无层：键盘路由回落普通终端路径。
+        assert!(!forward_input_key(4242, "a", "", vec![]));
     }
 }

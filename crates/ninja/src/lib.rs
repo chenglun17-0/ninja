@@ -21,7 +21,10 @@
 //! - [`config`]：`~/.config/ninja/ninja.toml`（shell/字体/键位/主题色）
 //! - [`plugins`]：p3 ADE 插件门——[plugins] enabled 非空才绑 Unix
 //!   socket（默认空载不建）；p4 命中分发：Cmd+点击广播 hit，插件
-//!   claim/ignore 仲裁；协议类型来自 ninja-protocol
+//!   claim/ignore 仲裁；p5 监督器（首次命中拉插件进程）+ 层握手
+//!   （open→ready→present/close）+ 层前台输入路由
+//! - [`layer`]：p5 层原语——IOSurface 分配/注册表/几何（合成在
+//!   renderer 的层 pass）
 //! - [`link`]：p4 命中识别纯函数（路径/URL/OSC-8）
 //! - [`open`]：p4 系统默认打开（无插件认领时的回退；无安装提示）
 //! - [`app`]：NSApplication 引导、菜单（键位来自配置）、delegate
@@ -41,6 +44,7 @@ pub mod atlas;
 pub mod config;
 pub mod font;
 pub mod keymap;
+pub mod layer;
 pub mod link;
 pub mod open;
 pub mod pane;

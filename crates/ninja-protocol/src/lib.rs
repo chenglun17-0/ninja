@@ -41,6 +41,14 @@
 //!    - 宿主侧：记录并断开该连接（[`Message::decode_host`] 返回
 //!      [`DecodeError::UnsupportedVersion`]，处置属 p5 接线）。
 //! 4. `type` 不认识 = 同版本协议违规：解码错误。不猜。
+//! 5. **v0 内字段集修订记录（p5，2025-10）**：`hit` 增补 `cwd` 字段
+//!    （string，缺省 `""`）。v0 尚未对外发布（仓库未公开、无第二实现
+//!    部署），字段集修订直接钉进 v0：新增字段只增不删不改，配合规则 2
+//!    的「未知字段忽略」与反序列化缺省，旧实现在新线格式上行为不变。
+//!    原因：进程外插件无法访问宿主的 OSC-7 pwd 状态，没有 `cwd` 就
+//!    永远无法认领相对路径（golden 样例 `src/main.rs:42:13` 正是相对
+//!    路径）；只认绝对路径会直接弱化 p5 插件门禁。此条不并成通例：
+//!    仓库公开后再改字段集必须升 `v`。
 //!
 //! # 五类消息总表
 //!
@@ -48,7 +56,7 @@
 //!
 //! | type | 方向 | 字段 |
 //! |---|---|---|
-//! | [`hit`](Message::Hit) | 宿主→插件 | `id` u64、`kind`（"path"/"url"/"osc8"）、`text` string、`row` u32、`col` u32、`pane` u32、`modifiers` \[[`Modifier`]\] |
+//! | [`hit`](Message::Hit) | 宿主→插件 | `id` u64、`kind`（"path"/"url"/"osc8"）、`text` string、`cwd` string（相对路径解析基，空 = 未知；p5 增补见规则 5）、`row` u32、`col` u32、`pane` u32、`modifiers` \[[`Modifier`]\] |
 //! | [`hit.claim`](Message::HitClaim) | 插件→宿主 | `id` u64（回执）、`priority` u32（多插件竞争，大者胜） |
 //! | [`hit.ignore`](Message::HitIgnore) | 插件→宿主 | `id` u64 |
 //! | [`layer.open`](Message::LayerOpen) | 插件→宿主 | `id` u64、`placement`（"overlay"/"side"）、`anchor_row` u32、`anchor_col` u32 |
@@ -106,7 +114,8 @@
 //!
 //! // new() 钉 v=PROTOCOL_VERSION，忘不了。
 //! let msg = Message::Hit(Hit::new(
-//!     7, HitKind::Path, "src/main.rs:42", 41, 0, 2, vec![Modifier::Cmd],
+//!     7, HitKind::Path, "src/main.rs:42", "/Users/jal/demo", 41, 0, 2,
+//!     vec![Modifier::Cmd],
 //! ));
 //! let json = msg.to_json().unwrap();
 //! assert!(json.contains(r#""v":0"#) && json.contains(r#""type":"hit""#));

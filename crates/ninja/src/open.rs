@@ -13,6 +13,42 @@ use objc2::rc::Retained;
 use objc2_app_kit::NSWorkspace;
 use objc2_foundation::{NSURL, NSString};
 
+/// OSC 7 pwd（vt 的 `pwd()` 返回**完整 URI**，如 `file://host/Users/jal`）
+/// → 文件系统路径（剥 scheme/authority + 百分号解码）。非 file:// 或
+/// 解不出以 `/` 起首的路径 → None。p5 修订：hit.cwd 与系统默认回退
+/// 都走这里（此前 open.rs 直接把 URI 当路径基，p4 未踩中过 OSC 7）。
+pub fn osc7_to_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    // authority 到首个 '/'；无 '/'（只有 host）→ 无路径。split_once 的
+    // 右段不含分隔符，补回前导 '/'。
+    let path = format!("/{}", rest.split_once('/')?.1);
+    if path == "/" {
+        return Some(path);
+    }
+    // 百分号解码（%XX；坏序列保守放回原样）。
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    if decoded.starts_with('/') {
+        Some(decoded)
+    } else {
+        None
+    }
+}
+
 /// 把命中交给系统默认处理器。
 ///
 /// `pwd`：shell 经 OSC 7 报告的工作目录（相对路径的解析基；None 用
@@ -115,6 +151,25 @@ fn append_probe_line(path: &std::ffi::OsStr, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osc7_uri_decoded_to_path() {
+        // vt 契约：pwd() 返回完整 URI。
+        assert_eq!(
+            osc7_to_path("file://localhost/tmp/project"),
+            Some("/tmp/project".to_string())
+        );
+        assert_eq!(osc7_to_path("file://somehost/"), Some("/".to_string()));
+        // 中文/空格目录（shell 通常百分号编码）。
+        assert_eq!(
+            osc7_to_path("file://h/Users/jal/%E4%B8%AD%E6%96%87%20dir"),
+            Some("/Users/jal/中文 dir".to_string())
+        );
+        // 非 file scheme / 无路径 / 空 → None。
+        assert_eq!(osc7_to_path("https://x.io/a"), None);
+        assert_eq!(osc7_to_path("file://onlyhost"), None);
+        assert_eq!(osc7_to_path(""), None);
+    }
 
     #[test]
     fn line_col_stripped_for_open() {

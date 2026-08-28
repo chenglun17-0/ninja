@@ -72,12 +72,30 @@ fragment float4 cell_fs(
     float cov = atlas.sample(smp, in.uv).r;
     return float4(in.color.rgb, in.color.a * cov);
 }
+
+// p5 层：插件画进 IOSurface 的 BGRA 直接采样（alpha 预乘，quad 顶点
+// 色恒白）。uv 与 cell_vs 同一顶点布局，无断字形路径。
+fragment float4 layer_fs(
+    VOut in [[stage_in]],
+    texture2d<float> content [[texture(0)]],
+    sampler smp [[sampler(0)]]
+) {
+    return content.sample(smp, in.uv);
+}
 "#;
 
 /// 渲染主题色（p1 硬编码；p2 配置阶段进 TOML）。
 pub struct Theme {
     pub selection_bg: Rgb,
     pub cursor: Rgb,
+}
+
+/// p5 层的渲染快照（layer::draw_list 产出）：纹理（IOSurface 包裹）
+/// + drawable 像素矩形（左上原点）。
+pub struct LayerDraw {
+    pub handle: u64,
+    pub texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    pub rect: (f64, f64, f64, f64),
 }
 
 impl Default for Theme {
@@ -93,6 +111,8 @@ pub struct Renderer {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    /// p5 层管线（同一顶点看色器 + layer_fs 采样 BGRA）。
+    layer_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     atlas_texture: Retained<ProtocolObject<dyn MTLTexture>>,
     pub layer: Retained<CAMetalLayer>,
@@ -127,6 +147,7 @@ impl Renderer {
             .ok()?;
         let vs = library.newFunctionWithName(&NSString::from_str("cell_vs"))?;
         let fs = library.newFunctionWithName(&NSString::from_str("cell_fs"))?;
+        let layer_fs_fn = library.newFunctionWithName(&NSString::from_str("layer_fs"))?;
 
         let pipeline_desc = MTLRenderPipelineDescriptor::new();
         pipeline_desc.setVertexFunction(Some(&vs));
@@ -144,6 +165,25 @@ impl Renderer {
         color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
         let pipeline = device
             .newRenderPipelineStateWithDescriptor_error(&pipeline_desc)
+            .ok()?;
+
+        // p5 层管线：同顶点/blend 配置，只换片段函数（BGRA 直采样）。
+        let layer_desc = MTLRenderPipelineDescriptor::new();
+        layer_desc.setVertexFunction(Some(&vs));
+        layer_desc.setFragmentFunction(Some(&layer_fs_fn));
+        let layer_attachment = unsafe {
+            layer_desc
+                .colorAttachments()
+                .objectAtIndexedSubscript(0)
+        };
+        layer_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        layer_attachment.setBlendingEnabled(true);
+        layer_attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+        layer_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+        layer_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+        layer_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+        let layer_pipeline = device
+            .newRenderPipelineStateWithDescriptor_error(&layer_desc)
             .ok()?;
 
         let sampler_desc = MTLSamplerDescriptor::new();
@@ -168,6 +208,7 @@ impl Renderer {
             device,
             queue,
             pipeline,
+            layer_pipeline,
             sampler,
             atlas_texture,
             layer,
@@ -180,13 +221,21 @@ impl Renderer {
 
     /// 画一帧：先组顶点（cell 循环里按需光栅化新字形），随后把
     /// atlas pending（含本帧新字形）上传纹理，最后才编码 draw。
+    /// p5：cell pass 之后编码层 pass（插件 IOSurface 纹理按矩形盖上，
+    /// 同一 encoder 换管线，无额外 render pass）。
     /// 顺序是 p1 黑屏缺陷的修复本体：`replaceRegion` 是 CPU 侧立即写入
     /// （Shared 存储），GPU 在同一命令缓冲 commit 后才采样 —— 本帧
     /// 光栅化的字形当帧可见，不需要「下一帧」来补上传（空闲终端没有
     /// 下一帧：无 PTY 字节、光标不闪烁时不重画）。
     /// 不额外调度重画：无新增槽位时 pending 为空、上传 no-op，无自旋。
     /// 光标可见性/闪烁相位由 view 折进 frame.cursor（None = 不画）。
-    pub fn draw(&mut self, frame: &Frame, atlas: &mut GlyphAtlas, font: &mut Font) {
+    pub fn draw(
+        &mut self,
+        frame: &Frame,
+        atlas: &mut GlyphAtlas,
+        font: &mut Font,
+        layers: &[LayerDraw],
+    ) {
         let (dw, dh) = self.drawable_size;
         if dw < 1.0 || dh < 1.0 || frame.cols == 0 || frame.rows == 0 {
             return;
@@ -287,12 +336,79 @@ impl Renderer {
                 verts.len() as u64 as usize,
                 1,
             );
+
+            // ---- p5 层 pass：同一 encoder，换管线逐层盖上 ----
+            // 层顶点：uv 全幅 0..1（uv0,0 = 表面左上 = 层矩形左上），
+            // 顶点色恒白（alpha 由纹理自带）。
+            for l in layers {
+                let (x, y, w, h) = l.rect;
+                let (x0, y0) = (x as f32, y as f32);
+                let (x1, y1) = ((x + w) as f32, (y + h) as f32);
+                let (r, g, b, a) = (1.0f32, 1.0, 1.0, 1.0);
+                let lv: [Vertex; 6] = [
+                    Vertex { x: x0, y: y0, u: 0.0, v: 0.0, r, g, b, a },
+                    Vertex { x: x1, y: y0, u: 1.0, v: 0.0, r, g, b, a },
+                    Vertex { x: x1, y: y1, u: 1.0, v: 1.0, r, g, b, a },
+                    Vertex { x: x0, y: y0, u: 0.0, v: 0.0, r, g, b, a },
+                    Vertex { x: x1, y: y1, u: 1.0, v: 1.0, r, g, b, a },
+                    Vertex { x: x0, y: y1, u: 0.0, v: 1.0, r, g, b, a },
+                ];
+                encoder.setRenderPipelineState(&self.layer_pipeline);
+                encoder.setFragmentTexture_atIndex(Some(&l.texture), 0);
+                encoder.setFragmentSamplerState_atIndex(Some(&self.sampler), 0);
+                encoder.setVertexBytes_length_atIndex(
+                    std::ptr::NonNull::new(lv.as_ptr() as *mut std::ffi::c_void).unwrap(),
+                    std::mem::size_of::<[Vertex; 6]>(),
+                    0,
+                );
+                encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                    MTLPrimitiveType::Triangle,
+                    0,
+                    6,
+                    1,
+                );
+            }
             encoder.endEncoding();
         }
         let drawable: &ProtocolObject<dyn objc2_metal::MTLDrawable> = drawable.as_ref();
         cmdbuf.presentDrawable(drawable);
         cmdbuf.commit();
         self.frames_drawn += 1;
+
+        // 取证开关：NINJA_LAYER_PROBE=<dir> 时把每个已呈现层的纹理读回
+        // 落盘 <dir>/<handle>.ppm（E2E 断言「层内确有文本墨迹」用；
+        // layer::close 摘层时删除对应文件——close 在 plugins 侧调
+        // renderer 的静态助手，这里只管 dump）。
+        if let Some(dir) = std::env::var_os("NINJA_LAYER_PROBE") {
+            for l in layers {
+                self.dump_layer_ppm(l, std::path::Path::new(&dir));
+            }
+        }
+    }
+
+    /// 层纹理读回 → PPM（BGRA→RGB）。失败静默（取证钩子不炸产品路径）。
+    fn dump_layer_ppm(&self, l: &LayerDraw, dir: &std::path::Path) {
+        let w = l.rect.2.round().max(1.0) as usize;
+        let h = l.rect.3.round().max(1.0) as usize;
+        let mut buf = vec![0u8; w * h * 4];
+        // SAFETY: 布局与 BGRA8Unorm 匹配，读回整幅。
+        unsafe {
+            l.texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                std::ptr::NonNull::new(buf.as_mut_ptr().cast()).unwrap(),
+                w * 4,
+                objc2_metal::MTLRegion {
+                    origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: objc2_metal::MTLSize { width: w, height: h, depth: 1 },
+                },
+                0,
+            );
+        }
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        out.reserve(w * h * 3);
+        for px in buf.chunks_exact(4) {
+            out.extend_from_slice(&[px[2], px[1], px[0]]); // BGRA→RGB
+        }
+        let _ = std::fs::write(dir.join(format!("{}.ppm", l.handle)), out);
     }
 
     /// 组一帧的全部顶点：cell 循环（背景/字形/装饰）→ IME 预编辑 →
@@ -645,7 +761,7 @@ mod tests {
         }
 
         let mut atlas = GlyphAtlas::new(ch);
-        r.draw(&frame, &mut atlas, &mut font);
+        r.draw(&frame, &mut atlas, &mut font, &[]);
 
         // 离屏 layer 拿不到 drawable → 帧没画成，headless 环境跳过。
         if r.frames_drawn == 0 {

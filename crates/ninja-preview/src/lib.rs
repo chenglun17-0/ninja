@@ -1,11 +1,6 @@
-//! ninja-preview（p0 空壳）。
+//! ninja-preview 宿主库位（无产品代码）：全部实现在 `src/main.rs`
+//!（独立进程 crate，无 lib 目标以外的形态）。
 //!
-//! 官方示例插件：只预览文本和代码，独立进程，第一次点击才被拉起。
-//! 它只允许通过 ninja-protocol 的 JSON 消息与宿主说话，禁止链接宿主内部 API；
-//! 层像素走宿主分配的 IOSurface。真正实现在 p5（层 + 预览）。
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn placeholder() {}
-}
+//! 见 `src/main.rs` 的 crate 文档：官方示例插件——文本/代码 pager，
+//! 只经 ADE 协议（ninja-protocol JSON 帧 + 宿主分配的 IOSurface）与
+//! 宿主说话，永不链宿主内部 API。

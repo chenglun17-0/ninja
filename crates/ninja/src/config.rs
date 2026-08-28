@@ -201,6 +201,9 @@ struct ThemeToml {
 struct PluginsToml {
     /// 启用的插件名。缺省/空 = 插件全关（空载门禁）。
     enabled: Option<Vec<String>>,
+    /// 插件名 → 二进制路径（p5：首次命中分发时按名拉起）。缺省时
+    /// 按名字在 NINJA_PLUGIN_DIR / 宿主二进制同目录解析。
+    paths: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -290,9 +293,26 @@ impl Config {
                 })
                 .collect();
             if !names.is_empty() {
-                eprintln!("ninja: 插件已启用 {names:?}（ADE socket 将监听；拉起在 p5）");
+                eprintln!("ninja: 插件已启用 {names:?}（首次命中时拉起进程）");
             }
-            cfg.plugins = PluginsConfig { enabled: names };
+            cfg.plugins = PluginsConfig {
+                enabled: names,
+                paths: parsed
+                    .plugins
+                    .paths
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(k, v)| {
+                        let v = v.trim().to_string();
+                        if v.is_empty() {
+                            eprintln!("ninja: plugins.paths.{k} 为空，忽略");
+                            None
+                        } else {
+                            Some((k, v))
+                        }
+                    })
+                    .collect(),
+            };
         }
         cfg
     }
@@ -337,6 +357,8 @@ pub fn default_toml() -> String {
     s.push_str("# split_right = \"cmd+d\"\n\n");
     s.push_str("[plugins]\n");
     s.push_str("# enabled = [\"preview\"]   # 默认空 = 插件关：不建 ADE socket、不拉进程\n");
+    s.push_str("# [plugins.paths]\n");
+    s.push_str("# preview = \"/usr/local/bin/ninja-preview\"   # 缺省按名在 NINJA_PLUGIN_DIR / 宿主同目录找\n");
     s
 }
 

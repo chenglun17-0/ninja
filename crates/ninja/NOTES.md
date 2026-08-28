@@ -263,3 +263,80 @@ sleep 6; footprint $(pgrep -x ninja)   # 4 pane（2窗+2标签+1分屏）
 - 焦点环用主题 cursor 色；分隔条不可键盘操作。
 - CGEvent 取证受真实会话抢焦点干扰（首键常丢）；关键路径有
   NINJA_P2_SELFTEST 钩子兜底。IME/拖选等 p1 手动项沿用 D2 待补测。
+
+## p5：层 + 文本预览（第一个插件门禁）取证
+
+「只通过公开协议完成点击路径 → 终端内看文本 → Esc 关层」。全部走
+真实二进制 + 真实 Unix socket + 真实 IOSurface 共享内存。
+
+### 协议修订（v0 内，显式钉）
+
+`hit` 增补 `cwd`（string，`#[serde(default)]`）——进程外插件无法访问
+宿主的 OSC-7 pwd 状态，golden 样例 `src/main.rs:42:13` 正是相对路径；
+不加则插件永远认领不了相对路径。规则记录在 ninja-protocol crate 文档
+「版本与演化规则」第 5 条（v0 未发布，字段集只增不删；公开后再改必须
+升 v）。golden `hit.json` 已再生成，second_language 测试无需改动
+（解码器只看 v/type）。
+
+### 端到端链路（E2E：`NINJA_E2E=1 cargo test -p ninja --test layer_preview`）
+
+| 环节 | 证据 |
+| --- | --- |
+| 启用≠常驻 | idle_no_plugins 对照组：启用后 3s 无子进程；`已拉起插件` 日志只出现在首次分发 |
+| 首击冷启动 | host_err：`冷启动等待 ~12ms，连接数 1`（spawn→connect）；预算 `COLD_CONNECT_TIMEOUT=2s`（debug 构建/系统忙时可达数百 ms，350ms 实测会随机降级） |
+| claim 抑制系统默认 | open_probe 文件为空（认领即止） |
+| 层内容 = 文本 | `NINJA_LAYER_PROBE`：渲染器把层纹理读回落 PPM；绝对路径场景 4344+ 亮像素、8 条 31px 等距文本条带（Menlo 13pt 行距）+ 头带 |
+| 相对路径解析 | OSC-7 场景：fakesh 报 `file://host/<pwd>` → 宿主解码为路径进 `hit.cwd` → 插件 `<pwd>/src/rel.txt` 认领 → 层照常出现 |
+| Esc 关层 | `tools/verify/synth_input.swift keypid 53 <host-pid>`（CGEventPostToPid 定向投递，免前台焦点抖动）→ keyDown 层前台分支 → 摘层 + 通知插件 + 层探针文件被删 |
+| 稳定性 | 修复后连续 5/5 通过；零残留进程（reaper killpg 收割宿主+插件） |
+
+依赖红线：`cargo tree -p ninja-preview` 无宿主 crate（只 ninja-protocol
++ objc2 系统框架族）；`cargo tree -p ninja` 无 wasmtime/tokio 不变；
+空载（默认配置）不建 socket、不拉进程不变（idle_no_plugins 全绿）。
+
+### 实现中发现并修掉的缺陷（全部有复现取证）
+
+1. **`layer::present` 注册表锁重入死锁**：present 持 REGISTRY Mutex 调
+   `render_now` → `draw_list` 再锁同一把锁 → 宿主主线程冻死（首个
+   E2E 轮次无任何报错挂死）。修复：先放锁再重画。
+2. **IOSurface 跨进程 lookup 失败**：`kIOSurfaceIsGlobal` 的值误传
+   CFNumber（属性接 CFBoolean），surface 实际非 global，插件进程
+   `IOSurfaceLookup(id)` 恒 NULL。修复：CFBoolean true。
+3. **层握手解码器竞态**：claim 与 layer.open 常在同一读块到达，分发
+   阶段只弹到回执就停；握手若先阻塞读新字节，会把已缓冲的
+   layer.open 晾满整个 1.5s 预算（E2E 偶发 20s 探针不出现）。修复：
+   握手循环先弹尽解码器再阻塞读。
+4. **OSC-7 pwd 是完整 URI**：vt 契约 `pwd()` 返回 `file://host/path`，
+   p4 的 open.rs 一直把 URI 当路径基（从未被 OSC-7 场景踩中）。新增
+   `open::osc7_to_path`（剥 scheme/authority + 百分号解码），hit.cwd
+   与系统默认回退共用；带单测。
+5. **NINJA_P4_HIT 一次性 3s 定时器竞态**：系统忙时 fakesh 首行晚于
+   定时器 → 点击落空 → 测试随机挂。改为内容门控重试（目标行有字节
+   才点，最多 15s；点击后停表）。p4 三个 E2E 场景断言不受影响
+   （全 contains/空判）。
+6. **E2E 点击行超 80 列被网格折行**：宿主认出的是截断路径（插件合理
+   ignore）。测试目标改放 `/tmp` 短目录；这也解释了为何 golden 样例
+   的相对路径形态（`src/main.rs:42:13`）在真实 80 列终端里必须足够短。
+
+### 运行 E2E 的前提
+
+`cargo test --workspace`（自动构建 ninja-preview）；或先
+`cargo build -p ninja-preview` 再 `NINJA_E2E=1 cargo test -p ninja`
+（layer_preview 从 `CARGO_BIN_EXE_ninja` 同目录解析插件二进制，缺失
+时以明确报错失败而非静默跳过——门禁不放松）。Esc 取证需
+`tools/verify/synth_input.swift`（Xcode 工具链；仓内
+`.cargo/config.toml` 的 `DEVELOPER_DIR=CommandLineTools` 会被测试显式
+剥掉——CLT swift 6.0.2 与自身 SDK 不配套）。
+
+### 已知残留（p5 新增）
+
+- 同 pane 一次只允许一个层（多次命中替换旧层）；多 pane 各一层。
+- 层矩形在 view resize 时直接收层（不跟随重排）。
+- 插件认领但层握手超预算（挂死插件）时，点击线程最多冻结 1.5s 一次
+  （同步策略，与 p4 的 500ms 回执预算同哲学）；release 二进制的
+  正常路径 <50ms。
+- 泵 timer（150ms）只在有层存在时挂在主 runloop；层全关即摘。
+- `input.key` 只映射协议命名集 + 单可见字符；修饰键名完整传递但
+  预览插件不消费（无滚动，p5 明确不做）。
+- dpi 由窗口 backingScale 推导；离屏/无屏场景为 72（字体小一档），
+  功能不受影响。

@@ -57,6 +57,13 @@ pub struct Hit {
     pub kind: HitKind,
     /// 命中文本（路径 / URL / OSC-8 链接）。原样字节，不猜测展开。
     pub text: String,
+    /// 相对路径的解析基目录（shell 经 OSC 7 报告的工作目录；空 = 未知）。
+    /// 绝对路径 / URL 时插件可忽略本字段。p5 修订加入（见 crate 文档
+    /// 「版本与演化规则」第 5 条）：进程外插件无法访问宿主的 OSC-7
+    /// 状态，没有它就永远认领不了相对路径；收方对未知字段一律忽略的
+    /// 规则保证旧实现兼容。
+    #[serde(default)]
+    pub cwd: String,
     /// 命中 cell 的行（0 基，pane 内 vt 网格）。
     pub row: u32,
     /// 命中 cell 的列（0 基）。
@@ -72,6 +79,7 @@ impl Hit {
         id: u64,
         kind: HitKind,
         text: impl Into<String>,
+        cwd: impl Into<String>,
         row: u32,
         col: u32,
         pane: u32,
@@ -82,6 +90,7 @@ impl Hit {
             id,
             kind,
             text: text.into(),
+            cwd: cwd.into(),
             row,
             col,
             pane,
@@ -569,6 +578,7 @@ impl Message {
                 7,
                 HitKind::Path,
                 "src/main.rs:42:13",
+                "/Users/jal/demo",
                 41,
                 0,
                 2,

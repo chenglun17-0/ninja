@@ -26,8 +26,12 @@ pub struct Ivars {
     pub config: Config,
     /// 门禁取证钩子的步骤序列（NINJA_P2_SELFTEST，启动后延时执行）。
     pub selftest: RefCell<Option<String>>,
-    /// p4 命中分发取证钩子（NINJA_P4_HIT="col,row"，启动后延时执行）。
+    /// p4 命中分发取证钩子（NINJA_P4_HIT="col,row"，内容门控重试）。
     pub p4_hit: RefCell<Option<String>>,
+    /// p4 钩子的重试定时器（点击后/超时后停）。
+    p4_hit_timer: RefCell<Option<Retained<objc2_foundation::NSTimer>>>,
+    /// p4 钩子首拍时刻（15s 重试窗口计时用）。
+    p4_hit_started: Cell<Option<std::time::Instant>>,
     /// 本壳持有的窗口强引用。**关键不变量**：窗口在 -[NSWindow close]
     /// 期间必须有人持有（NSApp 的窗口列表引用会在 close 中途摘掉，
     /// 若那是唯一引用，窗口在自己 close 的调用栈里 dealloc，后续
@@ -89,24 +93,25 @@ define_class!(
             // p4 命中分发取证钩子（非产品功能）：NINJA_P4_HIT="col,row"
             // 在首帧落定后对 key window 的焦点 pane 走一遍 Cmd+点击路径
             //（与 NINJA_P2_SELFTEST 同惯例；真实合成点击取证用
-            // tools/verify/synth_input.swift 的 click x y 1）。延时 3s：
-            // 等启动链路（Metal 初始化）与外部插件连上 socket——E2E 里
-            // 插件是测试进程自己拉起的独立进程，连接需要一点时间；
-            // 真实 Cmd+点击无此等待（点击时插件早已连着或根本没启用）。
+            // tools/verify/synth_input.swift 的 click x y 1）。p5 起改为
+            // **内容门控重试**：shell 首行没字节前重试（最多 15s；系统忙
+            // 时 fakesh 的 printf 可能晚于定时器首拍，一次性触发会随机
+            // 落空——E2E 实测），有内容才真正点击并停表。真实 Cmd+点击
+            // 无此等待（点击时内容早已在屏上）。
             if let Ok(spec) = std::env::var("NINJA_P4_HIT") {
                 self.ivars().p4_hit.replace(Some(spec));
                 // SAFETY: 同上。
                 let target: Retained<objc2::runtime::AnyObject> = unsafe { msg_send![self, self] };
                 let timer = unsafe {
                     objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                        3.0,
+                        1.0,
                         &target,
                         objc2::sel!(ninjaP4HitTick:),
                         None,
-                        false,
+                        true,
                     )
                 };
-                std::mem::forget(timer);
+                self.ivars().p4_hit_timer.replace(Some(timer));
             }
         }
 
@@ -227,9 +232,21 @@ define_class!(
         /// pane（没有焦点就第一个叶子）走 Cmd+点击命中分发路径。
         #[unsafe(method(ninjaP4HitTick:))]
         fn ninja_p4_hit_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
-            let Some(spec) = self.ivars().p4_hit.take() else {
+            use std::time::{Duration, Instant};
+            let Some(spec) = self.ivars().p4_hit.borrow().clone() else {
                 return;
             };
+            if self.ivars().p4_hit_started.get().is_none() {
+                self.ivars().p4_hit_started.set(Some(Instant::now()));
+            }
+            if let Some(t0) = self.ivars().p4_hit_started.get() {
+                if t0.elapsed() > Duration::from_secs(15) {
+                    eprintln!("ninja: NINJA_P4_HIT 等待行内容超时，放弃");
+                    self.ivars().p4_hit.take();
+                    self.stop_p4_hit_timer();
+                    return;
+                }
+            }
             let Some(mtm) = MainThreadMarker::new() else { return };
             let app = NSApplication::sharedApplication(mtm);
             // key/main 窗口在后台/争激活时会短暂为 nil（并行取证实测），
@@ -269,8 +286,15 @@ define_class!(
                 .and_then(|v| (v.len() == 2).then(|| (v[0], v[1])))
             else {
                 eprintln!("ninja: NINJA_P4_HIT 需为 \"col,row\"（u16），得到 {spec:?}");
+                self.stop_p4_hit_timer();
                 return;
             };
+            // 内容门控：目标行还没字节（shell 首行未落定）→ 等下一拍。
+            if view.row_is_blank(row) {
+                return;
+            }
+            self.ivars().p4_hit.take();
+            self.stop_p4_hit_timer();
             view.cmd_click(col, row, libghostty_vt::key::Mods::SUPER);
         }
 
@@ -516,6 +540,8 @@ pub fn run() {
         config,
         selftest: RefCell::new(None),
         p4_hit: RefCell::new(None),
+        p4_hit_timer: RefCell::new(None),
+        p4_hit_started: Cell::new(None),
         windows: RefCell::new(Vec::new()),
         closing: RefCell::new(Vec::new()),
         prune_scheduled: Cell::new(false),
@@ -532,6 +558,14 @@ pub fn run() {
 
 /// Rust 侧公开接口（define_class 外的 impl）。
 impl AppDelegate {
+    /// 停 p4 取证定时器（点击已发/参数错/超时）。普通 Rust 方法，
+    /// 不挂 selector（define_class 内的无属性方法会被当 ObjC 方法拒收）。
+    fn stop_p4_hit_timer(&self) {
+        if let Some(t) = self.ivars().p4_hit_timer.take() {
+            t.invalidate();
+        }
+    }
+
     /// 登记 window 强引用（make_window 后立即调；见 Ivars.windows）。
     /// 窗口在 -close 期间必须有人持有（NSApp 窗口列表的引用会在 close
     /// 中途摘掉，唯一引用会让窗口拆在自己的 close 调用栈里 → SIGSEGV）。

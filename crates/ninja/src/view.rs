@@ -44,6 +44,7 @@ use crate::atlas::GlyphAtlas;
 use crate::config::Config;
 use crate::font::Font;
 use crate::keymap;
+use crate::layer::{self, LayerGeom};
 use crate::link;
 use crate::open;
 use crate::plugins;
@@ -201,6 +202,8 @@ define_class!(
         fn set_frame_size(&self, size: NSSize) {
             // SAFETY: 标准 super 调用。
             let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+            // p5：resize 后层矩形必然错位——收层（通知插件）。
+            plugins::host_close_layers_of_pane(self.pane_id());
             self.grid_changed();
         }
 
@@ -218,6 +221,41 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            // p5 层前台分支：本 pane 有插件层时键盘先给插件（协议语义：
+            // input.key）。Esc 例外——PRODUCT「任何插件层都能立刻关掉」：
+            // 宿主直接关层（摘层 + 通知插件 layer.close），不依赖插件
+            // 响应速度；焦点（键盘路由）随之回终端。
+            let pane = self.pane_id();
+            if layer::foreground(pane).is_some() {
+                let flags = event.modifierFlags();
+                let mods = keymap::mods_from_flags(flags.0 as u64);
+                let code = event.keyCode();
+                let chars = event
+                    .charactersIgnoringModifiers()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                if keymap::key_from_code(code) == Some(Key::Escape) && !mods.contains(Mods::SUPER)
+                {
+                    plugins::host_close_layers_of_pane(pane);
+                    self.needs_render();
+                    return;
+                }
+                // 其余键转 input.key（键名：命名集优先，退回单字符文本）。
+                let key_name = keymap::key_from_code(code)
+                    .and_then(keymap::protocol_key_name)
+                    .or_else(|| {
+                        let c = chars.chars().next()?;
+                        (c.is_ascii_graphic() && !c.is_whitespace()).then(|| {
+                            c.to_ascii_lowercase().to_string()
+                        })
+                    });
+                if let Some(k) = key_name {
+                    let text = chars.chars().filter(|c| c.is_ascii_graphic()).collect::<String>();
+                    plugins::forward_input_key(pane, &k, &text, modifier_list(mods));
+                }
+                return; // 层前台：不进 PTY/IME
+            }
+
             let flags = event.modifierFlags();
             let mods = keymap::mods_from_flags(flags.0 as u64);
             let code = event.keyCode();
@@ -706,33 +744,41 @@ impl TerminalView {
     // ---- p4 命中分发（Cmd+点击；也供 NINJA_P4_HIT 取证钩直调）----
 
     /// Cmd+点击路径：识别 → 构造 Hit → 插件分发 → claim 或系统默认。
+    /// p5：认领时携带层几何（IOSurface 尺寸/位置由宿主定）。
     /// 主线程；分发用同步短超时（见 plugins.rs），不新增线程。
     pub fn cmd_click(&self, col: u16, row: u16, mods: Mods) {
         // 1) 行扫描（借用在块内放掉——分发/打开不再碰 view 状态）。
+        //    OSC-7 pwd 是完整 URI，解码成路径（open::osc7_to_path）。
         let (cells, osc8, pwd) = {
             let st = self.state();
             let (cells, osc8) = scan_row(&st.term, row, col);
-            let pwd = st.term.terminal.pwd().unwrap_or("").trim().to_string();
+            let pwd_uri = st.term.terminal.pwd().unwrap_or("").trim().to_string();
+            let pwd = open::osc7_to_path(&pwd_uri).unwrap_or_default();
             (cells, osc8, pwd)
         };
         // 2) 纯函数识别（OSC-8 优先，否则行内扩展 + 分类）。
         let Some(found) = link::recognize(&cells, usize::from(col), osc8.as_deref()) else {
-            return; // 点在不可点的东西上：什么都不做（保持普通终端行为）
+            return; // 点在不可点的东西上：什么都不都不做（保持普通终端行为）
         };
-        // 3) 构造 Hit 并广播（未启用插件 → NoPlugins → 系统默认）。
+        // 3) 构造 Hit（含 cwd：相对路径的解析基，p5 协议修订）并广播
+        //    （未启用插件 → NoPlugins → 系统默认）。
         let pane = self.pane_id();
         let hit = ProtocolHit::new(
             plugins::next_hit_id(),
             found.kind,
             found.text.clone(),
+            pwd.clone(),
             u32::from(row),
             u32::from(col),
             pane,
             modifier_list(mods),
         );
-        match plugins::dispatch_hit(&hit) {
+        // 4) 层几何（IOSurface/纹理/重画所需；仅插件可能认领时收集）。
+        let geom = self.layer_geom(pane);
+        match plugins::dispatch_hit(&hit, geom.as_ref()) {
             plugins::DispatchOutcome::Claimed { .. } => {
-                // 有插件认领：p4 到此为止（层/预览接线是 p5）。
+                // 有插件认领：层握手已在 dispatch 内完成（open→ready→
+                // present），系统默认不触发。到此为止。
             }
             plugins::DispatchOutcome::NoPlugins
             | plugins::DispatchOutcome::AllIgnored => {
@@ -741,6 +787,40 @@ impl TerminalView {
                 open::open_hit_target(found.kind, &found.text, pwd);
             }
         }
+    }
+
+    /// 层几何快照（cmd_click 用；renderer 存活才有）。None = 无渲染器
+    /// （headless 取证钩）→ 分发时不开层。
+    fn layer_geom(&self, pane: u32) -> Option<LayerGeom> {
+        let st = self.state();
+        let r = st.renderer.as_ref()?;
+        let scale = r.layer.contentsScale().max(1.0);
+        Some(LayerGeom {
+            pane,
+            cell_px: (r.cell_px.0, r.cell_px.1),
+            view_px: r.drawable_size,
+            scale,
+            device: r.device.clone(),
+            view: std::ptr::from_ref(self) as usize,
+            conn: 0, // 层握手时换成认领连接 id
+        })
+    }
+
+    /// 层内容重画请求（layer::present 回调；主线程）。直接画一帧而不
+    /// 只标记脏（层宿主视图是 Metal 自绘：不依赖 AppKit display cycle
+    /// 的时序，present 后当帧可见）。
+    pub fn layer_needs_display(&self) {
+        self.render_now();
+    }
+
+    /// 目标行是否还没有任何文本（取证钩子 NINJA_P4_HIT 的内容门控用：
+    /// shell 首行没落定前不点击）。主线程；只读 vt 网格。
+    pub fn row_is_blank(&self, row: u16) -> bool {
+        let st = self.state();
+        let (cells, _) = scan_row(&st.term, row, 0);
+        cells
+            .iter()
+            .all(|c| matches!(c, crate::link::RowCell::Blank | crate::link::RowCell::Cont))
     }
 
     // ---- 几何 ----
@@ -883,6 +963,8 @@ impl TerminalView {
 
     fn render_now(&self) {
         let mut st = self.state();
+        let pane = st.pane_id;
+        let layers = layer::draw_list(pane);
         let State {
             term,
             font,
@@ -919,7 +1001,7 @@ impl TerminalView {
         } else {
             frame_buf.marked = None;
         }
-        r.draw(frame_buf, atlas, font);
+        r.draw(frame_buf, atlas, font, &layers);
     }
 
     // ---- 键盘/焦点/剪贴板 ----
@@ -1005,6 +1087,9 @@ impl TerminalView {
     ///    有人调本 pane 的唤醒闭包）；3. 摘 runloop source（info 与
     ///    source 本体泄漏不 free，见 WakeInfo）；4. 放渲染器。
     pub fn shutdown(&self) {
+        // p5：pane 收尾先收层（还有插件连接可通知；指针纪律：层注册表
+        // 里的 view 指针自此不再被解引用）。
+        plugins::host_close_layers_of_pane(self.pane_id());
         let reg = self.ivars().wake.take();
         // 先标 dead，再做任何释放。首行执行保证任何后续 perform 都安全。
         if let Some(reg) = &reg {

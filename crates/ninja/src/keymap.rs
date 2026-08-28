@@ -187,6 +187,43 @@ pub fn key_from_command_selector(sel: &str) -> Option<Key> {
     })
 }
 
+/// vt 逻辑键 → ADE 协议键名（命名集：left/right/up/down/home/end/
+/// pageup/pagedown/delete/backspace/tab/enter/esc/f1..f12 + 单字符）。
+/// 协议键名集冻结（新键名升 v）；不在集内 → None（调用方退回单字符
+/// 文本或丢弃）。
+pub fn protocol_key_name(key: Key) -> Option<String> {
+    let name = match key {
+        Key::ArrowLeft => "left",
+        Key::ArrowRight => "right",
+        Key::ArrowUp => "up",
+        Key::ArrowDown => "down",
+        Key::Home => "home",
+        Key::End => "end",
+        Key::PageUp => "pageup",
+        Key::PageDown => "pagedown",
+        Key::Delete => "delete",
+        Key::Backspace => "backspace",
+        Key::Tab => "tab",
+        Key::Enter | Key::NumpadEnter => "enter",
+        Key::Escape => "esc",
+        Key::F1 => "f1",
+        Key::F2 => "f2",
+        Key::F3 => "f3",
+        Key::F4 => "f4",
+        Key::F5 => "f5",
+        Key::F6 => "f6",
+        Key::F7 => "f7",
+        Key::F8 => "f8",
+        Key::F9 => "f9",
+        Key::F10 => "f10",
+        Key::F11 => "f11",
+        Key::F12 => "f12",
+        Key::Space => " ",
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
 /// 剪掉 vt 编码器不接受的文本：C0 控制字符与 macOS PUA 功能键码
 ///（U+F700–U+F8FF），见 libghostty-vt key::Event::set_utf8 文档。
 pub fn sanitize_utf8(text: &str) -> Option<String> {
@@ -268,5 +305,17 @@ mod tests {
         assert_eq!(key_from_command_selector("insertNewline:"), Some(Key::Enter));
         assert_eq!(key_from_command_selector("insertTab:"), Some(Key::Tab));
         assert_eq!(key_from_command_selector("noop:"), None);
+    }
+
+    #[test]
+    fn protocol_key_names() {
+        // 命名集与协议文档一致；字母/数字不在命名集（退回单字符文本）。
+        assert_eq!(protocol_key_name(Key::Escape).as_deref(), Some("esc"));
+        assert_eq!(protocol_key_name(Key::ArrowLeft).as_deref(), Some("left"));
+        assert_eq!(protocol_key_name(Key::PageDown).as_deref(), Some("pagedown"));
+        assert_eq!(protocol_key_name(Key::NumpadEnter).as_deref(), Some("enter"));
+        assert_eq!(protocol_key_name(Key::F12).as_deref(), Some("f12"));
+        assert_eq!(protocol_key_name(Key::Space).as_deref(), Some(" "));
+        assert_eq!(protocol_key_name(Key::A), None);
     }
 }
