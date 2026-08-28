@@ -32,6 +32,10 @@ pub struct Ivars {
     p4_hit_timer: RefCell<Option<Retained<objc2_foundation::NSTimer>>>,
     /// p4 钩子首拍时刻（15s 重试窗口计时用）。
     p4_hit_started: Cell<Option<std::time::Instant>>,
+    /// p6 同会话禁用/再启用取证钩子：NINJA_P6_PLUGIN_FILE 轮询的文件路径。
+    p6_file: RefCell<Option<String>>,
+    /// p6 钩子已应用的目标态（去抖：只在变化时动作）。
+    p6_state: Cell<Option<bool>>,
     /// 本壳持有的窗口强引用。**关键不变量**：窗口在 -[NSWindow close]
     /// 期间必须有人持有（NSApp 的窗口列表引用会在 close 中途摘掉，
     /// 若那是唯一引用，窗口在自己 close 的调用栈里 dealloc，后续
@@ -113,6 +117,28 @@ define_class!(
                 };
                 self.ivars().p4_hit_timer.replace(Some(timer));
             }
+
+            // p6 同会话禁用/再启用取证钩子（非产品功能）：
+            // NINJA_P6_PLUGIN_FILE=<path> 时每 0.2s 读该文件内容
+            //（"off"/"0"=禁用，"on"/"1"=再启用），状态变化才动作。
+            // 文件触发（同 NINJA_* 惯例）让 E2E/验证员免 CGEvent 驱动
+            // 同会话「启用→用一次→禁用→再启用」的生命周期；产品 UI
+            // 归后续阶段。
+            if let Ok(f) = std::env::var("NINJA_P6_PLUGIN_FILE") {
+                self.ivars().p6_file.replace(Some(f));
+                // SAFETY: 同上（-self 返回 retain 过的引用）。
+                let target: Retained<objc2::runtime::AnyObject> = unsafe { msg_send![self, self] };
+                let timer = unsafe {
+                    objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                        0.2,
+                        &target,
+                        objc2::sel!(ninjaP6PluginTick:),
+                        None,
+                        true,
+                    )
+                };
+                std::mem::forget(timer); // 进程生命期常驻（同 selftest 惯例）
+            }
         }
 
         // 多窗口：最后一个窗口关闭才退出（⌘Q 随时退）。
@@ -131,6 +157,11 @@ define_class!(
             if let Some(mtm) = MainThreadMarker::new() {
                 shell::shutdown_all_windows(mtm);
             }
+            // p6：`terminate:` 直接 exit(0)，不走 Rust 栈展开——栈上
+            // PluginHost 的 Drop 不会跑（⌘Q/关最后窗都走这里；socket
+            // 尸体因此不只来自 SIGKILL）。显式关一次（幂等，与 Drop 同
+            // 一实现：收层/断连/收割子进程/删 socket）。
+            plugins::host_shutdown();
         }
     }
 
@@ -296,6 +327,40 @@ define_class!(
             self.ivars().p4_hit.take();
             self.stop_p4_hit_timer();
             view.cmd_click(col, row, libghostty_vt::key::Mods::SUPER);
+        }
+
+        /// p6 钩子拍：读 NINJA_P6_PLUGIN_FILE 文件内容，状态变化才
+        /// 禁用/再启用（plugins::host_set_enabled）；"quit" 驱动正常退出
+        /// 路径（terminate: → applicationWillTerminate → host_shutdown →
+        /// exit(0)——产品 ⌘Q/关最后窗的同一条路径；E2E 用。
+        /// CGEventPostToPid 的 ⌘Q 到不了后台应用的菜单系统，实证）。
+        /// 文件没写/被删/内容未知 → 维持现状。
+        #[unsafe(method(ninjaP6PluginTick:))]
+        fn ninja_p6_plugin_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            let Some(path) = self.ivars().p6_file.borrow().clone() else {
+                return;
+            };
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let want = match content.trim() {
+                "off" | "0" | "disable" => false,
+                "on" | "1" | "enable" => true,
+                "quit" => {
+                    let Some(mtm) = MainThreadMarker::new() else {
+                        return;
+                    };
+                    NSApplication::sharedApplication(mtm).terminate(None);
+                    return;
+                }
+                _ => return, // 未知内容：不动
+            };
+            if self.ivars().p6_state.get() == Some(want) {
+                return; // 已处于目标态
+            }
+            if plugins::host_set_enabled(want) {
+                self.ivars().p6_state.set(Some(want));
+            }
         }
 
         /// ⌘N：新窗口（独立窗口；nil target 动作最终落到 app delegate）。
@@ -542,6 +607,8 @@ pub fn run() {
         p4_hit: RefCell::new(None),
         p4_hit_timer: RefCell::new(None),
         p4_hit_started: Cell::new(None),
+        p6_file: RefCell::new(None),
+        p6_state: Cell::new(None),
         windows: RefCell::new(Vec::new()),
         closing: RefCell::new(Vec::new()),
         prune_scheduled: Cell::new(false),

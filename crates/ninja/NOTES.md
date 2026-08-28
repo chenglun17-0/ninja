@@ -340,3 +340,76 @@ sleep 6; footprint $(pgrep -x ninja)   # 4 pane（2窗+2标签+1分屏）
   预览插件不消费（无滚动，p5 明确不做）。
 - dpi 由窗口 backingScale 推导；离屏/无屏场景为 72（字体小一档），
   功能不受影响。
+
+# p6：关掉即轻（门禁）取证
+
+「禁用预览插件后内存回到 p2 空载、无残留进程、无隐藏窗口」。四条缺口的
+修复全部有单测 + E2E 判别（`tests/off_is_light.rs`，`NINJA_E2E=1` 门控）。
+
+## 缺口与修复
+
+1. **插件死亡收层（监督器缺口）**：pump_plugins / layer_handshake / 分发
+   读写阶段的对端 EOF / IO 错 / 坏协议断连原来只 `conns.remove(i)`——
+   层永久残留（any_layers 恒真 → 泵 timer 永不停）+ 陈旧层纹理一直
+   合成在最后渲染的 drawable 上（= 隐藏窗口）。修复：所有连接死亡
+   路径统一走 `drop_conn` → `layer::close_by_conn(conn)`（摘层 + 受影响
+   pane 主动重画；close() 同样补了重画，close_pane 维持调用方重画——
+   shutdown 路径视图可能正在拆）。单测 `conn_death_reclaims_layers_and_
+   stops_pump`（对端连上→开层→present→断开→any_layers()==false；删掉
+   close_by_conn 调用即红，判别力实证）。
+2. **同会话禁用/再启用**：`PluginHost::shutdown()`（幂等；顺序：摘全部层
+   + 尽力通知 layer.close → 停泵 → 断连接（插件 EOF 自退）→ kill+wait
+   子进程 → 删 socket 文件），`Drop` 复用同一实现。触发钩子
+   `NINJA_P6_PLUGIN_FILE`（0.2s 轮询文件内容："off"/"on"/"quit"；产品
+   UI 归后续）。再启用 = 新 host 换进分发器同一槽位：spawned 集随新
+   对象重置、socket 在原路径重绑。
+3. **陈旧 socket 清扫**：宿主 SIGKILL/崩溃 → `$TMPDIR/ninja-ade-<pid>.sock`
+   尸体。`PluginHost::start`（仅启用插件时——空载路径零改动）扫约定目录，
+   pid 已死（kill(pid,0)=ESRCH）才删，活 pid / 解析不出 pid 一律不动。
+   单测 `stale_socket_sweep_dead_pid_only`。
+4. **门禁 E2E** `tests/off_is_light.rs` 三场景（骨架复用 layer_preview：
+   CARGO_BIN_EXE_ninja + NINJA_P4_HIT + NINJA_LAYER_PROBE + 合成 Esc）。
+
+## E2E 实测（本轮，2026-08-28；连续 4/4 通过）
+
+| 场景 | 断言 | 结果 |
+| --- | --- | --- |
+| 用一次→Esc→禁用（钩子） | 层探针出现且有墨迹→Esc 删探针→"off" 后 socket 消失、pgrep ninja-preview 空、宿主子进程无 preview、层探针目录空、stderr 有拉起+禁用日志 | ✔ |
+| 同上·内存门禁 | footprint 采样最小值回 **37MB**（p2 基线 36MB，+1MB；容差钉 +4MB——足以抓单个 IOSurface 级 ~2MB 泄漏） | ✔ |
+| 禁用→再启用→再禁用 | "on" 后 socket 原路径重绑（"已再启用"日志）；再启用无分发不拉进程；"off" 再消失 | ✔ |
+| SIGKILL 宿主 | preview 因 socket EOF 自退（无残留）；约定路径留 socket 尸体（SIGKILL 不跑收口） | ✔ |
+| 尸体清扫 | 下一个启用插件的宿主启动即扫掉死 pid 尸体（"清扫陈旧"日志） | ✔ |
+| 正常退出（钩子 "quit"） | 宿主退出码 0、插件无残留、socket 文件被删、禁用日志在 | ✔ |
+
+复跑：`cargo build -p ninja-preview && NINJA_E2E=1 cargo test -p ninja --test off_is_light`。
+
+## 实现中发现并修掉的缺陷（p6 新增）
+
+1. **`terminate:` 不走 Rust 栈展开（E2E 场景 3 抓到）**：⌘Q / 关最后窗的
+   正常退出 = `NSApplication terminate:` 直接 `exit(0)`，`app.run()` 不
+   返回、栈上 `PluginHost` 的 **Drop 不会跑**——socket 尸体不只来自
+   SIGKILL，每次正常退出都留。p5 的「正常退出路径完整」判断有误。修复：
+   `applicationWillTerminate` 显式调 `plugins::host_shutdown()`（与 Drop
+   同一幂等实现）。实测 quit 后 socket 消失、退出码 0。
+2. **同尺寸 setFrameSize 拆层竞态**：AppKit 窗口装配/居中阶段重复投递
+   同尺寸 setFrameSize，无脑收层会把恰落在装配尾音上的首层拆掉（E2E
+   偶发探针消失）。修复：记录 last_size，尺寸真变才收层；resize 收层
+   语义不变。
+3. **CGEventPostToPid 的 ⌘Q 到不了后台应用的菜单系统**（keyDown 直达
+   键如 Esc 可以，菜单键等价物不行）：正常退出取证改用钩子 "quit"
+   （驱动产品同一条 terminate: 路径）。Esc 合成首键偶发丢失（p2 已录），
+   E2E 里带重试（多余的 Esc 落 PTY 无害）。
+4. **僵尸 pid 会让清扫误判**：被 SIGKILL 的宿主若没人 waitpid 收尸，
+   kill(pid,0) 仍返回"活"→ 保守不删（正确行为）。E2E 场景 2 显式
+   waitpid 收尸后再验清扫。
+
+## 已知残留（p6 新增）
+
+- 禁用钩子是取证用的文件触发，不是产品 UI/菜单（归后续；语义已定：
+  shutdown 幂等、再启用换新 host）。
+- 禁用后宿主 footprint +1MB（Metal/IOSurface 分配器高水位，非泄漏；
+  再启用→再用→再禁用不增长）。
+- 禁用时对插件的 layer.close 通知是尽力而为（连接已断的层直接回收，
+  无通知对象）；与 Esc 兜底同语义。
+- 清扫只认约定路径名 `ninja-ade-<pid>.sock`；NINJA_ADE_SOCK 覆盖路径
+  的尸体不扫（测试隔离路径，生产不使用）。

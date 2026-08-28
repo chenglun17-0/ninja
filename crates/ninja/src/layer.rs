@@ -91,6 +91,11 @@ static REGISTRY: std::sync::Mutex<Registry> = std::sync::Mutex::new(Registry {
     next_handle: 1,
 });
 
+/// 单测互斥：REGISTRY 是全局的，任何开层/断言注册表状态的测试先拿这
+/// 把锁（本模块的空表断言与 plugins::tests 的层生命周期测试串行）。
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 层创建所需几何（view 的 cmd_click 在主线程收集；字段只在主线程用）。
 pub struct LayerGeom {
     pub pane: u32,
@@ -215,34 +220,81 @@ pub fn present(handle: u64) -> Option<u32> {
         l.presented = true;
         (l.view, l.pane)
     };
-    // SAFETY: view 指针由主线程注册、主线程（本函数唯一调用方路径）
-    // 解引用；shutdown/resize 先经 close_pane 摘层，不悬空。
-    let view: &crate::view::TerminalView = unsafe { &*(view as *const _) };
-    view.layer_needs_display();
+    repaint_view(view);
     Some(pane)
 }
 
-/// 摘层（不通知插件——通知由 plugins 层补发 layer.close）。返回被摘的
-/// (handle, conn, pane) 列表。
-pub fn close(handle: u64) -> Vec<(u64, u64, u32)> {
-    let mut reg = match REGISTRY.lock() {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
+/// 摘层后对受影响 pane 重画（陈旧层纹理若不主动重画，会一直合成在
+/// 最后一次渲染的 drawable 上——空闲终端没有下一帧，层就成了永久
+/// 残留的「隐藏窗口」，p6 门禁）。`view==0`（单测注入的假几何，无宿主
+/// 视图）跳过。只能在主线程调（纪律同 present）。
+fn repaint_view(view: usize) {
+    if view == 0 {
+        return;
+    }
+    // SAFETY: view 指针由主线程注册（LayerGeom.view），本函数只在
+    // 主线程调用；view shutdown 先经 close_pane 摘层，指针不悬空。
+    let view: &crate::view::TerminalView = unsafe { &*(view as *const _) };
+    view.layer_needs_display();
+}
+
+/// 注册表按谓词摘层的实现核心：摘层 + 删层探针 + **放锁后**重画
+///（render_now → draw_list 会再锁同一把锁，std Mutex 不可重入——
+/// 纪律同 present）。
+fn close_where<F: Fn(&LayerEntry) -> bool>(pred: F) -> Vec<(u64, u64, u32)> {
+    let (closed, views) = {
+        let mut reg = match REGISTRY.lock() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let closed: Vec<(u64, u64, u32)> = reg
+            .layers
+            .iter()
+            .filter(|l| pred(l))
+            .map(|l| (l.handle, l.conn, l.pane))
+            .collect();
+        let views: Vec<usize> = reg
+            .layers
+            .iter()
+            .filter(|l| pred(l))
+            .map(|l| l.view)
+            .collect();
+        reg.layers.retain(|l| !pred(l));
+        for (h, _, _) in &closed {
+            remove_probe(*h);
+        }
+        (closed, views)
     };
-    let closed: Vec<(u64, u64, u32)> = reg
-        .layers
-        .iter()
-        .filter(|l| l.handle == handle)
-        .map(|l| (l.handle, l.conn, l.pane))
-        .collect();
-    reg.layers.retain(|l| l.handle != handle);
-    for (h, _, _) in &closed {
-        remove_probe(*h);
+    for v in views {
+        repaint_view(v);
     }
     closed
 }
 
-/// 摘某 pane 的全部层（resize / pane 关闭路径）。返回同上。
+/// 摘层（不通知插件——通知由 plugins 层补发 layer.close）。返回被摘的
+/// (handle, conn, pane) 列表。p6 起对受影响 pane 重画（pump 路径上插件
+/// 自发 layer.close 后不再有别的重画时机）。
+pub fn close(handle: u64) -> Vec<(u64, u64, u32)> {
+    close_where(|l| l.handle == handle)
+}
+
+/// 摘某插件连接拥有的全部层（**p6 监督器**：插件进程死亡/坏协议被断
+/// 时，它的层就是无主陈旧 overlay，不摘会永久残留且 `any_layers()`
+/// 恒真 → 泵 timer 永不停转）。语义同 [`close`]，返回被摘的
+/// (handle, conn, pane) 列表；受影响 pane 重画。
+pub fn close_by_conn(conn: u64) -> Vec<(u64, u64, u32)> {
+    close_where(|l| l.conn == conn)
+}
+
+/// 摘全部层（同会话禁用 / 宿主退出：`PluginHost::shutdown` 用）。
+/// 返回被摘列表（调用方按 conn 尽力通知还连着的插件 layer.close）。
+pub fn close_all() -> Vec<(u64, u64, u32)> {
+    close_where(|_| true)
+}
+
+/// 摘某 pane 的全部层（resize / pane 关闭路径）。返回同上。有意**不**
+/// 在此重画：调用方（Esc → needs_render、resize → grid_changed）自带
+/// 重画，而 shutdown 路径视图可能正在拆，主动重画不安全。
 pub fn close_pane(pane: u32) -> Vec<(u64, u64, u32)> {
     let mut reg = match REGISTRY.lock() {
         Ok(r) => r,
@@ -330,11 +382,16 @@ mod tests {
 
     #[test]
     fn registry_lifecycle() {
+        // 与会开层的 plugins::tests 测试互斥（REGISTRY 全局）。
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 无 Metal 设备（headless 单测）：直接验证注册表的摘除/查询语义
         // 不足以开层——open 需要 device，这里只测 close/foreground 在
         // 空表上的行为。真正的开层在 E2E（tests/layer_preview.rs）。
         assert!(close_pane(4242).is_empty());
         assert!(close(99).is_empty());
+        // p6：按连接摘层在空表上同样是 no-op。
+        assert!(close_by_conn(7).is_empty());
+        assert!(close_all().is_empty());
         assert!(!any_layers());
         assert!(foreground(4242).is_none());
         assert!(draw_list(4242).is_empty());

@@ -149,6 +149,9 @@ pub struct Ivars {
     blink_timer: Cell<Option<Retained<NSTimer>>>,
     /// per-pane 唤醒注册（source + runloop + info；见 WakeReg 拆除顺序）。
     wake: Cell<Option<WakeReg>>,
+    /// 上一次 setFrameSize 的尺寸（点）：AppKit 在窗口装配/居中阶段会
+    /// 重复投递同尺寸事件；同尺寸 = 几何未变 = 不收层（见 set_frame_size）。
+    last_size: Cell<(f64, f64)>,
 }
 
 define_class!(
@@ -202,7 +205,14 @@ define_class!(
         fn set_frame_size(&self, size: NSSize) {
             // SAFETY: 标准 super 调用。
             let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
-            // p5：resize 后层矩形必然错位——收层（通知插件）。
+            // p5：resize 后层矩形必然错位——收层（通知插件）。p6：只在
+            // 尺寸真变时收——AppKit 装配/居中阶段会重复投递同尺寸事件，
+            // 无脑收会把恰在装配尾音上开的层无端拆掉（E2E 实测竞态）。
+            let same = self.ivars().last_size.get() == (size.width, size.height);
+            self.ivars().last_size.set((size.width, size.height));
+            if same {
+                return;
+            }
             plugins::host_close_layers_of_pane(self.pane_id());
             self.grid_changed();
         }
@@ -695,6 +705,7 @@ impl TerminalView {
             state: RefCell::new(state),
             blink_timer: Cell::new(None),
             wake: Cell::new(None),
+            last_size: Cell::new((0.0, 0.0)),
         };
 
         // 两阶段初始化：先放 ivars，再走 NSView 的 initWithFrame:。
@@ -976,7 +987,7 @@ impl TerminalView {
             frame_buf,
             ..
         } = &mut *st;
-        let Some(r) = renderer.as_mut() else { return };
+        let Some(r) = renderer.as_mut() else { return; };
         if term.frame_into(frame_buf).is_err() {
             return;
         }

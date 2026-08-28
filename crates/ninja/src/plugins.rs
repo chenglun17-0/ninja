@@ -1,6 +1,9 @@
 //! p3：宿主侧 ADE 插件门（Unix socket，默认关）；p4：命中分发；
 //! p5：插件监督器（首次命中拉起进程）+ 层状态机（open→ready→present/
-//! close）+ 层前台输入路由。
+//! close）+ 层前台输入路由；p6：**关掉即轻**——插件死亡收层
+//! （[`layer::close_by_conn`]）、同会话禁用（[`PluginHost::shutdown`]，
+//! [`Drop`] 复用同一实现）、陈旧 socket 清扫（[`sweep_stale_sockets`]）。
+//! 禁用/退出/崩溃之后：无插件进程、无 socket、无层，内存回空载。
 //!
 //! 空载门禁：`[plugins] enabled` 为空（默认）时**不创建 socket 文件、
 //! 不拉任何插件进程**——[`PluginHost::start`] 直接返回 `None`，宿主
@@ -50,7 +53,9 @@ pub struct PluginsConfig {
     pub paths: std::collections::HashMap<String, String>,
 }
 
-/// 已绑定的 ADE socket 句柄。Drop 时删除 socket 文件、收割子进程。
+/// 已绑定的 ADE socket 句柄。Drop = [`PluginHost::shutdown`]（幂等）：
+/// 收层、断连接、收割子进程、删 socket 文件——正常退出与同会话禁用
+/// 走同一通路（p6）。
 #[derive(Debug)]
 pub struct PluginHost {
     listener: UnixListener,
@@ -67,8 +72,11 @@ pub struct PluginHost {
     spawned: std::collections::BTreeSet<String>,
     /// 拉起的插件进程（Drop 收割；宿主退出时它们也会因 socket EOF 自退）。
     children: Vec<std::process::Child>,
-    /// 配置快照（按名解析二进制用）。
+    /// 配置快照（按名解析二进制用；同会话再启用换新 host 也用它）。
     cfg: PluginsConfig,
+    /// 已禁用（同会话禁用钩子/退出路径）。置位后分发/泵/accept 全部
+    /// 空转，行为等同未启用（NoPlugins）——p6「关掉即轻」。
+    disabled: bool,
 }
 
 #[derive(Debug)]
@@ -110,6 +118,50 @@ const PUMP_INTERVAL: f64 = 0.15;
 pub fn socket_path() -> PathBuf {
     let pid = std::process::id();
     std::env::temp_dir().join(format!("ninja-ade-{pid}.sock"))
+}
+
+/// 陈旧 socket 清扫（p6）：宿主 SIGKILL/崩溃时 [`Drop`] 不跑，约定
+/// 目录下会留下 `ninja-ade-<pid>.sock` 尸体（bind 只清同路径文件）。
+/// 规则：文件名里的 pid 已死（`kill(pid,0)`=ESRCH）才删；活 pid 一律
+/// 不动（并行实例，或 pid 被复用——保守不动）。只在启用插件启动时
+/// 扫（[`PluginHost::start`]）：空载路径零改动。
+pub fn sweep_stale_sockets() {
+    sweep_stale_sockets_in(&std::env::temp_dir());
+}
+
+/// [`sweep_stale_sockets`] 的实现核心（目录可注入，单测用隔离目录）。
+fn sweep_stale_sockets_in(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(pid_str) = name
+            .strip_prefix("ninja-ade-")
+            .and_then(|s| s.strip_suffix(".sock"))
+        else {
+            continue; // 非本约定的文件不碰
+        };
+        let Ok(pid) = pid_str.parse::<i32>() else {
+            continue; // 名字里不是数字（垃圾名）：不碰
+        };
+        if pid <= 0 || pid == std::process::id() as i32 {
+            continue; // 自己的路径由 bind 处置；非正数必是垃圾名
+        }
+        // kill(pid, 0)：0/EPERM = 有进程在（不动）；ESRCH = 进程已死。
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !alive {
+            let _ = std::fs::remove_file(e.path());
+            eprintln!(
+                "ninja: 清扫陈旧 ADE socket {}（pid {pid} 已死）",
+                e.path().display()
+            );
+        }
+    }
 }
 
 /// 实际生效路径：`NINJA_ADE_SOCK` 覆盖（拉起插件进程时经同名环境变量
@@ -160,13 +212,15 @@ impl PluginHost {
     /// 唯一入口：按配置决定绑不绑 socket。
     ///
     /// - `enabled` 为空 → `None`：**不建 socket、不碰文件系统、不拉
-    ///   进程**（空载不变量）。
-    /// - 非空 → 绑定 + listen（非阻塞）；绑定失败不炸终端：stderr
-    ///   警告 + `None`（同配置模块的降级哲学）。
+    ///   进程**（空载不变量；也不扫陈旧 socket——空载路径零改动）。
+    /// - 非空 → 清扫 $TMPDIR 里死了进程的陈旧 socket（见
+    ///   [`sweep_stale_sockets`]）→ 绑定 + listen（非阻塞）；绑定失败
+    ///   不炸终端：stderr 警告 + `None`（同配置模块的降级哲学）。
     pub fn start(cfg: &PluginsConfig) -> Option<PluginHost> {
         if cfg.enabled.is_empty() {
             return None;
         }
+        sweep_stale_sockets();
         Self::bind(effective_socket_path(), cfg.clone())
     }
 
@@ -191,6 +245,7 @@ impl PluginHost {
                     spawned: std::collections::BTreeSet::new(),
                     children: Vec::new(),
                     cfg,
+                    disabled: false,
                 })
             }
             Err(e) => {
@@ -203,6 +258,11 @@ impl PluginHost {
     /// 已绑定的路径（取证/日志用）。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 配置快照（同会话再启用换新 host 用，见 [`host_set_enabled`]）。
+    pub fn cfg(&self) -> &PluginsConfig {
+        &self.cfg
     }
 
     /// 监听器引用（监督器接管 accept 用；p5 分发/泵路径直接经本结构）。
@@ -273,8 +333,12 @@ impl PluginHost {
     }
 
     /// 按需非阻塞 accept：把内核 backlog 里排队的插件连接收进来。
-    /// 不新增线程；没连接就是空操作。
+    /// 不新增线程；没连接就是空操作。已禁用时不再收新连接（行为同
+    /// 未启用）。
     fn pump_accept(&mut self) {
+        if self.disabled {
+            return;
+        }
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -306,6 +370,10 @@ impl PluginHost {
         timeout: Duration,
         geom: Option<&LayerGeom>,
     ) -> DispatchOutcome {
+        if self.disabled {
+            // 已禁用（同会话禁用钩子）：等同未启用 → 系统默认打开。
+            return DispatchOutcome::NoPlugins;
+        }
         self.pump_accept();
         if self.conns.is_empty() {
             // p5 冷启动：首次分发才拉插件；等 connect 的预算独立于回执
@@ -352,7 +420,7 @@ impl PluginHost {
             }
         }
         for i in broken.iter().rev() {
-            self.conns.remove(*i);
+            self.drop_conn(*i); // p6：断连 = 无主层一并回收
         }
         if self.conns.is_empty() {
             return DispatchOutcome::AllIgnored; // 广播全失败 = 无认领
@@ -440,7 +508,7 @@ impl PluginHost {
             }
         }
         for i in dead.iter().rev() {
-            self.conns.remove(*i);
+            self.drop_conn(*i); // p6：断连/坏协议 = 无主层一并回收
         }
         let Some((priority, claim_conn)) = best else {
             ade_debug("dispatch: 全 ignore/静默");
@@ -486,7 +554,7 @@ impl PluginHost {
                 }
             }
             if dead {
-                self.conns.remove(conn_idx);
+                self.drop_conn(conn_idx);
                 return;
             }
             if quit {
@@ -497,12 +565,12 @@ impl PluginHost {
                 break; // 预算尽：层可能仍开着（等 present），pump 兜底
             };
             if self.conns[conn_idx].stream.set_read_timeout(Some(rem)).is_err() {
-                self.conns.remove(conn_idx);
+                self.drop_conn(conn_idx);
                 return;
             }
             let n = match self.conns[conn_idx].stream.read(&mut buf) {
                 Ok(0) => {
-                    self.conns.remove(conn_idx); // 插件退了：层交由 pump 清
+                    self.drop_conn(conn_idx); // 插件退了：收它的层（p6）
                     return;
                 }
                 Ok(n) => n,
@@ -514,12 +582,12 @@ impl PluginHost {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    self.conns.remove(conn_idx);
+                    self.drop_conn(conn_idx);
                     return;
                 }
             };
             if self.conns[conn_idx].decoder.extend(&buf[..n]).is_err() {
-                self.conns.remove(conn_idx);
+                self.drop_conn(conn_idx);
                 return;
             }
         }
@@ -582,17 +650,17 @@ impl PluginHost {
         while i < self.conns.len() {
             let conn = &mut self.conns[i];
             if conn.stream.set_read_timeout(Some(Duration::from_millis(1))).is_err() {
-                self.conns.remove(i);
+                self.drop_conn(i);
                 continue;
             }
             match conn.stream.read(&mut buf) {
                 Ok(0) => {
-                    self.conns.remove(i);
+                    self.drop_conn(i); // p6：插件退了，收它的层
                     continue;
                 }
                 Ok(n) => {
                     if conn.decoder.extend(&buf[..n]).is_err() {
-                        self.conns.remove(i);
+                        self.drop_conn(i);
                         continue;
                     }
                     let mut dead = false;
@@ -616,7 +684,7 @@ impl PluginHost {
                         }
                     }
                     if dead {
-                        self.conns.remove(i);
+                        self.drop_conn(i); // p6：坏协议断连，收它的层
                         continue;
                     }
                     i += 1;
@@ -629,7 +697,7 @@ impl PluginHost {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => {
-                    self.conns.remove(i);
+                    self.drop_conn(i); // p6：IO 错断连，收它的层
                     continue;
                 }
             }
@@ -637,6 +705,23 @@ impl PluginHost {
         if !layer::any_layers() {
             stop_pump_timer_if_idle();
         }
+    }
+
+    /// 连接死亡收口（EOF / IO 错 / 坏协议，p6 监督器）：摘连接 +
+    /// **收掉该连接拥有的全部层**（插件死了它的层就是无主陈旧 overlay：
+    /// 不摘则层永久残留且 `any_layers()` 恒真 → 泉 timer 永不停转，
+    /// 只能靠用户 Esc 兑底）+ 无层时停泵。`layer::close_by_conn`
+    /// 内部对受影响 pane 重画（无主层不再有别的重画时机）。
+    fn drop_conn(&mut self, idx: usize) {
+        let Some(c) = self.conns.get(idx) else {
+            return;
+        };
+        let conn_id = c.id;
+        self.conns.remove(idx);
+        if !layer::close_by_conn(conn_id).is_empty() {
+            ade_debug(&format!("conn {conn_id} 死亡：已回收其全部层"));
+        }
+        stop_pump_timer_if_idle();
     }
 
     /// 按连接 id 发消息（input.key / layer.close 回程）。找不到连接
@@ -673,14 +758,43 @@ fn geom_clone(g: &LayerGeom) -> LayerGeom {
     }
 }
 
-impl Drop for PluginHost {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-        // 收割子进程（正常路径它们已因 EOF 自退；kill 只兜孤儿）。
+impl PluginHost {
+    /// 幂等关闭（p6 同会话禁用；[`Drop`] 复用同一实现）。顺序敏感：
+    /// 1. 摘全部层并尽力通知还连着的拥有者 `layer.close`（插件好清
+    ///    状态；已死连接的层一并回收）；
+    /// 2. 无层即停泵 timer；
+    /// 3. 断全部连接（插件侧读到 EOF 自退——正常路径零强杀）；
+    /// 4. kill + wait 子进程（EOF 没退的兑底 + 收尸防僵尸）；
+    /// 5. 删 socket 文件（文件消失 = 禁用完成的可观测信号）。
+    /// 之后 host 处于 disabled 态：分发/泵/accept 全部空转，行为等同
+    /// 未启用（NoPlugins），直到被换上新 host 再启用（见
+    /// [`host_set_enabled`]）。
+    pub fn shutdown(&mut self) {
+        if self.disabled {
+            return; // 幂等
+        }
+        self.disabled = true;
+        for (handle, conn, _pane) in layer::close_all() {
+            let _ = self.send_to_conn(conn, &Message::LayerClose(LayerClose::new(handle)));
+        }
+        stop_pump_timer_if_idle();
+        self.conns.clear();
         for c in self.children.iter_mut() {
             let _ = c.kill();
             let _ = c.wait();
         }
+        self.children.clear();
+        let _ = std::fs::remove_file(&self.path);
+        eprintln!(
+            "ninja: 插件已禁用（层已收、连接已断、子进程已收割、socket {:?} 已删）",
+            self.path
+        );
+    }
+}
+
+impl Drop for PluginHost {
+    fn drop(&mut self) {
+        self.shutdown(); // 同一实现；已禁用则幂等空转
     }
 }
 
@@ -857,6 +971,55 @@ pub fn host_close_layers_of_pane(pane: u32) {
         }
     }
     stop_pump_timer_if_idle();
+}
+
+/// 宿主退出收口（p6）：`NSApplication terminate:` 直接 `exit(0)`，
+/// `app.run()` 不返回、Rust 栈展开不发生——`PluginHost::Drop` 在⌘Q/
+/// 关最后窗的正常退出路径上**不会跑**（E2E 实测：socket 尸体不只是
+/// SIGKILL 的产物）。`applicationWillTerminate` 里显式调本函数（幂
+/// 等；与 Drop 同一实现）。
+pub fn host_shutdown() {
+    if let Some(host) = take_dispatcher() {
+        if let Ok(mut h) = host.lock() {
+            h.shutdown();
+        }
+    }
+}
+
+/// p6 同会话禁用 / 再启用（取证钩子 `NINJA_P6_PLUGIN_FILE` 驱动；
+/// 产品 UI 归后续阶段）。
+/// - 禁用 = 现任 host [`PluginHost::shutdown`]（幂等：收层/断连接/
+///   收割子进程/删 socket）；
+/// - 再启用 = 新绑一个 host 换进分发器同一槽位——`spawned` 集随新
+///   对象重置（下次分发重新拉起）、socket 重绑，即「禁用→再启用」
+///   的完整语义；旧 host 的 [`Drop`] 是幂等空转。
+/// 返回 false = 无分发器（未启用插件/宿主在退出）/ 再启用绑定失败。
+pub fn host_set_enabled(on: bool) -> bool {
+    let Some(host) = take_dispatcher() else {
+        return false;
+    };
+    let Ok(mut h) = host.lock() else {
+        return false;
+    };
+    if !on {
+        h.shutdown();
+        return true;
+    }
+    if h.cfg().enabled.is_empty() {
+        return false; // 配置本就未启用：没有可再启用的东西
+    }
+    // 重绑在原任 host 自己的路径上（生产 = effective_socket_path；
+    // 显式绑定的测试路径也随之保留）。
+    let path = h.path().to_path_buf();
+    match PluginHost::bind(path, h.cfg().clone()) {
+        Some(nh) => {
+            let bound = nh.path().to_path_buf();
+            *h = nh;
+            eprintln!("ninja: 插件已再启用（socket {bound:?} 已重绑，spawned 集已重置）");
+            true
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1158,7 +1321,11 @@ mod tests {
     #[test]
     fn dispatcher_weak_dies_with_host_and_free_entry_works() {
         // Weak 通路：登记 → 可取；宿主释放 → 自动失效（退出时 drop 删
-        // socket 的生命周期不变量）。
+        // socket 的生命周期不变量）。分发器槽全局：与其它装槽的测试
+        // 串行（见 DISPATCHER_TEST_LOCK）。
+        let _g = DISPATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = sandbox("dispwk");
         let arc = Arc::new(Mutex::new(
             PluginHost::bind(dir.join("a.sock"), PluginsConfig::default()).unwrap(),
@@ -1180,5 +1347,240 @@ mod tests {
     fn forward_input_key_without_layer_is_false() {
         // 无层：键盘路由回落普通终端路径。
         assert!(!forward_input_key(4242, "a", "", vec![]));
+    }
+
+    // ------------------------------------------------------------------
+    // p6 关掉即轻：插件死亡收层 / 同会话禁用 / 陈旧 socket 清扫
+    // ------------------------------------------------------------------
+
+    use ninja_protocol::{LayerOpen, LayerPresent, Placement};
+
+    /// 层生命周期测试几何：真 Metal 设备 + 假 view（0 = 重画跳过，
+    /// 见 layer::repaint_view）。headless 无设备 → None（跳过，同
+    /// renderer 测试惯例）。
+    fn test_geom() -> Option<LayerGeom> {
+        let device = objc2_metal::MTLCreateSystemDefaultDevice()?;
+        Some(LayerGeom {
+            pane: 41061, // 独立 pane id：不与其它测试/全局状态互踩
+            cell_px: (8.0, 16.0),
+            view_px: (640.0, 480.0),
+            scale: 2.0,
+            device,
+            view: 0,
+            conn: 0,
+        })
+    }
+
+    /// 对端脚本（层生命周期）：claim + layer.open → 等 layer.ready →
+    /// （present=true 时发 present 并稍等宿主消化）→ 断开连接（=插件死亡）。
+    fn spawn_layer_peer(sock: PathBuf, present: bool) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let mut s = UnixStream::connect(&sock).expect("peer connect");
+            let mut len_buf = [0u8; 4];
+            s.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            s.read_exact(&mut payload).unwrap();
+            let id = match Message::decode_host(&payload) {
+                Ok(Message::Hit(h)) => h.id,
+                other => panic!("peer 应收到 hit，得到 {other:?}"),
+            };
+            s.write_all(&encode_frame(&Message::HitClaim(HitClaim::new(id, 100))).unwrap())
+                .unwrap();
+            s.write_all(
+                &encode_frame(&Message::LayerOpen(LayerOpen::new(
+                    id,
+                    Placement::Overlay,
+                    2,
+                    0,
+                )))
+                .unwrap(),
+            )
+            .unwrap();
+            // 等 layer.ready（拿到层句柄）。
+            s.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut p = vec![0u8; len];
+            s.read_exact(&mut p).unwrap();
+            let handle = match Message::decode_plugin(&p) {
+                Ok(Message::LayerReady(r)) => r.layer,
+                other => panic!("peer 应收到 layer.ready，得到 {other:?}"),
+            };
+            if present {
+                s.write_all(&encode_frame(&Message::LayerPresent(LayerPresent::new(handle))).unwrap())
+                    .unwrap();
+                thread::sleep(Duration::from_millis(150));
+            }
+            drop(s); // 插件死亡（EOF）
+        })
+    }
+
+    #[test]
+    fn conn_death_reclaims_layers_and_stops_pump() {
+        // p6 监督器缺口：插件死亡（断连）必须收层——不摘则陈旧 overlay
+        // 永久残留 + any_layers 恒真 + 泵 timer 永不停转。
+        let Some(geom) = test_geom() else {
+            eprintln!("skip: 无 Metal 设备（headless），开层需真设备");
+            return;
+        };
+        // REGISTRY 全局：与 layer::tests 的空表断言互斥。
+        let _g = crate::layer::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 阶段一：握手期对端死亡（layer_handshake 的 EOF 分支）。
+        {
+            let dir = sandbox("connd1");
+            let sock = dir.join("a.sock");
+            let mut host =
+                PluginHost::bind(sock.clone(), PluginsConfig::default()).expect("bind");
+            let peer = spawn_layer_peer(sock, false);
+            // 等对端 connect 进 backlog（同 host_with_peers 的节奏）。
+            thread::sleep(Duration::from_millis(150));
+            let hit = sample_hit(host.next_hit_id());
+            let out = host.dispatch_hit_with_timeout(&hit, Duration::from_secs(2), Some(&geom));
+            assert_eq!(out, DispatchOutcome::Claimed { priority: 100 });
+            peer.join().unwrap();
+            assert!(
+                !layer::any_layers(),
+                "握手期对端死亡：它开的层应被回收（无主陈旧 overlay）"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // 阶段二：present 后在泵路径死亡（pump_plugins 的 EOF 分支）。
+        {
+            let dir = sandbox("connd2");
+            let sock = dir.join("a.sock");
+            let mut host =
+                PluginHost::bind(sock.clone(), PluginsConfig::default()).expect("bind");
+            let peer = spawn_layer_peer(sock, true);
+            // 等对端 connect 进 backlog（同 host_with_peers 的节奏）。
+            thread::sleep(Duration::from_millis(150));
+            let hit = sample_hit(host.next_hit_id());
+            let out = host.dispatch_hit_with_timeout(&hit, Duration::from_secs(2), Some(&geom));
+            assert_eq!(out, DispatchOutcome::Claimed { priority: 100 });
+            assert!(layer::any_layers(), "present 后层应在");
+            peer.join().unwrap();
+            // 泵消化对端 EOF：层被回收（多泵几拍兑调度抖动）。
+            let mut reclaimed = false;
+            for _ in 0..40 {
+                host.pump_plugins();
+                if !layer::any_layers() {
+                    reclaimed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            assert!(reclaimed, "泵期对端死亡：它开的层应被回收");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn shutdown_is_idempotent_cleans_and_rebind_works() {
+        // 同会话禁用通路（Drop 复用同一实现）：socket 消失、对端读到
+        // EOF、幂等、禁用后行为同未启用（NoPlugins）、同路径可重绑
+        // （再启用语义）。
+        let dir = sandbox("shut");
+        let sock = dir.join("a.sock");
+        let cfg = PluginsConfig {
+            enabled: vec!["ghost".into()], // 无对应二进制：不会真的拉起
+            ..PluginsConfig::default()
+        };
+        let mut host = PluginHost::bind(sock.clone(), cfg).expect("bind");
+        assert!(sock.exists());
+
+        // 对端连上（pump_plugins 顺带 accept），读到 EOF（=shutdown 断连）。
+        let peer_sock = sock.clone();
+        let peer = thread::spawn(move || {
+            let mut s = UnixStream::connect(&peer_sock).expect("peer");
+            let mut b = [0u8; 16];
+            let _ = s.read(&mut b); // 阻塞到 EOF
+        });
+        thread::sleep(Duration::from_millis(100));
+        host.pump_plugins(); // 收进对端（无层：空转）
+
+        host.shutdown();
+        assert!(!sock.exists(), "shutdown 后 socket 文件应删除");
+        peer.join().unwrap();
+
+        // 幂等：再关一次不 panic、不重复动作。
+        host.shutdown();
+        // 禁用后行为同未启用：分发直接 NoPlugins（不重试拉插件）。
+        let hit = sample_hit(host.next_hit_id());
+        assert_eq!(
+            host.dispatch_hit_with_timeout(&hit, Duration::from_millis(10), None),
+            DispatchOutcome::NoPlugins
+        );
+
+        // 再启用语义：同一路径重绑新 host（spawned 集随新对象重置）。
+        let cfg = host.cfg().clone();
+        let mut again = PluginHost::bind(sock.clone(), cfg).expect("rebind");
+        assert!(sock.exists(), "再启用应重绑同一路径");
+        again.shutdown();
+        assert!(!sock.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_socket_sweep_dead_pid_only() {
+        // p6：陈旧 socket 清扫——只删死了进程的；活 pid / 解析不出 pid /
+        // 非约定文件一律不动。
+        let dir = sandbox("sweep");
+        let live = dir.join(format!("ninja-ade-{}.sock", std::process::id()));
+        // 死 pid：真拉一个短命进程收尸拿 pid（kill(pid,0)=ESRCH）。
+        let dead_pid = {
+            let mut c = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+            let pid = c.id();
+            c.wait().unwrap();
+            pid
+        };
+        let dead = dir.join(format!("ninja-ade-{dead_pid}.sock"));
+        let garbage = dir.join("ninja-ade-notapid.sock");
+        let unrelated = dir.join("other-thing.sock");
+        for p in [&live, &dead, &garbage, &unrelated] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        sweep_stale_sockets_in(&dir);
+        assert!(live.exists(), "活 pid 的 socket（并行实例）不能动");
+        assert!(!dead.exists(), "死 pid 的陈旧 socket 应被清扫");
+        assert!(garbage.exists(), "解析不出 pid 的文件不碰");
+        assert!(unrelated.exists(), "非本约定的文件不碰");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分发器槽是全局的：装它的测试之间串行（含既有
+    /// dispatcher_weak_dies… 测试）。
+    static DISPATCHER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn host_set_enabled_disable_reenable_cycle() {
+        // p6 钩子通路（NINJA_P6_PLUGIN_FILE → host_set_enabled）：
+        // 禁用 → socket 消失；再启用 → 同路径重绑（换新 host）。
+        let _g = DISPATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = sandbox("p6hook");
+        let sock = dir.join("a.sock");
+        let cfg = PluginsConfig {
+            enabled: vec!["ghost".into()],
+            ..PluginsConfig::default()
+        };
+        let arc = Arc::new(Mutex::new(
+            PluginHost::bind(sock.clone(), cfg).expect("bind"),
+        ));
+        install_dispatcher(&arc);
+        assert!(sock.exists());
+
+        assert!(host_set_enabled(false));
+        assert!(!sock.exists(), "禁用后 socket 文件应消失");
+
+        assert!(host_set_enabled(true));
+        assert!(sock.exists(), "再启用应重绑同一路径");
+
+        // 再关一次 + 宿主退出路径（drop Arc → Drop → 幂等空转）。
+        assert!(host_set_enabled(false));
+        drop(arc);
+        assert!(take_dispatcher().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -131,8 +131,10 @@ fn idle_default_config_no_socket_no_plugin_processes() {
         "探针失效：PTY shell 应作为子进程可见（否则 ps/启动有问题）"
     );
 
-    // 对照组 socket 由测试收尾（宿主被 SIGKILL，drop 不会跑；陈旧
-    // socket 的正式清理属 p6 生命周期）。
+    // 对照组 socket 由测试收尾（宿主被 SIGKILL，drop 不会跑）。p6 起
+    // 陈旧 socket 有正式清扫：下一个启用插件的宿主启动时扫死 pid
+    // （plugins.rs sweep_stale_sockets；E2E 见 tests/off_is_light.rs
+    // 场景 2），这里仍手工清以免依赖测试执行顺序。
     let _ = std::fs::remove_file(socket_path_for(on_pid));
     // reaper 在此（或 panic 展开）收割全部宿主进程。
 }
