@@ -1,10 +1,13 @@
-//! NSView 子类：单终端面。键盘（`interpretKeyEvents` + `key::Encoder`）、
+//! NSView 子类：一个终端面（p2：一 pane = PTY + vt + Metal 视图，
+//! 多 pane 各自独立）。键盘（`interpretKeyEvents` + `key::Encoder`）、
 //! IME（`NSTextInputClient`）、鼠标选区（selection gesture 状态机）、滚轮、
 //! resize → cols/rows 换算 → `Terminal::resize` + PTY winsize。
 //!
 //! 线程模型：view 与 `TermState` 只在主线程（NSView 本就 main-thread-only）；
-//! PTY 读写线程经 [`crate::pty::set_wake_hook`] 唤醒主 runloop 的
-//! `CFRunLoopSource`，perform 回调里 drain → `vt_write` → 重画。
+//! 各自的 PTY 读写线程经 per-pane 的 `CFRunLoopSource` 唤醒主 runloop，
+//! perform 回调里 drain → `vt_write` → 重画。生命周期：shell 退出（EOF）
+//! 时 view 收尾自己，然后通知壳（`shell::handle_pane_eof`）把自己从
+//! pane 树里拆掉或关窗。
 //!
 //! 可变状态包在 `RefCell<State>`（objc2 0.6 ivars 无 `&mut` 访问），
 //! 纪律：任何跨 `interpretKeyEvents`/AppKit 回调的调用前必须放掉 borrow。
@@ -12,7 +15,6 @@
 
 #![allow(non_snake_case)] // ObjC selector 方法名
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,11 +25,11 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSEvent, NSPasteboard, NSPasteboardTypeString, NSResponder, NSScreen, NSView,
+    NSEvent, NSPasteboard, NSPasteboardTypeString, NSResponder, NSScreen, NSView,
     NSTextInputClient,
 };
 use objc2_core_foundation::{
-    CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext, kCFRunLoopCommonModes,
+    CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext, kCFRunLoopCommonModes,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSNotFound, NSRange, NSRangePointer,
@@ -36,46 +38,71 @@ use objc2_foundation::{
 use objc2_quartz_core::CAMetalLayer;
 
 use crate::atlas::GlyphAtlas;
+use crate::config::Config;
 use crate::font::Font;
 use crate::keymap;
 use crate::pty::{self, Pty};
-use crate::renderer::Renderer;
+use crate::renderer::{Renderer, Theme};
 use crate::select;
 use crate::term::{Frame, Marked, Rgb, TermState};
 
 // ---------------------------------------------------------------------------
-// PTY → 主线程数据泵（p1 单窗口：三个全局指针 + 一个 runloop source）
+// PTY → 主线程数据泵（p2：per-pane 一个 runloop source，不再全局单例）
 // ---------------------------------------------------------------------------
 
-/// 主线程 view 裸指针（只在主线程写；perform 回调在主 runloop 上读）。
-static MAIN_VIEW: AtomicUsize = AtomicUsize::new(0);
-/// 唤醒 source 裸指针（pty 读/写线程经 wake_hook 信号它）。
-static WAKE_SOURCE: AtomicUsize = AtomicUsize::new(0);
-/// 主 runloop 裸指针。
-static MAIN_RUNLOOP: AtomicUsize = AtomicUsize::new(0);
+/// 压在堆上的 per-pane 唤醒上下文：perform 回调从它取回 view。
+/// `dead` 在 shutdown 首位置 true；之后 perform 直接返回（view 可能
+/// 已释放）。上下文本身【故意泄漏】（每 pane ~几十字节，随 pane 数
+/// 有界）：runloop 对已 signal 但未 fire 的 source 可能持有快照引用，
+/// 摘除/释放后仍可能回调 perform——若 info 已 free 则 UAF（p2 实测
+/// 关窗 SEGFAULT 的根因）。泄漏换取拆除窗口内任意时序的安全。
+struct WakeInfo {
+    view: *const TerminalView,
+    dead: bool,
+}
 
-/// `pty::set_wake_hook` 的钩子：信号 source + 唤醒主 runloop。
-/// null 检查容忍注册前/注销后的调用。
-fn wake_hook() {
-    let src = WAKE_SOURCE.load(Ordering::Acquire) as *const CFRunLoopSource;
-    if !src.is_null() {
-        unsafe { (*src).signal() };
-    }
-    let rl = MAIN_RUNLOOP.load(Ordering::Acquire) as *const CFRunLoop;
-    if !rl.is_null() {
-        unsafe { (*rl).wake_up() };
+/// 拆除顺序约束：shutdown 先 drop PTY（join 读写线程 → 不再有人调
+/// 唤醒闭包），再从 runloop 摘 source、free info。
+struct WakeReg {
+    source: CFRetained<CFRunLoopSource>,
+    runloop: CFRetained<CFRunLoop>,
+    info: *mut WakeInfo,
+}
+
+/// 唤醒上下文：跨线程（PTY 读线程）持有的两个裸指针。字段只在
+/// [`WakeCtx::wake`] 内解引用——闭包经方法调用整体捕获，不精确穿透到
+/// 裸指针字段（保持 Send/Sync 标注）。指针在拆除前常活（WakeReg 顺序）。
+struct WakeCtx {
+    src: *const CFRunLoopSource,
+    rl: *const CFRunLoop,
+}
+unsafe impl Send for WakeCtx {}
+unsafe impl Sync for WakeCtx {}
+impl WakeCtx {
+    /// SAFETY（类型不变量）：指针在 shutdown 摘除 source 前常活，
+    /// 且只调线程安全的 CFRunLoopSourceSignal / CFRunLoopWakeUp。
+    fn wake(&self) {
+        unsafe {
+            (*self.src).signal();
+            (*self.rl).wake_up();
+        }
     }
 }
 
 /// runloop source 的 perform 回调（主线程）：drain PTY → 喂 vt → 重画。
-unsafe extern "C-unwind" fn source_perform(_info: *mut std::ffi::c_void) {
-    let ptr = MAIN_VIEW.load(Ordering::Acquire) as *const TerminalView;
-    if !ptr.is_null() {
-        // SAFETY: 指针由 view 在主线程写入（view 活着）且 perform 与 view
-        // 同在主 runloop；shutdown 先清 MAIN_VIEW 再放 view。
-        let view: &TerminalView = unsafe { &*ptr };
-        view.on_pty_data();
+/// info 指向该 pane 的 WakeInfo；dead 置位后（view 将释放）直接返回。
+unsafe extern "C-unwind" fn source_perform(info: *mut std::ffi::c_void) {
+    if info.is_null() {
+        return;
     }
+    // SAFETY: info 由 install_wake 在主线程 Box::into_raw，永不 free
+    //（见 WakeInfo 泄漏说明）；dead 在 view 释放前置 true。
+    let wi = unsafe { &*(info.cast::<WakeInfo>()) };
+    if wi.dead || wi.view.is_null() {
+        return;
+    }
+    let view: &TerminalView = unsafe { &*wi.view };
+    view.on_pty_data();
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +138,8 @@ pub struct State {
 pub struct Ivars {
     state: RefCell<State>,
     blink_timer: Cell<Option<Retained<NSTimer>>>,
+    /// per-pane 唤醒注册（source + runloop + info；见 WakeReg 拆除顺序）。
+    wake: Cell<Option<WakeReg>>,
 }
 
 define_class!(
@@ -134,6 +163,10 @@ define_class!(
             // SAFETY: 标准 super 调用，返回值类型正确。
             let ok: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
             self.send_focus(true);
+            // 焦点指示环（pane 壳画）跟随：只碰自己所在的窗口，
+            // 不做全局遍历（关窗瞬间别的窗口可能正被拆除，全局 walk
+            // 会触已释放对象——p2 实测关窗 SIGSEGV 根因）。
+            crate::shell::sync_focus_ring_for(self);
             ok
         }
 
@@ -142,6 +175,7 @@ define_class!(
             // SAFETY: 同上。
             let ok: bool = unsafe { msg_send![super(self), resignFirstResponder] };
             self.send_focus(false);
+            crate::shell::sync_focus_ring_for(self);
             ok
         }
 
@@ -496,7 +530,6 @@ define_class!(
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_SCROLLBACK: usize = 10_000;
-const FONT_SIZE_PT: f64 = 13.0;
 const BLINK_INTERVAL_SECS: f64 = 0.53;
 
 fn viewport_point(x: u16, y: u16) -> libghostty_vt::terminal::Point {
@@ -507,9 +540,9 @@ fn viewport_point(x: u16, y: u16) -> libghostty_vt::terminal::Point {
 }
 
 impl TerminalView {
-    /// 创建 view：字体度量 → cell/atlas/renderer → vt effects 注册 → PTY。
-    /// `command`：None = `$SHELL`（缺省 `/bin/bash`）。
-    pub fn new(mtm: MainThreadMarker, command: Option<&str>) -> Retained<Self> {
+    /// 创建一个 pane：字体度量 → cell/atlas/renderer → vt effects 注册 →
+    /// PTY → per-pane 唤醒链。`config`：shell/字体/主题色（p2 TOML）。
+    pub fn new(mtm: MainThreadMarker, config: &Config) -> Retained<Self> {
         let scale = NSScreen::mainScreen(mtm)
             .map(|s| s.backingScaleFactor())
             .unwrap_or(2.0)
@@ -517,7 +550,11 @@ impl TerminalView {
 
         let mut term = TermState::new(DEFAULT_COLS, DEFAULT_ROWS, MAX_SCROLLBACK)
             .expect("Terminal init");
-        let font = Font::new(FONT_SIZE_PT, scale);
+        let font = Font::with_family(
+            config.font_size_pt,
+            scale,
+            config.font_family.as_deref(),
+        );
         let cell_w_px = (font.metrics.cell_w * scale).ceil() as u32;
         let cell_h_px = (font.metrics.cell_h * scale).ceil() as u32;
         let baseline_px = font.baseline_offset() * scale;
@@ -525,7 +562,8 @@ impl TerminalView {
 
         // vt effects（回调只捕获 'static 共享句柄）：
         // - on_pty_write：DECRQM/DSR 应答直接写 PTY。
-        let pty = Pty::spawn(command, DEFAULT_COLS, DEFAULT_ROWS).expect("spawn shell");
+        let pty = Pty::spawn(config.shell.as_deref(), DEFAULT_COLS, DEFAULT_ROWS)
+            .expect("spawn shell");
         let pty_write = pty.inner.clone();
         let _ = term
             .terminal
@@ -563,12 +601,17 @@ impl TerminalView {
         // Metal 层。
         let layer = CAMetalLayer::new();
         layer.setContentsScale(scale);
-        let renderer = Renderer::new(
+        let mut renderer = Renderer::new(
             layer.clone(),
             atlas.edge(),
             (f64::from(cell_w_px), f64::from(cell_h_px), baseline_px),
         )
         .expect("Metal renderer init");
+        // 主题色从 p2 配置注入（p1 硬编码 → TOML）。
+        renderer.theme = Theme {
+            selection_bg: config.selection_bg,
+            cursor: config.cursor,
+        };
 
         let state = State {
             term,
@@ -593,6 +636,7 @@ impl TerminalView {
         let ivars = Ivars {
             state: RefCell::new(state),
             blink_timer: Cell::new(None),
+            wake: Cell::new(None),
         };
 
         // 两阶段初始化：先放 ivars，再走 NSView 的 initWithFrame:。
@@ -606,16 +650,24 @@ impl TerminalView {
         view.setWantsLayer(true);
         view.setLayer(Some(layer.as_super()));
 
-        install_wake(&view);
-        pty::set_wake_hook(Some(wake_hook));
-        // D1 修复（启动期唤醒注册竞态）：Pty::spawn 在上面、hook 注册在这里，
-        // 中间隔着 Renderer::new 的运行时着色器编译——快 shell 的首批 PTY
-        // 字节可能在 WAKE_HOOK==0 时就入队 rx（读线程 wake_main 空转丢信号），
-        // 字节滞留队列、vt 永远收不到（空闲 shell 无后续字节补发信号）。
-        // 注册完立即补一次信号：runloop 起转后 source_perform → on_pty_data
-        // 会把窗口期内到达的字节全部 drain 进 vt。rx 为空时只是多一帧空画。
-        // 之后到达的字节走正常路径（hook 已就位），无丢失窗口。
-        wake_hook();
+        // per-pane 唤醒链：source 挂主 runloop，闭包注册进 PTY 核。
+        let pty_inner = view
+            .state()
+            .pty
+            .as_ref()
+            .expect("pty alive")
+            .inner
+            .clone();
+        install_wake(&view, &pty_inner);
+        // D1 修复（启动期唤醒注册竞态，p2 保留）：Pty::spawn 在上面、
+        // 唤醒闭包注册在 install_wake 里，中间隔着 Renderer::new 的
+        // 运行时着色器编译——快 shell 的首批 PTY 字节可能在闭包未就位时
+        // 就入队 rx（读线程 wake_main 空转丢信号），字节滞留队列、
+        // vt 永远收不到（空闲 shell 无后续字节补发信号）。
+        // 注册完立即补一次信号：runloop 起转后 source_perform →
+        // on_pty_data 会把窗口期内到达的字节全部 drain 进 vt。rx 为空
+        // 时只是多一帧空画。之后到达的字节走正常路径，无丢失窗口。
+        signal_wake(&view);
         install_blink_timer(&view);
         view.grid_changed();
         view
@@ -748,11 +800,11 @@ impl TerminalView {
             }
         }
         if eof {
-            // shell 退出：单窗口 p1 直接收尾（Pty::drop 发 SIGHUP + join 线程）。
+            // shell 退出（p2）：本 pane 收尾自己，然后请壳把自己从
+            // pane 树拆掉；若是窗口最后一个 pane → 关窗（最后一个窗口关
+            // 才退出，由 applicationShouldTerminateAfterLastWindowClosed 汇聚）。
             self.shutdown();
-            if let Some(mtm) = MainThreadMarker::new() {
-                NSApplication::sharedApplication(mtm).terminate(None);
-            }
+            crate::shell::handle_pane_eof(self);
             return;
         }
         self.render_now();
@@ -881,19 +933,47 @@ impl TerminalView {
 
     // ---- 收尾 ----
 
-    /// 清全局指针 + 停 timer + 关 PTY。幂等；EOF/退出时调用。
+    /// 本 pane 收尾（幂等；EOF / 关窗 / 关 pane 时调用）：
+    /// 0. info 标 dead（此后 perform 回调直接返回——view 即将释放，
+    ///    而已 signal 的 source 可能在摘除后仍被 runloop 快照触发）；
+    /// 1. 停闪烁 timer；2. drop PTY（SIGHUP + join 读写线程——此后不再
+    ///    有人调本 pane 的唤醒闭包）；3. 摘 runloop source（info 与
+    ///    source 本体泄漏不 free，见 WakeInfo）；4. 放渲染器。
     pub fn shutdown(&self) {
-        pty::set_wake_hook(None);
-        MAIN_VIEW.store(0, Ordering::Release);
+        let reg = self.ivars().wake.take();
+        // 先标 dead，再做任何释放。首行执行保证任何后续 perform 都安全。
+        if let Some(reg) = &reg {
+            // SAFETY: info 指针来自 install_wake 的 Box::into_raw，主线程。
+            unsafe { (*reg.info).dead = true };
+        }
         let timer = self.ivars().blink_timer.take();
         if let Some(t) = timer {
             t.invalidate();
         }
-        let mut st = self.state();
-        if let Some(p) = st.pty.take() {
-            p.inner.shutdown();
+        {
+            let mut st = self.state();
+            // 先断开唤醒钩子（vt 的 on_pty_write 闭包还握着 PtyInner 的
+            // Arc，靠这里保证它引用不到已拆除的 source）。
+            if let Some(p) = &st.pty {
+                p.inner.set_wake(None);
+            }
+            // Pty::drop：inner.shutdown（SIGHUP + 关 master）+ join 线程。
+            drop(st.pty.take());
+            st.renderer.take();
         }
-        st.renderer.take();
+        if let Some(reg) = reg {
+            // 摘除 source（之后的 signal 不再触发 fire）；WakeReg 的
+            // Retained drop 释放我们那份引用。info 故意泄漏（防 runloop
+            // 快照 perform 的 UAF）——每 pane 常量级，见 WakeInfo 文档。
+            // SAFETY: 指针由 install_wake 注册，同在主线程；PTY 线程已
+            // join，无并发唤醒。
+            unsafe {
+                reg.runloop
+                    .remove_source(Some(&reg.source), kCFRunLoopCommonModes);
+            }
+            let _info = reg.info; // 有意泄漏（防 runloop 快照 perform 的 UAF）
+            drop(reg.source);
+        }
     }
 }
 
@@ -936,12 +1016,18 @@ fn text_from_object(obj: &AnyObject) -> Option<String> {
     None
 }
 
-/// PTY→主线程唤醒链安装（主线程）。source 挂主 runloop（common modes，
-/// live resize 期间也泵）；runloop 会 retain source，view 不需要再持有。
-fn install_wake(view: &TerminalView) {
+/// PTY→主线程唤醒链安装（主线程，per-pane）：source 挂主 runloop
+/// （common modes，live resize 期间也泵）；唤醒闭包注册进该 pane 的
+/// PTY 核（读/写线程跨线程调用）。runloop 会 retain source，WakeReg
+/// 另持一份所有权供拆除（摘除 + 释放 info）。
+fn install_wake(view: &TerminalView, pty: &std::sync::Arc<pty::PtyInner>) {
+    let info = Box::into_raw(Box::new(WakeInfo {
+        view: view as *const TerminalView,
+        dead: false,
+    }));
     let mut context = CFRunLoopSourceContext {
         version: 0,
-        info: std::ptr::null_mut(),
+        info: info.cast(),
         retain: None,
         release: None,
         copyDescription: None,
@@ -955,13 +1041,31 @@ fn install_wake(view: &TerminalView) {
     let source = unsafe { CFRunLoopSource::new(None, 0, &raw mut context) }
         .expect("CFRunLoopSource create");
     let main = CFRunLoop::main().expect("main runloop");
-    main.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
-    WAKE_SOURCE.store(std::ptr::from_ref(&*source) as usize, Ordering::Release);
-    MAIN_RUNLOOP.store(std::ptr::from_ref(&*main) as usize, Ordering::Release);
-    MAIN_VIEW.store(std::ptr::from_ref(view) as usize, Ordering::Release);
-    // runloop 已 retain source；这里 Retained drop 只是释放我们的引用。
-    // 主 runloop 常驻，指针常有效。
-    std::mem::forget(source);
+    unsafe { main.add_source(Some(&source), kCFRunLoopCommonModes) };
+
+    // 唤醒闭包：PTY 读线程执行——只调线程安全的 signal/wake_up。
+    // 指针在 shutdown 先 join PTY 线程再摘 source，无 UAF 窗口。
+    let ctx = WakeCtx {
+        src: std::ptr::from_ref(&*source),
+        rl: std::ptr::from_ref(&*main),
+    };
+    pty.set_wake(Some(std::sync::Arc::new(move || ctx.wake())));
+
+    view.ivars().wake.set(Some(WakeReg {
+        source,
+        runloop: main,
+        info,
+    }));
+}
+
+/// 主线程直接补一次信号（D1：启动期注册后补发 drain，见 new）。
+fn signal_wake(view: &TerminalView) {
+    let reg = view.ivars().wake.take();
+    if let Some(reg) = reg {
+        // SAFETY: source 常活（WakeReg 持引用，主线程）。
+        reg.source.signal();
+        view.ivars().wake.set(Some(reg));
+    }
 }
 
 /// 闪烁 timer：target 持 view（AppKit timer retains target；shutdown 时

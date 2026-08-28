@@ -16,6 +16,11 @@ path = "src/main.rs"
 libghostty-vt.workspace = true
 libc = "0.2"
 
+# p2 配置：~/.config/ninja/ninja.toml（shell/字体/键位/主题色）。
+# 只在启动时解析一次，不进空载常驻路径。
+toml = "0.9"
+serde = { version = "1", features = ["derive"] }
+
 # p1 终端面：AppKit 壳 + 自研 Metal cell atlas + CoreText 字形。
 # 只用 objc2 家族（同一 runtime），不引 winit/egui/GPUI，不碰 Ghostty 内部 API。
 objc2 = "0.6"
@@ -47,6 +52,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSTextInputClient",
     "NSCursor",
     "NSGraphics",
+    "NSColor",
 ] }
 objc2-quartz-core = { version = "0.3", features = [
     "CALayer",
@@ -80,6 +86,7 @@ objc2-core-text = { version = "0.3", features = [
 objc2-core-graphics = { version = "0.3", features = [
     "CGContext",
     "CGBitmapContext",
+    "CGColor",
     "CGColorSpace",
     "CGImage",
     "CGAffineTransform",

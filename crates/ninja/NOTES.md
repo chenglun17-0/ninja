@@ -165,3 +165,101 @@ scale=2、含 56px 标题栏。
 - marked text 超行尾截断（预编辑串长于剩余列时裁剪，不折行）。
 - 窗口跨屏移动后字体 scale 不跟随（固定主屏 scale）。
 - Cmd+key 无菜单绑定时按 SUPER 编码直发 PTY（kitty 键盘协议）。
+
+# p2：标签 / 分屏 / 多窗口 + TOML 配置（2026-08-28）
+
+## 架构（改动落点）
+
+- **唤醒链路去单例**：p1 的 `MAIN_VIEW/WAKE_SOURCE/MAIN_RUNLOOP` 三个全局
+  与 pty.rs 全局 `WAKE_HOOK` 全部移除，改 per-pane：每个 `TerminalView`
+  建自己的 `CFRunLoopSource`（info 指向堆上 `WakeInfo`），唤醒闭包
+  （`Arc<dyn Fn + Send + Sync>`）注册进该 pane 的 `PtyInner`。D1 修复
+  保留：`install_wake` 后立即补发一次 signal（`signal_wake`）。
+- **拆除顺序红线**（本阶段两个 SIGSEGV 的教训，见下）：
+  1. `view::shutdown`：标 `WakeInfo.dead=true` → 断 `set_wake(None)` →
+     drop PTY（join 读写线程）→ 摘 runloop source。**info 有意泄漏**
+     （每 pane ~几十字节）：runloop 对已 signal 未 fire 的 source 可能持
+     快照引用，摘除后仍可能回调 perform——free info 即 UAF。
+  2. **窗口所有权**：`NSWindow` 默认 `releasedWhenClosed=YES`（close 时
+     自释放）；壳的 registry 再持一份强引用 = 过释放 → 关窗必 SIGSEGV
+     （pc=0xc8，跳已释放对象）。现 `setReleasedWhenClosed(false)` +
+     delegate 持 registry（`Vec<Retained<NSWindow>>`），close 完成后由
+     0.05s 一次性 `NSTimer`（`ninjaPruneClosedWindows:`）释放——不能在
+     `windowWillClose` 里当场 drop（窗口会拆在自己的 close 调用栈里）。
+  3. **不做全局窗口遍历**：关窗瞬间其它窗口可能在拆，焦点环同步/pane
+     EOF 只碰 `view.window()` 自己的窗口（`sync_focus_ring_for`）。
+  4. `shutdown_all` 只拆资源不摘视图：AppKit close 收尾还会碰子视图。
+- **pane 树**（pane.rs）：`PaneContainer`（NSView，窗口 contentView）持
+  二叉 split 树（叶子=TerminalView，ratio 可拖）；分隔条子视图可拖调
+  比例；焦点环 = 最上层 CALayer 边框视图（hitTest 返回 nil 不挡鼠标）。
+  ⌘D/⌘⇧D 插在焦点叶子旁；焦点导航按叶子 frame 几何找相邻重叠面；
+  布局尾部统一 `setNeedsDisplay`（分屏时同步 Metal present 在我们自己的
+  布局栈里不上屏——曾出现分屏后旧 pane 全黑直到点击，见残留）。
+- **壳**（shell.rs + app.rs）：⌘N 新窗口（`ninjaNewWindow:` 落 app
+  delegate）；⌘T 走 NSResponder 内建 `newWindowForTab:` + 系统 tab bar；
+  `addTabbedWindow:ordered:` 挂 tab 组（统一 tabbingIdentifier）；
+  ⌘W `performClose:`；pane shell 退出（EOF）→ `handle_pane_eof` →
+  多 pane 拆 pane / 单 pane 关窗；最后窗关闭才退出
+  （`applicationShouldTerminateAfterLastWindowClosed`）。
+- **配置**（config.rs）：`~/.config/ninja/ninja.toml`（`NINJA_CONFIG`
+  可覆盖）。缺文件 = 内置默认照常启动；坏字段 stderr 警告 + 降级默认。
+  schema：`shell` / `font-family`（不可用回退 Menlo）/ `font-size`
+  （4–200pt）/ `[theme] selection-bg`、`cursor`（#RRGGBB/#RGB/0x…）/
+  `[keys]`（动作名 → "cmd+shift+d" 风格，16 个动作可重绑，箭头 =
+  left/right/up/down）。菜单栏在启动时按配置键位生成。
+- **门禁取证钩子**：`NINJA_P2_SELFTEST=tab,split,win,close,closepane`
+  （逗号序列）在启动 0.8s 后按序触发对应动作——免 CGEvent 抖动，多
+  pane 内存/稳定性取证可复现（非产品功能，未知步骤忽略并警告）。
+
+## 验收取证（复跑命令）
+
+```bash
+cargo test --workspace          # 35 全过（28 lib + e2e 门控 skip + FFI…）
+NINJA_E2E=1 cargo test -p ninja --test fast_shell_first_frame   # D1 回归 ✓
+# 多 pane 取证（免 CGEvent）：
+NINJA_P2_SELFTEST=tab,split,win SHELL=/tmp/fakesh_p2.sh ./target/debug/ninja &
+sleep 6; footprint $(pgrep -x ninja)   # 4 pane（2窗+2标签+1分屏）
+# 配置：NINJA_CONFIG=/path/to/custom.toml（font-size 16 → 窗宽 769pt 实证生效）
+```
+
+| 验收项 | 取证方式 | 结果 |
+| --- | --- | --- |
+| cargo test --workspace | 本轮 | 35 全过，0 warning ✔ |
+| D1 快 shell 首帧（per-pane 唤醒重构后） | NINJA_E2E e2e | ink>1000 ✔ |
+| ⌘T 新标签 | CGEvent + selftest | pane 1→2，AX windows=1（成 tab）✔ |
+| ⌘D 右分屏 | CGEvent + 截图 | pane 2→3；左右两半各 1448/2143 ink，中缝分隔条在 x≈w/2 ✔ |
+| ⌘N 新窗口 | CGEvent + selftest | windows 1→2→3 ✔ |
+| ⌘W 关单窗（多窗存在） | CGEvent + selftest ×7 场景 | 存活、余窗正常、pane SIGHUP ✔ |
+| ⌘W 关最后窗 / ⌘Q | CGEvent | 进程退出、fakesh 残留 0 ✔ |
+| EOF 关 pane/关窗 | SHELL=即退脚本 | exit=0，无残留 ✔ |
+| 关 pane（⌘⇧W 路径） | selftest closepane ×3 | 树塌缩、焦点转移、无崩溃 ✔ |
+| 压力（tab,split,tab,split,closepane,close,win,close） | selftest ×3 | 3/3 稳定终态一致 ✔ |
+| 缺省配置文件启动 | 本机无 ~/.config/ninja/ninja.toml | 全部上述取证都在此状态跑 ✔ |
+| 自定义配置生效 | NINJA_CONFIG（16pt Courier） | 启动 ✓ shell ✓ 窗 769×463（默认 627×392）✔ |
+| 坏配置不拒启 | font-size=9999 | 警告 + 默认启动 ✔ |
+| **空载内存（门禁）** | footprint，对照 Ghostty 112MB（同机 store 基线） | 单窗 36MB（=p1，零回退）；2标签+1分屏（3 pane）65MB；2窗+2标签+1分屏（4 pane）91MB —— 同量级且低于 Ghostty ✔ |
+| 空闲无空转 | NINJA_DUMP_ATLAS mtime 间隔 3s | 不变 ✔ |
+| 空载红线 | cargo tree -p ninja \| grep wasmtime/ninja-protocol/preview | 0 命中；子进程仅 PTY shell ✔ |
+
+## p2 实测缺陷修复记录（验证轮次内）
+
+1. **分屏后旧 pane 全黑**：旧 pane 的 resize 重画发生在我们自己的布局
+   调用栈里（图层几何未提交），Metal present 不上屏；点击后才出现。
+   修复：`relayout` 尾部对叶子统一 `setNeedsDisplay`，重画推迟到
+   AppKit 显示周期（drawRect 路径）。
+2. **关窗 SIGSEGV（三种独立根因，全部 CGEvent/自测钩子复现）**：
+   - runloop 快照对已摘除 source 的迟到 perform → info 泄漏 + dead 标记；
+   - 关窗期间全局窗口遍历触半拆窗口 → 只碰自己窗口；
+   - `releasedWhenClosed` 默认 YES + 壳持强引用 = 过释放 → NO + 延迟
+     一拍释放。修复后 7 个关闭场景 + 3 轮压力全绿。
+
+## 已知残留（p2 新增）
+
+- 每个 pane 一套 Metal 管线/命令队列（~15-20MB/pane）。4 pane 91MB 在
+  门禁内；如需再压，p5+ 可共享 device/queue、按需休眠非焦点 pane。
+- 关闭的 pane 泄漏 `WakeInfo` + runloop source 本体（有意，见拆除红线1），
+  每 pane 常量级字节。
+- pane 内 OSC 标题多 pane 互抢窗口标题（最后写者赢）；tab 标题同此。
+- 焦点环用主题 cursor 色；分隔条不可键盘操作。
+- CGEvent 取证受真实会话抢焦点干扰（首键常丢）；关键路径有
+  NINJA_P2_SELFTEST 钩子兜底。IME/拖选等 p1 手动项沿用 D2 待补测。

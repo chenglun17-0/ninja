@@ -78,14 +78,34 @@ unsafe extern "C-unwind" {
 }
 
 impl Font {
-    /// 默认等宽字体：Menlo（系统必装）。`scale`：设备缩放（retina = 2.0）。
+    /// 默认等宽字体（Menlo）。`scale`：设备缩放（retina = 2.0）。
     pub fn new(size_pt: f64, scale: f64) -> Self {
-        let base = default_monospace(size_pt);
+        Self::with_family(size_pt, scale, None)
+    }
+
+    /// 指定字体族（p2 配置）；None 或字体不可用（CTFontCreateWithName
+    /// 会静默换成替补字体）→ 回退 Menlo。非等宽字体不拒绝（用户选择），
+    /// 但仍要求能取到度量。
+    pub fn with_family(size_pt: f64, scale: f64, family: Option<&str>) -> Self {
+        let named = family.and_then(|f| named_monospace(f, size_pt));
+        let base = named
+            .as_ref()
+            .map(|f: &CFRetained<CTFont>| {
+                // SAFETY: 合法 retain 过的 CTFont，再 retain 一个所有权。
+                unsafe { CFRetained::retain(std::ptr::NonNull::from(&**f)) }
+            })
+            .unwrap_or_else(|| default_monospace(size_pt));
         let metrics = measure(&base, size_pt);
 
 
         let raster_pt = size_pt * scale;
-        let raster_base = default_monospace(raster_pt);
+        let raster_base = named.map_or_else(
+            || default_monospace(raster_pt),
+            |base| {
+                // SAFETY: 同一 CTFont，再 retain 一个光栅化尺寸的引用。
+                unsafe { CFRetained::retain(std::ptr::NonNull::from(&*base)) }
+            },
+        );
         let mut fonts = HashMap::new();
         // SAFETY: raster_base 是合法 retain 过的 CTFont，再 retain 一个所有权。
         fonts.insert(
@@ -305,6 +325,21 @@ fn default_monospace(size_pt: f64) -> CFRetained<CTFont> {
     unsafe { CTFont::with_name(&name, size_pt, std::ptr::null()) }
 }
 
+/// 按名字取字体；CTFontCreateWithName 对不存在的名字会静默回退系统字体，
+/// 这里比对 family 名，对不上就当不可用（让上层回退 Menlo）。
+fn named_monospace(name: &str, size_pt: f64) -> Option<CFRetained<CTFont>> {
+    let cf = CFString::from_str(name);
+    // SAFETY: 参数平凡。
+    let font = unsafe { CTFont::with_name(&cf, size_pt, std::ptr::null()) };
+    let family = unsafe { font.family_name() };
+    let got = family.to_string();
+    if got.eq_ignore_ascii_case(name.trim()) {
+        Some(font)
+    } else {
+        None
+    }
+}
+
 fn variant(base: &CTFont, bold: bool, italic: bool) -> CFRetained<CTFont> {
     let mut traits = CTFontSymbolicTraits::empty();
     if bold {
@@ -332,6 +367,20 @@ mod tests {
         assert!(f.metrics.cell_h >= 8.0 && f.metrics.cell_h <= 40.0);
         assert!(f.metrics.ascent > 0.0 && f.metrics.descent > 0.0);
         assert!(f.baseline_offset() > 0.0 && f.baseline_offset() < f.metrics.cell_h);
+    }
+
+    #[test]
+    fn family_config_falls_back_to_menlo() {
+        // 不存在的字体族：CTFontCreateWithName 静默回退系统字体，
+        // with_family 必须识别并退回 Menlo（度量与默认一致）。
+        let fallback = Font::with_family(13.0, 2.0, Some("No Such Font 42"));
+        let default = Font::new(13.0, 2.0);
+        assert_eq!(fallback.metrics.cell_w, default.metrics.cell_w);
+        assert_eq!(fallback.metrics.cell_h, default.metrics.cell_h);
+        // 存在的族正常加载。
+        let mono = Font::with_family(13.0, 2.0, Some("Menlo"));
+        assert_eq!(mono.metrics.cell_w, default.metrics.cell_w);
+        assert_eq!(Font::with_family(13.0, 2.0, None).metrics.cell_w, default.metrics.cell_w);
     }
 
     #[test]

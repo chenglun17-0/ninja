@@ -38,7 +38,16 @@ pub struct PtyInner {
     to_pty_wake: Condvar,
     /// 主线程消费队列（读线程 push，主线程 drain）。
     rx: Mutex<VecDeque<PtyEvent>>,
+    /// 主线程注册的唤醒钩子（信号该 pane 的 CFRunLoopSource 并唤醒
+    /// 主 runloop）。p2：每个 PTY 一个钩子，多 pane 各自唤醒，不再全局单例。
+    /// 钩子只能在 PTY 读写线程被调；主线程在 drop PTY（join 读写线程）
+    /// 之后才拆 source，无并发窗口。
+    wake: Mutex<Option<WakeFn>>,
 }
+
+/// 主线程唤醒钩子。闭包在 PTY 读线程上执行，只做线程安全动作
+/// （CFRunLoopSourceSignal + CFRunLoopWakeUp），不碰 GUI/vt。
+pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 impl PtyInner {
     /// 往 PTY 写（任意线程调用；实际 write 在写线程）。
@@ -68,6 +77,19 @@ impl PtyInner {
     /// 子进程 pid（用于关窗时 SIGHUP 整个进程组）。
     pub fn child_pid(&self) -> libc::pid_t {
         self.child.load(Ordering::Acquire)
+    }
+
+    /// 主线程注册/注销唤醒钩子（每 pane 一次，见 view 的 install_wake）。
+    /// 注销后（None）读线程不再有唤醒路径——视图侧在 drop PTY 前先注销。
+    pub fn set_wake(&self, wake: Option<WakeFn>) {
+        *self.wake.lock().unwrap() = wake;
+    }
+
+    fn wake_main(&self) {
+        let f = self.wake.lock().unwrap().clone();
+        if let Some(f) = f {
+            f();
+        }
     }
 
     /// 收尾：给 shell 进程组发 SIGHUP、关 master。幂等。
@@ -154,6 +176,7 @@ impl Pty {
             to_pty: Mutex::new(VecDeque::new()),
             to_pty_wake: Condvar::new(),
             rx: Mutex::new(VecDeque::new()),
+            wake: Mutex::new(None),
         });
 
         // 读线程：阻塞在 poll 上，有数据就 read，EOF 汇报后退出。
@@ -315,30 +338,9 @@ fn writer_loop(inner: Arc<PtyInner>, fd: libc::c_int) {
 
 fn push_event(inner: &Arc<PtyInner>, ev: PtyEvent) {
     inner.rx.lock().unwrap().push_back(ev);
-    // 唤醒主线程：信号 CFRunLoopSource 并唤醒主 runloop（钩子由 view 侧注册）。
-    wake_main();
-}
-
-type WakeFn = fn();
-static WAKE_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// 主线程注册唤醒钩子（信号 CFRunLoopSource 并唤醒主 runloop）。
-/// p1 单窗口：全局一个钩子即可，不算共享状态设计债。
-pub fn set_wake_hook(f: Option<WakeFn>) {
-    let raw = match f {
-        Some(f) => f as usize,
-        None => 0,
-    };
-    WAKE_HOOK.store(raw, std::sync::atomic::Ordering::Release);
-}
-
-fn wake_main() {
-    let raw = WAKE_HOOK.load(std::sync::atomic::Ordering::Acquire);
-    if raw != 0 {
-        // SAFETY: raw 由 set_wake_hook 存入的 fn() 指针原样转回。
-        let f: WakeFn = unsafe { std::mem::transmute(raw) };
-        f();
-    }
+    // 唤醒主线程：信号该 pane 的 CFRunLoopSource 并唤醒主 runloop
+    //（钩子由 view 侧按 pane 注册）。
+    inner.wake_main();
 }
 
 #[cfg(test)]
