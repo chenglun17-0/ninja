@@ -19,9 +19,12 @@
 //! - [`pane`]：分屏容器（pane 树/分隔条拖拽/焦点导航/焦点环）
 //! - [`shell`]：多窗口 + 原生标签 + pane EOF 汇聚
 //! - [`config`]：`~/.config/ninja/ninja.toml`（shell/字体/键位/主题色）
-//! - [`app`]：NSApplication 引导、菜单（键位来自配置）、delegate
 //! - [`plugins`]：p3 ADE 插件门——[plugins] enabled 非空才绑 Unix
-//!   socket（默认空载不建）；协议类型来自 ninja-protocol
+//!   socket（默认空载不建）；p4 命中分发：Cmd+点击广播 hit，插件
+//!   claim/ignore 仲裁；协议类型来自 ninja-protocol
+//! - [`link`]：p4 命中识别纯函数（路径/URL/OSC-8）
+//! - [`open`]：p4 系统默认打开（无插件认领时的回退；无安装提示）
+//! - [`app`]：NSApplication 引导、菜单（键位来自配置）、delegate
 //!
 //! 空载路径 = 本 crate + 依赖。没有插件运行时、没有 wasmtime、没有 JS
 //! 引擎、没有插件 socket 或子进程（PTY 的 shell 不算插件）。
@@ -38,6 +41,8 @@ pub mod atlas;
 pub mod config;
 pub mod font;
 pub mod keymap;
+pub mod link;
+pub mod open;
 pub mod pane;
 pub mod plugins;
 pub mod pty;

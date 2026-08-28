@@ -42,6 +42,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSDate",
     "NSValue",
     "NSObjCRuntime",
+    "NSURL",
     "block2",
 ] }
 objc2-app-kit = { version = "0.3", features = [
@@ -58,6 +59,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSCursor",
     "NSGraphics",
     "NSColor",
+    "NSWorkspace",
 ] }
 objc2-quartz-core = { version = "0.3", features = [
     "CALayer",

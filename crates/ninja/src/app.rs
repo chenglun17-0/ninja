@@ -5,6 +5,7 @@
 
 #![allow(non_snake_case)] // ObjC selector 方法名
 use std::cell::{Cell, RefCell};
+use std::sync::{Arc, Mutex};
 
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
@@ -25,6 +26,8 @@ pub struct Ivars {
     pub config: Config,
     /// 门禁取证钩子的步骤序列（NINJA_P2_SELFTEST，启动后延时执行）。
     pub selftest: RefCell<Option<String>>,
+    /// p4 命中分发取证钩子（NINJA_P4_HIT="col,row"，启动后延时执行）。
+    pub p4_hit: RefCell<Option<String>>,
     /// 本壳持有的窗口强引用。**关键不变量**：窗口在 -[NSWindow close]
     /// 期间必须有人持有（NSApp 的窗口列表引用会在 close 中途摘掉，
     /// 若那是唯一引用，窗口在自己 close 的调用栈里 dealloc，后续
@@ -81,6 +84,29 @@ define_class!(
                     )
                 };
                 std::mem::forget(timer); // 只触发一次；进程生命期内 self 常活
+            }
+
+            // p4 命中分发取证钩子（非产品功能）：NINJA_P4_HIT="col,row"
+            // 在首帧落定后对 key window 的焦点 pane 走一遍 Cmd+点击路径
+            //（与 NINJA_P2_SELFTEST 同惯例；真实合成点击取证用
+            // tools/verify/synth_input.swift 的 click x y 1）。延时 3s：
+            // 等启动链路（Metal 初始化）与外部插件连上 socket——E2E 里
+            // 插件是测试进程自己拉起的独立进程，连接需要一点时间；
+            // 真实 Cmd+点击无此等待（点击时插件早已连着或根本没启用）。
+            if let Ok(spec) = std::env::var("NINJA_P4_HIT") {
+                self.ivars().p4_hit.replace(Some(spec));
+                // SAFETY: 同上。
+                let target: Retained<objc2::runtime::AnyObject> = unsafe { msg_send![self, self] };
+                let timer = unsafe {
+                    objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                        3.0,
+                        &target,
+                        objc2::sel!(ninjaP4HitTick:),
+                        None,
+                        false,
+                    )
+                };
+                std::mem::forget(timer);
             }
         }
 
@@ -195,6 +221,57 @@ define_class!(
                     other => eprintln!("ninja: NINJA_P2_SELFTEST 未知步骤 {other:?}"),
                 }
             }
+        }
+
+        /// p4 取证钩子：解析 NINJA_P4_HIT="col,row"，对 key window 的焦点
+        /// pane（没有焦点就第一个叶子）走 Cmd+点击命中分发路径。
+        #[unsafe(method(ninjaP4HitTick:))]
+        fn ninja_p4_hit_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            let Some(spec) = self.ivars().p4_hit.take() else {
+                return;
+            };
+            let Some(mtm) = MainThreadMarker::new() else { return };
+            let app = NSApplication::sharedApplication(mtm);
+            // key/main 窗口在后台/争激活时会短暂为 nil（并行取证实测），
+            // 退化顺序：keyWindow → mainWindow → 已登记窗口表（确定存在）。
+            let window = app.keyWindow().or_else(|| app.mainWindow()).or_else(|| {
+                self.ivars()
+                    .windows
+                    .borrow()
+                    .first()
+                    .map(|w| w.clone())
+            });
+            let Some(content) = window.and_then(|w| w.contentView()) else {
+                eprintln!("ninja: NINJA_P4_HIT 无窗口可命中");
+                return;
+            };
+            // SAFETY: isKindOfClass: 任意 NSObject 可查。
+            let is_c: bool =
+                unsafe { objc2::msg_send![&*content, isKindOfClass: PaneContainer::class()] };
+            if !is_c {
+                eprintln!("ninja: NINJA_P4_HIT 窗口内容不是 PaneContainer");
+                return;
+            }
+            // SAFETY: 通过类型检查后的上转（同 selftest 惯例）。
+            let container: &PaneContainer =
+                unsafe { &*(std::ptr::from_ref(&*content) as *const PaneContainer) };
+            let Some(view) = container
+                .focused_leaf()
+                .or_else(|| container.leaves().first().cloned())
+            else {
+                return;
+            };
+            // "col,row"（十进制，可含空白）。
+            let Some((col, row)) = spec
+                .split(',')
+                .map(|s| s.trim().parse::<u16>().ok())
+                .collect::<Option<Vec<_>>>()
+                .and_then(|v| (v.len() == 2).then(|| (v[0], v[1])))
+            else {
+                eprintln!("ninja: NINJA_P4_HIT 需为 \"col,row\"（u16），得到 {spec:?}");
+                return;
+            };
+            view.cmd_click(col, row, libghostty_vt::key::Mods::SUPER);
         }
 
         /// ⌘N：新窗口（独立窗口；nil target 动作最终落到 app delegate）。
@@ -423,15 +500,22 @@ pub fn run() {
     build_menu(mtm, &app, &config);
 
     // p3 ADE 插件门：默认（enabled 空）不建 socket、不拉任何插件进程
-    //（空载门禁）。启用时绑 Unix socket；accept/拉起在 p5。
-    // 生命周期：住在 run() 栈上，app.run() 返回（退出）时 drop 并删
-    // socket 文件。
-    let _plugin_host = plugins::PluginHost::start(&config.plugins);
+    //（空载门禁）。启用时绑 Unix socket；拉起在 p5。
+    // p4：装全局命中分发器（view 的 Cmd+点击经它到达 PluginHost）；
+    // 生命周期不变——Arc 在本栈上，退出时 drop 删 socket 文件（分发器
+    // 槽里只存 Weak，随宿主退出自动失效）。
+    let plugin_host = plugins::PluginHost::start(&config.plugins).map(|h| {
+        let arc = Arc::new(Mutex::new(h));
+        plugins::install_dispatcher(&arc);
+        arc
+    });
+    let _plugin_host = plugin_host;
 
     // 两阶段初始化（同 view）：先放 ivars 再走 NSObject 的 init。
     let this = AppDelegate::alloc(mtm).set_ivars(Ivars {
         config,
         selftest: RefCell::new(None),
+        p4_hit: RefCell::new(None),
         windows: RefCell::new(Vec::new()),
         closing: RefCell::new(Vec::new()),
         prune_scheduled: Cell::new(false),

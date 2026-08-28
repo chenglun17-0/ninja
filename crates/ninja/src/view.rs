@@ -15,12 +15,15 @@
 
 #![allow(non_snake_case)] // ObjC selector 方法名
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use libghostty_vt::ffi::SizeReportSize;
 use libghostty_vt::key::{Key, Mods};
 use libghostty_vt::render::{CursorVisualStyle, Dirty};
+use libghostty_vt::screen::CellWide;
+use ninja_protocol::{Hit as ProtocolHit, Modifier};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -41,6 +44,9 @@ use crate::atlas::GlyphAtlas;
 use crate::config::Config;
 use crate::font::Font;
 use crate::keymap;
+use crate::link;
+use crate::open;
+use crate::plugins;
 use crate::pty::{self, Pty};
 use crate::renderer::{Renderer, Theme};
 use crate::select;
@@ -118,6 +124,8 @@ pub struct State {
     atlas: GlyphAtlas,
     renderer: Option<Renderer>,
     pty: Option<Box<Pty>>,
+    /// 本 pane 的稳定 id（进程内递增；Hit.pane 用）。
+    pane_id: u32,
     /// on_size（XTWINOPS 应答）用的 cell 像素尺寸，resize 时同步。
     cell_px_shared: Arc<Mutex<(u32, u32)>>,
     /// IME 预编辑串。
@@ -276,6 +284,17 @@ define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
+            // p4：Cmd+点击 = 命中分发（Ghostty 惯例）。不带 Cmd 的普通
+            // 点击保持选区语义不变。
+            let flags = event.modifierFlags().0 as u64;
+            let mods = keymap::mods_from_flags(flags);
+            if mods.contains(Mods::SUPER) {
+                let (px, py) = self.point_of_event(event);
+                let (col, row) = self.cell_of_point(px, py);
+                self.cmd_click(col, row, mods);
+                return;
+            }
+
             let (px, py) = self.point_of_event(event);
             let cell = self.cell_of_point(px, py);
             let mut press = match libghostty_vt::selection::gesture::PressEvent::new() {
@@ -619,6 +638,7 @@ impl TerminalView {
             atlas,
             renderer: Some(renderer),
             pty: Some(Box::new(pty)),
+            pane_id: next_pane_id(),
             cell_px_shared,
             marked: None,
             blink_on: true,
@@ -676,6 +696,51 @@ impl TerminalView {
     /// RefCell 借用助手。调用点纪律：不跨 AppKit 重入调用持有。
     fn state(&self) -> std::cell::RefMut<'_, State> {
         self.ivars().state.borrow_mut()
+    }
+
+    /// 本 pane 的稳定 id（Hit.pane 用；进程内递增，首个 = 1）。
+    pub fn pane_id(&self) -> u32 {
+        self.state().pane_id
+    }
+
+    // ---- p4 命中分发（Cmd+点击；也供 NINJA_P4_HIT 取证钩直调）----
+
+    /// Cmd+点击路径：识别 → 构造 Hit → 插件分发 → claim 或系统默认。
+    /// 主线程；分发用同步短超时（见 plugins.rs），不新增线程。
+    pub fn cmd_click(&self, col: u16, row: u16, mods: Mods) {
+        // 1) 行扫描（借用在块内放掉——分发/打开不再碰 view 状态）。
+        let (cells, osc8, pwd) = {
+            let st = self.state();
+            let (cells, osc8) = scan_row(&st.term, row, col);
+            let pwd = st.term.terminal.pwd().unwrap_or("").trim().to_string();
+            (cells, osc8, pwd)
+        };
+        // 2) 纯函数识别（OSC-8 优先，否则行内扩展 + 分类）。
+        let Some(found) = link::recognize(&cells, usize::from(col), osc8.as_deref()) else {
+            return; // 点在不可点的东西上：什么都不做（保持普通终端行为）
+        };
+        // 3) 构造 Hit 并广播（未启用插件 → NoPlugins → 系统默认）。
+        let pane = self.pane_id();
+        let hit = ProtocolHit::new(
+            plugins::next_hit_id(),
+            found.kind,
+            found.text.clone(),
+            u32::from(row),
+            u32::from(col),
+            pane,
+            modifier_list(mods),
+        );
+        match plugins::dispatch_hit(&hit) {
+            plugins::DispatchOutcome::Claimed { .. } => {
+                // 有插件认领：p4 到此为止（层/预览接线是 p5）。
+            }
+            plugins::DispatchOutcome::NoPlugins
+            | plugins::DispatchOutcome::AllIgnored => {
+                // 无插件 / 全不认领：系统默认打开，绝不弹安装提示。
+                let pwd = if pwd.is_empty() { None } else { Some(pwd.as_str()) };
+                open::open_hit_target(found.kind, &found.text, pwd);
+            }
+        }
     }
 
     // ---- 几何 ----
@@ -980,6 +1045,79 @@ impl TerminalView {
 /// 预编辑文本的占格宽计数（末尾定位用）。
 fn count_width_cells(c: char) -> u32 {
     u32::from(libghostty_vt::unicode::codepoint_width(c).max(1))
+}
+
+// ---------------------------------------------------------------------------
+// p4 命中分发：Cmd+点击 → 识别 → 广播插件 → claim/系统默认
+// ---------------------------------------------------------------------------
+
+/// pane id 发号器（进程内递增，首个 pane = 1）。
+fn next_pane_id() -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// vt `Mods` → 协议 `Modifier` 列表（顺序固定：shift/ctrl/alt/cmd）。
+fn modifier_list(mods: Mods) -> Vec<Modifier> {
+    let mut v = Vec::new();
+    if mods.contains(Mods::SHIFT) {
+        v.push(Modifier::Shift);
+    }
+    if mods.contains(Mods::CTRL) {
+        v.push(Modifier::Ctrl);
+    }
+    if mods.contains(Mods::ALT) {
+        v.push(Modifier::Alt);
+    }
+    if mods.contains(Mods::SUPER) {
+        v.push(Modifier::Cmd);
+    }
+    v
+}
+
+/// 从 vt 网格取点击行：逐列 grapheme 文本 + 点击 cell 的 OSC-8 URI。
+/// 只在点击路径调用（grid_ref 不适合渲染循环，见 vt 文档）。
+fn scan_row(
+    term: &TermState,
+    row: u16,
+    click_col: u16,
+) -> (Vec<link::RowCell>, Option<String>) {
+    let cols = term.cols();
+    let mut cells = Vec::with_capacity(usize::from(cols));
+    let mut cbuf = ['\0'; 8];
+    let mut ubuf = [0u8; 2048];
+    let mut osc8: Option<String> = None;
+    for x in 0..cols {
+        let Ok(g) = term.grid_ref_viewport(x, row) else {
+            cells.push(link::RowCell::Blank);
+            continue;
+        };
+        let text = match g.graphemes(&mut cbuf) {
+            Ok(0) => String::new(),
+            Ok(n) => cbuf[..n].iter().collect::<String>(),
+            Err(_) => String::new(),
+        };
+        // 宽字形尾巴 / 软换行占位：无文本但不是 token 边界。
+        let wide = g
+            .cell()
+            .and_then(|c| c.wide())
+            .unwrap_or(CellWide::Narrow);
+        if x == click_col {
+            // OSC-8：点击 cell 的 hyperlink URI（0 = 无）。
+            match g.hyperlink_uri(&mut ubuf) {
+                Ok(n) if n > 0 => {
+                    osc8 = Some(String::from_utf8_lossy(&ubuf[..n]).into_owned())
+                }
+                _ => {}
+            }
+        }
+        cells.push(match wide {
+            CellWide::SpacerTail | CellWide::SpacerHead => link::RowCell::Cont,
+            _ if text.is_empty() || text.chars().all(char::is_whitespace) => link::RowCell::Blank,
+            _ => link::RowCell::Text(text),
+        });
+    }
+    (cells, osc8)
 }
 
 fn empty_frame() -> Frame {
