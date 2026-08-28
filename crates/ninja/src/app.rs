@@ -166,6 +166,18 @@ define_class!(
     }
 
     unsafe impl NSWindowDelegate for AppDelegate {
+        /// D-A：⌘W 只关「当前面」（决策群在 shell.rs，带单测）。裸 ⌘W
+        /// （我们的 Close=performClose: / 系统 Close Tab）多 pane 窗只关
+        /// 焦点 pane、拦掉整窗 close——其余 pane 各自 PTY 独立、shell
+        /// 绝不陪葬；单 pane 放行原生语义（关当前 tab，最后 tab 才关
+        /// 窗）。非 ⌘W 路径（红绿灯、⇧⌘W/⌥⌘W 系统项、EOF、selftest）
+        /// 不受影响。须在 windowWillClose 之前（performClose 先问
+        /// shouldClose 再走 close/willClose）。
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, sender: &NSWindow) -> bool {
+            shell::window_should_close(sender)
+        }
+
         // 关窗前先收尾该窗全部 pane，防止 runloop source 在窗口拆一半时
         // 进 view。多窗口下每个窗口的 close 都走这里。
         #[unsafe(method(windowWillClose:))]

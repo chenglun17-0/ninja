@@ -413,3 +413,65 @@ sleep 6; footprint $(pgrep -x ninja)   # 4 pane（2窗+2标签+1分屏）
   无通知对象）；与 Esc 兜底同语义。
 - 清扫只认约定路径名 `ninja-ade-<pid>.sock`；NINJA_ADE_SOCK 覆盖路径
   的尸体不扫（测试隔离路径，生产不使用）。
+
+# D-A 修复：⌘W 关整窗（2026-08-28）
+
+## 症状与定性
+
+用户日报「多标签时 ⌘W 应只关当前标签，实际关了整个窗口」。排查分两层：
+
+1. **NSWindow 原生 tab 层（2/3 标签、宿主/非宿主标签、全屏、Always 偏好、
+   ⌘T→⌘W 20ms 紧衔接、selftest ×12、多窗×tab 组合）**：实测 HEAD 全部
+   正确——macOS 会把 File>Close(performClose:) 项 tab 化成 Close Tab(⌘W)/
+   Close Window(⇧⌘W)/Close All/Close Other Tabs（AX 菜单 dump 实证），
+   `performClose:` 对 tab 组成员只关当前 tab（独立 Swift 探针两种窗口
+   配置各验证一次：关 1 留 1）。此层无需修复，但语义在本轮 E2E 钉死。
+2. **多 pane（分屏）窗层——可复现缺陷本体**：`⌘W`（performClose:）对
+   含 2+ 分屏的窗**直接整窗关闭，所有 pane 的 shell 全部 SIGHUP 陪葬**。
+   用户口径里「多标签」= 同窗多终端面；这正是「关整窗 + 杀其它面 shell」，
+   也正是任务「p2 记录『⌘W 多窗时关 1 窗其余 pane SIGHUP』语义重审——
+   关一个标签绝不能杀其它标签的 shell」要钉死的红线（每 pane 各自
+   forkpty+setsid，进程组独立，代码层确认无跨杀；问题只在这条整窗路径）。
+
+## 修复（shell.rs + app.rs）
+
+裸 ⌘W 只关「当前面」（iTerm/Ghostty 同款 surface 语义）：
+
+- `AppDelegate` 实现 `windowShouldClose:`（performClose: 先问 shouldClose
+  再 close），委托 `shell::window_should_close`。
+- 判别「裸 ⌘W」：currentEvent 是 keyDown，带 Cmd 且**无** Shift/Option/Ctrl。
+  ⇧⌘W（系统 Close Window）、⌥⌘W（Close All/Other Tabs）、红绿灯与菜单
+  点击（鼠标事件）、EOF 级联与 selftest（定时器/无事件）都不匹配 →
+  原整窗/整 tab 语义不变。
+- 多 pane 窗：关焦点 pane（`close_leaf`：焦点转移 + 焦点环同步 + 只收
+  该 pane 自己的 PTY 进程组），返回 false 拦掉整窗 close；单 pane 放行
+  → 关当前 tab，最后一个 tab 才关窗（原生语义）。决策函数
+  `should_close_whole_window(surfaces, bare_cmd_key)` 纯逻辑可单测（3 例）。
+- 顺带把 shell.rs 三处重复的「contentView→PaneContainer」判定收敛为
+  `pane_container_of`（行为不变）。
+
+## 验收取证（真实 GUI 会话，全部可复跑）
+
+| 场景 | 结果 |
+| --- | --- |
+| 3 分屏 ⌘W×3 | shell 3→2→1、窗在、进程活；最后才关窗退出 ✔（修复前第一下整窗关+进程退，E2E 判别红实证） |
+| 3 标签 ⌘W | 只关当前 tab，余 tab shell 存活，窗在 ✔ |
+| 红绿灯（分屏窗） | 整窗关（原生）✔ |
+| 红绿灯（tab 窗） | 只关当前 tab（原生 tab 行为）✔ |
+| ⇧⌘W（Close Pane） | 只关一个 pane，窗在 ✔（语义不变） |
+| EOF 杀 1 shell（2 pane 窗） | 只拆该 pane，窗留、余 shell 活 ✔ |
+| selftest close（定时器路径） | 整窗关不变（p2 压力序列语义保持）✔ |
+| cargo test --workspace | 103 全绿（96 基线 + 3 单测 + 4 E2E）✔ |
+
+复跑：`cargo test --workspace`；E2E（需可交互 GUI 会话 + Xcode 工具链）：
+`NINJA_E2E=1 cargo test -p ninja --test cmdw_surface_close`。E2E 四场景
+（分屏逐面关 / tab 只关当前 / 红绿灯整窗 / ⇧⌘W 不变）内部 flock 串行
+（都需前台激活，⌘W 只有前台应用的菜单系统才会接——p6 实证
+CGEventPostToPid 到不了菜单系统），新增 `synth_input.swift activate/wincount`
+子命令（NSRunningApplication/CGWindowList，非 AX 权限路径）。
+
+## 已知残留
+
+- tab 态系统注入的 Close Window(⇧⌘W) 与 Panes>Close Pane(⌘⇧W) 键位
+  相同：实测菜单匹配按栏序 Panes 项赢（⇧⌘W 关 pane，非整窗）——与
+  本轮语义一致，未动。
