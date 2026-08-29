@@ -8,15 +8,17 @@
 
 | 脚本 | 产物 | 做什么 |
 | --- | --- | --- |
-| `scripts/package_app.sh` | `dist/Ninja.app` | `cargo build --release -p ninja`（仅宿主，**不打 ninja-preview/ninja-theme**）→ 组 bundle → `codesign --force --identifier dev.ninja.ninja --options runtime` → `--verify --deep --strict` 自检 |
-| `scripts/package_dmg.sh` | `dist/Ninja-0.1.0-arm64.dmg` | staging（Ninja.app + `/Applications` 符号链接，拖拽安装）→ `hdiutil UDZO` → 挂卷验签/清点自检 |
+| `scripts/package_app.sh` | `dist/Ninja.app` | `cargo build --release -p ninja`（仅宿主，**不打 ninja-preview/ninja-theme**）→ 程序化图标（`make_icon.sh` → `Resources/AppIcon.icns`）→ 组 bundle → `codesign --force --identifier dev.ninja.ninja --options runtime` → `--verify --deep --strict` 自检 |
+| `scripts/package_dmg.sh` | `dist/Ninja-0.1.0-arm64.dmg` | staging（Ninja.app + `/Applications` 符号链接，拖拽安装）→ `hdiutil UDZO` → 挂卷验签/清点/图标自检 |
+| `scripts/make_icon.sh`（+ 源 `make_icon.swift`） | `.icns`（10 尺寸） | Swift/CoreGraphics 程序化绘制 Ninja 图标（无位图资产入库）：macOS 圆角方形深底 `#282C34`（呼应 ODP）+ 扁平忍者头（头带 ODP 红、飘带、眼缝 + ODP 蓝双眼），10 个标准尺寸 PNG（16…1024，含 @2x）→ `iconutil` 合 icns；内建像素级回归自检（特征色落位/透明角/尺寸/icns 回读），失败即中止打包 |
 
 - `dist/` 已入 `.gitignore`；脚本在 `scripts/`（tracked；`tools/` 整目录被忽略故不放那）。
 - bundle id **dev.ninja.ninja**（同时是 codesign `--identifier`，签名稳定标识）。
 - Info.plist 最小键集：`CFBundlePackageType=APPL`、`CFBundleExecutable=ninja`、
   `CFBundleName=Ninja`、`CFBundleIdentifier=dev.ninja.ninja`、
   `CFBundleShortVersionString=CFBundleVersion=0.1.0`、`CFBundleDevelopmentRegion=en`、
-  `NSHighResolutionCapable=true`。
+  `NSHighResolutionCapable=true`、`CFBundleIconFile=AppIcon.icns`（图标是资源
+  不是插件，零插件约束不变）。
 - `LSMinimumSystemVersion` 由脚本从**产物二进制的 `LC_BUILD_VERSION` minos** 读出
   （aarch64-apple-darwin rustc 默认部署目标 = **11.0**）。objc2 0.6 / objc2-app-kit
   0.3 声明的支持下限（约 macOS 10.12/10.13）比它宽，但 arm64 二进制在 11.0 以下本就
@@ -46,7 +48,6 @@
 - 本机验证途径（仅本机、非分发承诺）：
   `xattr -dr com.apple.quarantine /Applications/Ninja.app` 去隔离属性后照常打开；
   同机 Apple Development 签名 + 非下载来源的副本本就不带隔离属性。
-- 图标（`CFBundleIconFile`）非门禁项：暂无 .icns 资产，未做（p7 验收不含图标）。
 
 ## 插件本地安装 / 卸载
 

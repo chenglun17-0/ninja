@@ -36,6 +36,12 @@ find "$MNT" -mindepth 1 -maxdepth 1 | sort
 [[ -f "$MNT/Ninja.app/Contents/MacOS/ninja" ]] || { echo "错误：DMG 内缺宿主二进制" >&2; hdiutil detach "$MNT" >/dev/null; exit 1; }
 [[ ! -e "$MNT/Ninja.app/Contents/MacOS/ninja-preview" ]] || { echo "错误：DMG 内进了 ninja-preview（违反默认零插件）" >&2; hdiutil detach "$MNT" >/dev/null; exit 1; }
 [[ ! -e "$MNT/Ninja.app/Contents/MacOS/ninja-theme" ]] || { echo "错误：DMG 内进了 ninja-theme（违反默认零插件；T2 主题插件也不随分发物）" >&2; hdiutil detach "$MNT" >/dev/null; exit 1; }
+# 图标卷内生效断言（回归）：icns 资源与 plist 引用都要在拖拽安装的
+# 副本里——丢任一侧 = DMG 里 Finder 回退通用图标。
+[[ -f "$MNT/Ninja.app/Contents/Resources/AppIcon.icns" ]] || {
+  echo "错误：DMG 卷内缺 Resources/AppIcon.icns" >&2; hdiutil detach "$MNT" >/dev/null; exit 1; }
+[[ "$(defaults read "$MNT/Ninja.app/Contents/Info" CFBundleIconFile)" == "AppIcon.icns" ]] || {
+  echo "错误：DMG 卷内 Info.plist CFBundleIconFile ≠ AppIcon.icns" >&2; hdiutil detach "$MNT" >/dev/null; exit 1; }
 hdiutil detach "$MNT" >/dev/null
 
 echo "完成：$DMG"
