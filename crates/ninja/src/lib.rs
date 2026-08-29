@@ -8,8 +8,10 @@
 //!
 //! 模块划分（全部只在主线程碰 libghostty-vt 类型，该库非线程安全）：
 //!
-//! - [`theme`]：T-主题：One Dark Pro 唯一默认配色（官方色板钉死，
-//!   vt 默认前景/背景/光标 + ANSI 16 + 选区/光标/分隔条收口）
+//! - [`theme`]：T-主题：One Dark Pro 唯一内置基线配色（官方色板钉死，
+//!   vt 默认前景/背景/光标 + ANSI 16 + 选区/光标/分隔条收口）；T2 起
+//!   兼运行时色板覆盖点（插件 theme.set → 全局生效色板，渲染/vt/容器
+//!   现读 [`theme::current`]；插件死亡/禁用回退基线）
 //!
 //! - [`pty`]：forkpty 拉起 `$SHELL`，读写各一条线程，per-pane
 //!   CFRunLoopSource 唤醒主线程泵数据
@@ -25,7 +27,8 @@
 //! - [`plugins`]：p3 ADE 插件门——[plugins] enabled 非空才绑 Unix
 //!   socket（默认空载不建）；p4 命中分发：Cmd+点击广播 hit，插件
 //!   claim/ignore 仲裁；p5 监督器（首次命中拉插件进程）+ 层握手
-//!   （open→ready→present/close）+ 层前台输入路由
+//!   （open→ready→present/close）+ 层前台输入路由；T2 theme.set
+//!   处置（换色板全屏重画；拥有者连接死亡/禁用回退 ODP 基线）
 //! - [`layer`]：p5 层原语——IOSurface 分配/注册表/几何（合成在
 //!   renderer 的层 pass）
 //! - [`link`]：p4 命中识别纯函数（路径/URL/OSC-8）

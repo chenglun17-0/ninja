@@ -1,6 +1,6 @@
 //! ninja-protocol：ADE 协议（p3 落地）。
 //!
-//! 进程外、版本化、五类消息（hit / layer / input / spawn / config）。
+//! 进程外、版本化、六类消息（hit / layer / input / spawn / config / theme）。
 //! 宿主与插件是两个进程，只经 Unix socket 交换字节，**永远不共享地址
 //! 空间**——本 crate 只是把线格式钉成 Rust 类型 + 编解码，不携带任何
 //! 宿主内部 API。第二个实现可以不用 Rust：只认下述 JSON。
@@ -49,8 +49,18 @@
 //!    永远无法认领相对路径（golden 样例 `src/main.rs:42:13` 正是相对
 //!    路径）；只认绝对路径会直接弱化 p5 插件门禁。此条不并成通例：
 //!    仓库公开后再改字段集必须升 `v`。
+//! 6. **v0 内消息类型增补记录（T2，2026-08）**：新增 `theme` 类消息
+//!    `theme.set`（插件→宿主，携带完整色板）。依据规则 1 本应升 `v`，
+//!    但 v0 尚未对外发布（同第 5 条前提），增补直接钉进 v0；只增不删
+//!    不改。引入原因是**用户产品决策（2026-08-29 确认，见 PRODUCT.md
+//!    宿主原语表「颜色」行）**：宿主内置 One Dark Pro 为不可卸基线
+//!    配色，主题切换走插件原语——宿主不做内置主题系统/切换 UI，换色
+//!    是插件经协议推完整色板。旧实现（不认识 `theme.set`）在新线格式
+//!    上行为不变：插件侧旧实现收不到这条消息（只有插件发）；宿主侧
+//!    旧实现会按未知 type 拒收（规则 4），可接受的迁移面。此条同样
+//!    不并成通例：仓库公开后再加消息类型必须升 `v`。
 //!
-//! # 五类消息总表
+//! # 六类消息总表
 //!
 //! `方向`：宿主→插件 / 插件→宿主 / 双向。除公共 `v`/`type` 外的字段：
 //!
@@ -72,6 +82,7 @@
 //! | [`spawn.denied`](Message::SpawnDenied) | 宿主→插件 | `id` u64、`reason` string |
 //! | [`spawn.exited`](Message::SpawnExited) | 宿主→插件 | `id` u64、`pid` u32、`code` i32 |
 //! | [`config.push`](Message::ConfigPush) | 宿主→插件 | `enabled` \[string\]、`keys` map&lt;string,string&gt;、`memory_limit_bytes` u64 |
+//! | [`theme.set`](Message::ThemeSet) | 插件→宿主 | `name` string、`bg`/`fg`/`cursor`/`selection_bg`/`divider` string（`#rrggbb`）、`selection_alpha` u32（0-255）、`ansi` \[string;16\]（恰好 16 个 `#rrggbb`；T2 增补见规则 6） |
 //!
 //! 语义要点：
 //!
@@ -83,6 +94,10 @@
 //! - `input`：插件申请全局快捷键；层在前台时键盘事件先发该插件。
 //! - `spawn`：辅助进程由宿主代拉、宿主管生命周期与内存上限。
 //! - `config`：启用列表/键位/内存上限，只读推送。
+//! - `theme`（T2 增补，见规则 6）：插件推完整色板换宿主当前生效配色；
+//!   宿主内置基线色板（One Dark Pro）不可卸——插件连接死亡/禁用时
+//!   宿主回退基线。色值一律 `#rrggbb`；语义坏值（格式/alpha 越界）
+//!   由宿主整条忽略（不断连），类型/数量错按解码错误处置。
 //!
 //! # 枚举与命名集
 //!
@@ -90,6 +105,9 @@
 //!   （[`Modifier`]）。
 //! - `hit.kind`：`"path"` / `"url"` / `"osc8"`（[`HitKind`]）。
 //! - `placement`：`"overlay"`（盖在 cell 上）/ `"side"`（侧开）（[`Placement`]）。
+//! - `theme.set` 的颜色字段：`#` + 恰好 6 位十六进制（大小写均可，
+//!   golden 钉小写）；不收 `#abc` 短写/`0x` 前缀（宿主解析失败即整条
+//!   忽略，见 [`Message::ThemeSet`] 文档）。
 //! - `key` 字符串：单字符（如 `"p"`）或命名键 `left` `right` `up` `down`
 //!   `home` `end` `pageup` `pagedown` `delete` `backspace` `tab` `enter`
 //!   `esc` `f1`…`f12`。集合冻结；新键名升 `v`。
@@ -142,5 +160,5 @@ pub use message::{
     ConfigPush, Direction, Hit, HitClaim, HitIgnore, HitKind, InputHotkey, InputHotkeyDenied,
     InputHotkeyGranted, InputKey, KNOWN_TYPES, LayerClose, LayerOpen, LayerPresent, LayerReady,
     Message, Modifier, PROTOCOL_VERSION, Placement, SpawnDenied, SpawnExited, SpawnRequest,
-    SpawnStarted, is_known_type,
+    SpawnStarted, ThemeSet, is_known_type,
 };

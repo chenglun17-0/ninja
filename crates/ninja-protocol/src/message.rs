@@ -1,4 +1,4 @@
-//! 五类消息的 Rust 类型（线格式 schema 的权威定义）。
+//! 六类消息的 Rust 类型（线格式 schema 的权威定义；theme 类为 T2 增补）。
 //!
 //! 每条消息一个结构体，公共字段 `v`（协议版本）+ 由 [`Message`] 的
 //! internally-tagged 枚举注入的 `type`；线上形态 `{"type":..,"v":..,...}`
@@ -397,6 +397,63 @@ impl SpawnExited {
 }
 
 // ---------------------------------------------------------------------------
+// theme：插件换全色板（T2，用户产品决策 2026-08-29）
+// ---------------------------------------------------------------------------
+
+/// 插件→宿主：换当前生效色板（完整覆盖：背景/前景/光标/选区/ANSI 16）。
+/// 宿主内置 One Dark Pro 为不可卸基线（T1）；本消息是唯一的主题切换
+/// 原语入口——插件连接死亡/禁用时宿主回退内置基线（p6 收层同语义）。
+/// 颜色一律 `#rrggbb`（6 位十六进制，前缀 `#`）；`selection_alpha` 是
+/// 选区不透明度 0-255；`name` 仅用于宿主日志/取证。色值语义非法（格式
+/// 坏/alpha 越界）由宿主整条忽略（警告，不断连）；字段类型/数量错
+///（如 `ansi` 不是 16 元数组）是解码错误，按 p3 契约处置。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ThemeSet {
+    pub v: u32,
+    /// 色板名（宿主日志/取证用；不参与匹配）。
+    pub name: String,
+    /// 默认背景（OSC 11 查询应答的就是它）。
+    pub bg: String,
+    /// 默认前景（OSC 10 查询应答的就是它）。
+    pub fg: String,
+    /// 光标色。
+    pub cursor: String,
+    /// 选区背景色。
+    pub selection_bg: String,
+    /// 选区不透明度（0-255）。
+    pub selection_alpha: u32,
+    /// 分隔条/边框色。
+    pub divider: String,
+    /// ANSI 16 色（含 bright），下标即调色板 0-15；必须恰好 16 个。
+    pub ansi: [String; 16],
+}
+
+impl ThemeSet {
+    pub fn new(
+        name: impl Into<String>,
+        bg: impl Into<String>,
+        fg: impl Into<String>,
+        cursor: impl Into<String>,
+        selection_bg: impl Into<String>,
+        selection_alpha: u32,
+        divider: impl Into<String>,
+        ansi: [String; 16],
+    ) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            name: name.into(),
+            bg: bg.into(),
+            fg: fg.into(),
+            cursor: cursor.into(),
+            selection_bg: selection_bg.into(),
+            selection_alpha,
+            divider: divider.into(),
+            ansi,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // config：只读推送给插件
 // ---------------------------------------------------------------------------
 
@@ -474,6 +531,8 @@ pub enum Message {
     SpawnExited(SpawnExited),
     #[serde(rename = "config.push")]
     ConfigPush(ConfigPush),
+    #[serde(rename = "theme.set")]
+    ThemeSet(ThemeSet),
 }
 
 /// 本版本全部 type 字符串（顺序与 [`Message`] 变体一致）。
@@ -494,6 +553,7 @@ pub const KNOWN_TYPES: &[&str] = &[
     "spawn.denied",
     "spawn.exited",
     "config.push",
+    "theme.set",
 ];
 
 impl Message {
@@ -516,6 +576,7 @@ impl Message {
             Message::SpawnDenied(m) => m.v,
             Message::SpawnExited(m) => m.v,
             Message::ConfigPush(m) => m.v,
+            Message::ThemeSet(m) => m.v,
         }
     }
 
@@ -538,11 +599,12 @@ impl Message {
             Message::SpawnDenied(_) => "spawn.denied",
             Message::SpawnExited(_) => "spawn.exited",
             Message::ConfigPush(_) => "config.push",
+            Message::ThemeSet(_) => "theme.set",
         }
     }
 
-    /// 所属五类之一：`hit` / `layer` / `input` / `spawn` / `config`
-    /// （type 的第一个 `.` 前段）。
+    /// 所属六类之一：`hit` / `layer` / `input` / `spawn` / `config` /
+    /// `theme`（type 的第一个 `.` 前段）。
     pub fn class(&self) -> &'static str {
         self.message_type().split('.').next().unwrap_or("")
     }
@@ -564,7 +626,8 @@ impl Message {
             | Message::LayerOpen(_)
             | Message::LayerPresent(_)
             | Message::InputHotkey(_)
-            | Message::SpawnRequest(_) => Direction::PluginToHost,
+            | Message::SpawnRequest(_)
+            | Message::ThemeSet(_) => Direction::PluginToHost,
             Message::LayerClose(_) => Direction::Both,
         }
     }
@@ -606,6 +669,33 @@ impl Message {
                 vec!["preview".into()],
                 BTreeMap::from([("new_window".into(), "cmd+n".into())]),
                 536_870_912,
+            )),
+            Message::ThemeSet(ThemeSet::new(
+                "solarized-dark",
+                "#002b36",
+                "#839496",
+                "#93a1a1",
+                "#073642",
+                102,
+                "#586e75",
+                [
+                    "#073642".into(),
+                    "#dc322f".into(),
+                    "#859900".into(),
+                    "#b58900".into(),
+                    "#268bd2".into(),
+                    "#d33682".into(),
+                    "#2aa198".into(),
+                    "#eee8d5".into(),
+                    "#002b36".into(),
+                    "#cb4b16".into(),
+                    "#586e75".into(),
+                    "#657b83".into(),
+                    "#839496".into(),
+                    "#6c71c4".into(),
+                    "#93a1a1".into(),
+                    "#fdf6e3".into(),
+                ],
             )),
         ]
     }

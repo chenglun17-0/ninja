@@ -3,8 +3,9 @@
 # 用本机可用代码签名身份对 .app 整体 codesign。
 #
 # 规则（对应 DISTRIBUTION.md）：
-# - 只打 ninja 宿主：bundle 不含 ninja-preview（PRODUCT：默认零插件，
-#   分发物不含预览，现 release 链路也不产该二进制）。
+# - 只打 ninja 宿主：bundle 不含 ninja-preview / ninja-theme（PRODUCT：
+#   默认零插件，分发物不含任何官方插件——主题插件也不进 DMG，换主题 =
+#   用户本地装插件，见 DISTRIBUTION.md）。
 # - 身份动态解析（security find-identity -v -p codesigning），优先
 #   Developer ID Application，其次 Apple Development；一个身份都没有
 #   = 直接失败，绝不静默回落 adhoc（假分发）。
@@ -22,7 +23,7 @@ VERSION="0.1.0"               # 与 workspace.package version 一致
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"
 
-echo "==> [1/4] cargo build --release -p ninja（仅宿主；ninja-preview 不进 bundle）"
+echo "==> [1/4] cargo build --release -p ninja（仅宿主；ninja-preview/ninja-theme 不进 bundle）"
 cargo build --release -p ninja
 
 # LSMinimumSystemVersion 取证依据：产物二进制的 LC_BUILD_VERSION minos
@@ -106,7 +107,7 @@ else
   echo "    spctl 不通过（非 Developer ID 签名）：已如实记录为分发残留"
 fi
 
-echo "==> bundle 内容清点（应只有 MacOS/ninja，无 ninja-preview）"
+echo "==> bundle 内容清点（应只有 MacOS/ninja，无 ninja-preview/ninja-theme）"
 find "$APP" -type f | sort
 
 echo "完成：${APP}（身份：${IDENTITY}）"

@@ -9,6 +9,8 @@
   帧格式: u32le(len) || UTF-8 JSON（len 只计 JSON 字节）
   信封:   每条消息必含 v 与 type；本实现支持 v=0
   规则:   v 不符 => 立即退出（不猜）；缺 v/type、坏帧 => 报错退出
+消息集: hit / layer / input / spawn / config / theme（theme 类为 T2
+  增补，见 ninja-protocol rustdoc「版本与演化规则」）
 输出: 每条消息一行 "type<TAB>v"，供调用方比对。
 """
 

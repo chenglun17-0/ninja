@@ -1,6 +1,6 @@
 [package]
 name = "ninja-protocol"
-description = "ADE 协议：五类消息 + 长度前缀 JSON 编解码（v/type 信封、版本门）"
+description = "ADE 协议：六类消息 + 长度前缀 JSON 编解码（v/type 信封、版本门）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

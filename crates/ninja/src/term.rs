@@ -113,6 +113,10 @@ pub struct TermState {
     /// 帧调用方那份 cells 缓存是否可信（上一次 frame_into 完整解码过）。
     /// 解码中途出错会置 false，防 Partial 帧拿到残缺缓存。
     cells_valid: bool,
+    /// T2 运行时换色板：强制下一帧全量重解码（cell 颜色在解码期经
+    /// vt 调色板解析成 RGB，缓存里的旧色不会自己变；见
+    /// [`TermState::apply_effective_palette`]）。
+    force_full_decode: bool,
 }
 
 impl TermState {
@@ -122,9 +126,9 @@ impl TermState {
             rows,
             max_scrollback,
         })?;
-        // T-主题：One Dark Pro 钉进 vt 核（默认前景/背景/光标 + ANSI 16
-        // 调色板；每 pane/窗口同一套）。失败只警告——主题是视觉问题，
-        // 不是启动门禁。
+        // T-主题：把当前生效色板钉进 vt 核（无插件覆盖 = One Dark Pro
+        // 基线；T2 起插件 theme.set 生效期间新开 pane 也生在插件色板下）。
+        // 失败只警告——主题是视觉问题，不是启动门禁。
         if !crate::theme::apply_to_terminal(&mut terminal) {
             eprintln!("ninja: One Dark Pro 主题钉入 vt 核失败（回落内置色）");
         }
@@ -137,6 +141,7 @@ impl TermState {
             terminal,
             row_scratch: Vec::new(),
             cells_valid: false,
+            force_full_decode: false,
         })
     }
 
@@ -264,6 +269,7 @@ impl TermState {
                 rows,
                 cells,
                 row_scratch,
+                force_full_decode,
                 ..
             } = self;
             let snapshot = render_state.update(terminal)?;
@@ -273,6 +279,12 @@ impl TermState {
             frame.fg = colors.foreground.into();
             frame.bg = colors.background.into();
             frame.dirty = snapshot.dirty()?;
+            // T2 换色板：vt 侧不把「调色板/默认色变了」标脏（同 OSC
+            // 10/11 的 Clean 语义），但屏幕上每个已解析颜色的 cell 都
+            // 要重出——强制 Full：全量重解码 + 渲染器必画（跳帧不吃）。
+            if *force_full_decode {
+                frame.dirty = Dirty::Full;
+            }
             frame.cursor_blinking = snapshot.cursor_blinking()?;
             frame.cursor_style = snapshot.cursor_visual_style()?;
             frame.cursor = snapshot.cursor_viewport()?.map(|c| CursorView {
@@ -326,7 +338,23 @@ impl TermState {
             snapshot.set_dirty(Dirty::Clean)?;
         }
         self.cells_valid = true;
+        self.force_full_decode = false;
         Ok(())
+    }
+
+    /// T2 运行时换色板：把**当前生效色板**（[`crate::theme::current`]）
+    /// 重钉进 vt 核 + 强制下一帧全量重解码。theme.set 应用与插件死亡/
+    /// 禁用回退时对每个存活 pane 各调一次（接线在 view 的
+    /// `apply_theme_all`）。OSC 10/11 查询应答随 vt 默认色自动跟随。
+    pub fn apply_effective_palette(&mut self) {
+        let pal = crate::theme::current();
+        if !crate::theme::apply_palette_to(&mut self.terminal, &pal) {
+            eprintln!(
+                "ninja: 色板 {:?} 钉入 vt 核失败（保持原色；仅警告）",
+                pal.name
+            );
+        }
+        self.force_full_decode = true;
     }
 }
 

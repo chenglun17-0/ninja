@@ -8,7 +8,7 @@
 
 | 脚本 | 产物 | 做什么 |
 | --- | --- | --- |
-| `scripts/package_app.sh` | `dist/Ninja.app` | `cargo build --release -p ninja`（仅宿主，**不打 ninja-preview**）→ 组 bundle → `codesign --force --identifier dev.ninja.ninja --options runtime` → `--verify --deep --strict` 自检 |
+| `scripts/package_app.sh` | `dist/Ninja.app` | `cargo build --release -p ninja`（仅宿主，**不打 ninja-preview/ninja-theme**）→ 组 bundle → `codesign --force --identifier dev.ninja.ninja --options runtime` → `--verify --deep --strict` 自检 |
 | `scripts/package_dmg.sh` | `dist/Ninja-0.1.0-arm64.dmg` | staging（Ninja.app + `/Applications` 符号链接，拖拽安装）→ `hdiutil UDZO` → 挂卷验签/清点自检 |
 
 - `dist/` 已入 `.gitignore`；脚本在 `scripts/`（tracked；`tools/` 整目录被忽略故不放那）。
@@ -68,6 +68,19 @@ cp target/release/ninja-preview ~/.config/ninja/plugins/preview
 
 启用 ≠ 常驻：首次 Cmd+点击路径时才拉起进程（PRODUCT 规则，p5 起即如此）。
 
+**主题插件同理**（T2 官方示例 ninja-theme，亦不随 .app 分发；换主题 =
+装插件，PRODUCT「颜色」原语）：
+
+```sh
+cargo build --release -p ninja-theme
+cp target/release/ninja-theme ~/.config/ninja/plugins/theme
+# ninja.toml：enabled = ["theme"]（色板可选：env NINJA_THEME=one-light |
+# solarized-dark | solarized-light，缺省 solarized-dark）
+```
+
+插件换色期间杀掉/禁用插件，宿主自动回退内置 One Dark Pro 基线（与 p6
+收层同语义）；分发物本身永远零插件。
+
 **卸载**：
 
 1. `ninja.toml` 里把名字移出 `enabled`（或清空该表）——已跑着的会话用 p6 的禁用
@@ -92,4 +105,5 @@ spctl -a -vv dist/Ninja.app                            # 预期不通过（非 D
 - `HOME=<临时目录>` 启动 → 正常（配置路径机器无关）；
 - `~/.config/ninja/plugins/preview` + `enabled=["preview"]` → 首击拉起（`NINJA_P4_HIT`
   钩子触发）；禁用（p6 钩子 `NINJA_P6_PLUGIN_FILE`）+ 删文件 → 无进程/无 socket 残留；
-- bundle 与 DMG 内均无 `ninja-preview`（`Contents/` 只有 `MacOS/ninja` + `Info.plist`）。
+- bundle 与 DMG 内均无 `ninja-preview`/`ninja-theme`（`Contents/` 只有 `MacOS/ninja` +
+  `Info.plist`；T2 后复跑仍零插件）。

@@ -25,10 +25,12 @@ use objc2_quartz_core::CALayer;
 use crate::config::Config;
 use crate::view::TerminalView;
 
-/// T-主题：容器底色（One Dark Pro editor.background #282c34）。
-/// sRGB 分量直接从 [`crate::theme`] 常量换算，两处 drawRect 共用。
+/// T-主题/T2：容器底色 = **当前生效色板**背景（无插件覆盖 = One
+/// Dark Pro editor.background #282c34；插件 theme.set 生效期间随插件
+/// 色板——drawRect 每次现读 [`crate::theme::current`]，非编译期常量）。
+/// 两处 drawRect 共用。
 pub fn theme_background_color() -> Retained<NSColor> {
-    let c = crate::theme::BACKGROUND;
+    let c = crate::theme::current().bg;
     NSColor::colorWithSRGBRed_green_blue_alpha(
         f64::from(c.0) / 255.0,
         f64::from(c.1) / 255.0,
@@ -37,9 +39,10 @@ pub fn theme_background_color() -> Retained<NSColor> {
     )
 }
 
-/// T-主题：分隔条 1px 线（One Dark Pro panel.border/focusBorder #3e4452）。
+/// T-主题/T2：分隔条 1px 线 = 生效色板分隔色（基线 = One Dark Pro
+/// panel.border/focusBorder #3e4452）。
 pub fn theme_divider_color() -> Retained<NSColor> {
-    let c = crate::theme::DIVIDER;
+    let c = crate::theme::current().divider;
     NSColor::colorWithSRGBRed_green_blue_alpha(
         f64::from(c.0) / 255.0,
         f64::from(c.1) / 255.0,
@@ -253,6 +256,29 @@ define_class!(
 // Rust 接口
 // ---------------------------------------------------------------------------
 
+/// T2 换色板：容器chrome（焦点环边色 + 分隔条/底色 drawRect）跟随生效
+/// 色板重刷。由 TerminalView::apply_theme 经 superview 链调用（叶子
+/// 面的直接 superview 即本容器；分隔条是本容器子视图）。
+pub fn refresh_container_theme(container: &NSView) {
+    // 焦点环是 CALayer 边框，setNeedsDisplay 不会重设它的颜色。
+    // SAFETY: isKindOfClass: 任意 NSObject 可查。
+    let is_c: bool =
+        unsafe { objc2::msg_send![container, isKindOfClass: PaneContainer::class()] };
+    if is_c {
+        // SAFETY: 通过类型检查后的上转。
+        let c: &PaneContainer = unsafe { &*(std::ptr::from_ref(container) as *const PaneContainer) };
+        if let Some(ring) = c.ivars().ring.borrow().as_ref() {
+            ring.update_border_color();
+        }
+    }
+    // 容器底色与分隔条都在 drawRect 里现读生效色板：标记重画即可。
+    container.setNeedsDisplay(true);
+    let subs = container.subviews();
+    for s in subs.iter() {
+        s.setNeedsDisplay(true);
+    }
+}
+
 /// TerminalView（NSView 子类）→ NSResponder 引用（makeFirstResponder 用）。
 fn as_responder(v: &TerminalView) -> &NSResponder {
     v.as_super().as_super()
@@ -263,7 +289,7 @@ impl PaneContainer {
     pub fn new(mtm: MainThreadMarker, config: &Config) -> Retained<Self> {
         let first = TerminalView::new(mtm, config);
         let frame = first.frame();
-        let ring = FocusRingView::new(mtm, config.cursor);
+        let ring = FocusRingView::new(mtm, config.cursor.unwrap_or_else(|| crate::theme::current().cursor));
 
         let this = PaneContainer::alloc(mtm).set_ivars(Ivars {
             config: config.clone(),
@@ -926,6 +952,27 @@ impl FocusRingView {
         }
         view.setLayer(Some(&layer));
         view
+    }
+
+    /// T2 换色板：边框色重设为当前生效色板的光标色（基线 = ODP
+    /// #528bff；建环时的初始色与此同源）。
+    fn update_border_color(&self) {
+        let Some(layer) = self.layer() else { return };
+        let color = crate::theme::current().cursor;
+        // SAFETY: 同 new（sRGB 空间 CGColorCreate）。
+        unsafe {
+            if let Some(space) = objc2_core_graphics::CGColorSpace::new_device_rgb() {
+                let comps: [f64; 4] = [
+                    f64::from(color.0) / 255.0,
+                    f64::from(color.1) / 255.0,
+                    f64::from(color.2) / 255.0,
+                    0.9,
+                ];
+                if let Some(c) = CGColor::new(Some(&*space), comps.as_ptr()) {
+                    layer.setBorderColor(Some(c.as_ref()));
+                }
+            }
+        }
     }
 }
 

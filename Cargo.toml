@@ -4,6 +4,7 @@ members = [
     "crates/ninja",
     "crates/ninja-protocol",
     "crates/ninja-preview",
+    "crates/ninja-theme",
 ]
 
 [workspace.package]

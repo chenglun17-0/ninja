@@ -699,10 +699,10 @@ impl TerminalView {
         )
         .expect("Metal renderer init");
         // 主题色从配置注入（T-主题：默认 = One Dark Pro，见 theme.rs；
-        // [theme] TOML 是字段级覆盖，不是主题切换）。
+        // [theme] TOML 是字段级覆盖，不是主题切换。T2：None = 跟随
+        // 当前生效色板——插件 theme.set 换色板时选区/光标随之变化）。
         renderer.theme = Theme {
             selection_bg: config.selection_bg,
-            selection_alpha: crate::theme::SELECTION_ALPHA,
             cursor: config.cursor,
         };
 
@@ -755,6 +755,7 @@ impl TerminalView {
             .inner
             .clone();
         install_wake(&view, &pty_inner);
+        register_for_theme(&view);
         // D1 修复（启动期唤醒注册竞态，p2 保留）：Pty::spawn 在上面、
         // 唤醒闭包注册在 install_wake 里，中间隔着 Renderer::new 的
         // 运行时着色器编译——快 shell 的首批 PTY 字节可能在闭包未就位时
@@ -1160,6 +1161,8 @@ impl TerminalView {
     ///    有人调本 pane 的唤醒闭包）；3. 摘 runloop source（info 与
     ///    source 本体泄漏不 free，见 WakeInfo）；4. 放渲染器。
     pub fn shutdown(&self) {
+        // T2：先从主题重画登记表摘除（后续换色板/回退不再碰本 view）。
+        unregister_for_theme(self);
         // p5：pane 收尾先收层（还有插件连接可通知；指针纪律：层注册表
         // 里的 view 指针自此不再被解引用）。
         plugins::host_close_layers_of_pane(self.pane_id());
@@ -1203,6 +1206,64 @@ impl TerminalView {
 /// 预编辑文本的占格宽计数（末尾定位用）。
 fn count_width_cells(c: char) -> u32 {
     u32::from(libghostty_vt::unicode::codepoint_width(c).max(1))
+}
+
+// ---------------------------------------------------------------------------
+// T2 主题重画登记表：换色板时找到所有存活终端面
+// ---------------------------------------------------------------------------
+
+/// 存活 TerminalView 裸指针登记表（主线程碰；纪律同 layer 注册表：
+/// view shutdown 首行先摘，指针不悬空）。static Mutex 只为满足 static
+/// 要求。
+static THEME_VIEWS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// view 建立时登记（TerminalView::new 尾部）。
+fn register_for_theme(view: &TerminalView) {
+    if let Ok(mut v) = THEME_VIEWS.lock() {
+        v.push(std::ptr::from_ref(view) as usize);
+    }
+}
+
+/// view 收尾时摘除（shutdown 首行）。
+fn unregister_for_theme(view: &TerminalView) {
+    let p = std::ptr::from_ref(view) as usize;
+    if let Ok(mut v) = THEME_VIEWS.lock() {
+        v.retain(|&x| x != p);
+    }
+}
+
+/// T2 换色板落地入口（plugins.rs 的 theme.set 处置与回退路径调）：
+/// 每个存活 pane 重钉 vt 色板（含强制全量重解码，跳帧不吃）+ 重画 +
+/// 容器 chrome（底色/分隔条/焦点环）刷新。只能在主线程调（插件帧处置
+/// 本就在主线程）。
+pub fn apply_theme_all() {
+    let views = match THEME_VIEWS.lock() {
+        Ok(v) => v.clone(),
+        Err(_) => return,
+    };
+    for p in views {
+        // SAFETY: 指针由 register_for_theme 在主线程登记；shutdown 首行
+        // 摘除，本函数只在主线程调，指针不悬空。
+        let view: &TerminalView = unsafe { &*(p as *const TerminalView) };
+        view.apply_theme();
+    }
+}
+
+impl TerminalView {
+    /// 单面换色：vt 重钉 + 全量重解码 + 重画 + superview 容器chrome刷新。
+    fn apply_theme(&self) {
+        {
+            let mut st = self.state();
+            st.term.apply_effective_palette();
+        }
+        self.render_now();
+        // SAFETY: 主线程 NSView 读 superview（本 view 直接 superview 即
+        // PaneContainer；叶子/分隔条都是它的子视图）。
+        let sup = unsafe { self.superview() };
+        if let Some(sup) = sup {
+            crate::pane::refresh_container_theme(&sup);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

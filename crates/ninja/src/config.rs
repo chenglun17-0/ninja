@@ -139,10 +139,11 @@ pub struct Config {
     /// None = 内置默认等宽（Menlo）。
     pub font_family: Option<String>,
     pub font_size_pt: f64,
-    /// 主题色（T-主题：One Dark Pro 官方值钉在 [`crate::theme`]，
-    /// 这两个是 p2 既有的字段级覆盖入口）。
-    pub selection_bg: Rgb,
-    pub cursor: Rgb,
+    /// 主题色（T-主题：One Dark Pro 官方值钉在 [`crate::theme`]；这两个
+    /// 是 p2 既有的字段级覆盖入口）。None = 未覆盖（跟随当前生效色板
+    /// ——内置 ODP 基线或 T2 插件覆盖）。
+    pub selection_bg: Option<Rgb>,
+    pub cursor: Option<Rgb>,
     /// 动作名 → 键绑定（含全部默认，缺项由默认表补齐）。
     pub keys: HashMap<String, KeyBinding>,
     /// p3：插件开关。默认空 = 关（空载不建 socket、不拉进程）。
@@ -155,8 +156,8 @@ impl Default for Config {
             shell: None,
             font_family: None,
             font_size_pt: 13.0,
-            selection_bg: crate::theme::SELECTION_BG,
-            cursor: crate::theme::CURSOR,
+            selection_bg: None,
+            cursor: None,
             keys: default_keys(),
             plugins: PluginsConfig::default(),
         }
@@ -257,13 +258,13 @@ impl Config {
         }
         if let Some(s) = parsed.theme.selection_bg {
             match parse_rgb(&s) {
-                Some(c) => cfg.selection_bg = c,
+                Some(c) => cfg.selection_bg = Some(c),
                 None => eprintln!("ninja: theme.selection_bg {s:?} 解析失败，用默认值"),
             }
         }
         if let Some(s) = parsed.theme.cursor {
             match parse_rgb(&s) {
-                Some(c) => cfg.cursor = c,
+                Some(c) => cfg.cursor = Some(c),
                 None => eprintln!("ninja: theme.cursor {s:?} 解析失败，用默认值"),
             }
         }
@@ -353,7 +354,8 @@ pub fn default_toml() -> String {
     s.push_str("# font-size = 13.0\n\n");
     s.push_str("[theme]\n");
     s.push_str("# 默认 = One Dark Pro（官方色板钉死在代码，见 theme.rs）；\n");
-    s.push_str("# selection-bg = \"#ABB2BF\"   # 官方 #abb2bf30 带alpha，覆盖只换 RGB 不换alpha\n");
+    s.push_str("# 换主题不是配置面的事：装插件（如官方 ninja-theme）经协议 theme.set 换全色板\n");
+    s.push_str("# selection-bg = \"#ABB2BF\"   # 官方 #abb2bf30 带alpha，字段级覆盖只换 RGB 不换alpha\n");
     s.push_str("# cursor = \"#528BFF\"\n\n");
     s.push_str("[keys]\n");
     s.push_str("# new_window = \"cmd+n\"\n");
@@ -435,8 +437,8 @@ focus_down = "not a key"
         assert_eq!(c.shell.as_deref(), Some("/bin/zsh"));
         assert_eq!(c.font_family.as_deref(), Some("JetBrains Mono"));
         assert_eq!(c.font_size_pt, 14.5);
-        assert_eq!(c.selection_bg, Rgb(0x10, 0x10, 0x10));
-        assert_eq!(c.cursor, Rgb(0xFF, 0x00, 0x00));
+        assert_eq!(c.selection_bg, Some(Rgb(0x10, 0x10, 0x10)));
+        assert_eq!(c.cursor, Some(Rgb(0xFF, 0x00, 0x00)));
         assert_eq!(
             c.keys[&"split_right".to_string()].flags(),
             MASK_CTRL | MASK_CMD

@@ -1,9 +1,9 @@
-//! p3 契约测试：五类消息全覆盖。
+//! p3 契约测试：六类消息全覆盖（theme 类为 T2 增补）。
 //!
-//! - 往返：sample → JSON → 解码 == 原值（16 条全量）。
+//! - 往返：sample → JSON → 解码 == 原值（17 条全量）。
 //! - golden：每条消息与 tests/golden/<type>.json 字节一致（钉死线格式，
 //!   第二语言实现的参照物；再生成见 examples/dump_messages.rs）。
-//! - 信封不变量：每条序列化必含 `"v":0` 与 `"type":<type>`；五类各至少
+//! - 信封不变量：每条序列化必含 `"v":0` 与 `"type":<type>`；六类各至少
 //!   一条；KNOWN_TYPES 与枚举一一对应。
 //! - 策略：宿主 lenient（未知字段忽略）；版本门（v 不符 → 不猜）；
 //!   未知 type / 缺 v / 缺 type / 坏 JSON 的错误分类。
@@ -20,11 +20,11 @@ fn goldens_dir() -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn five_classes_all_covered() {
+fn six_classes_all_covered() {
     let samples = Message::sample_messages();
     assert_eq!(samples.len(), KNOWN_TYPES.len(), "每条消息一个样例");
-    for class in ["hit", "layer", "input", "spawn", "config"] {
-        assert!(samples.iter().any(|m| m.class() == class), "五类缺 {class}");
+    for class in ["hit", "layer", "input", "spawn", "config", "theme"] {
+        assert!(samples.iter().any(|m| m.class() == class), "六类缺 {class}");
     }
     for (m, ty) in samples.iter().zip(KNOWN_TYPES) {
         assert_eq!(m.message_type(), *ty);
@@ -115,6 +115,43 @@ fn host_decode_ignores_unknown_fields() {
         }
         other => panic!("应解出 hit，得到 {:?}", other.message_type()),
     }
+}
+
+#[test]
+fn theme_set_decode_contract() {
+    // T2：theme.set 是唯一携带色板的消息。lenient：未知字段照收。
+    let json = r##"{"type":"theme.set","v":0,"name":"x","bg":"#002b36","fg":"#839496","cursor":"#93a1a1","selection_bg":"#073642","selection_alpha":102,"divider":"#586e75","ansi":["#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000"],"future":1}"##;
+    match Message::decode_host(json.as_bytes()).unwrap() {
+        Message::ThemeSet(t) => {
+            assert_eq!(t.name, "x");
+            assert_eq!(t.bg, "#002b36");
+            assert_eq!(t.selection_alpha, 102);
+            assert_eq!(t.ansi.len(), 16);
+            assert_eq!(t.ansi[15], "#000000");
+            assert_eq!(Message::ThemeSet(t).direction(), Direction::PluginToHost);
+        }
+        other => panic!("应解出 theme.set，得到 {:?}", other.message_type()),
+    }
+    // ansi 必须「恰好 16 个」：短写/长写都是解码错误（不猜）。
+    let mk = |n: usize| {
+        let ansi: Vec<String> = (0..n).map(|_| "#000000".to_string()).collect();
+        format!(
+            r##"{{"type":"theme.set","v":0,"name":"x","bg":"#0","fg":"#0","cursor":"#0","selection_bg":"#0","selection_alpha":1,"divider":"#0","ansi":{:?}}}"##,
+            ansi
+        )
+    };
+    for bad in [mk(15), mk(17)] {
+        assert!(
+            matches!(Message::from_json(&bad), Err(DecodeError::InvalidJson(_))),
+            "ansi 长度不是 16 必须拒收：{bad}"
+        );
+    }
+    // 缺必填字段（如 divider）同理拒收。
+    let missing = r##"{"type":"theme.set","v":0,"name":"x","bg":"#0","fg":"#0","cursor":"#0","selection_bg":"#0","selection_alpha":1,"ansi":["#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000"]}"##;
+    assert!(matches!(
+        Message::from_json(missing),
+        Err(DecodeError::InvalidJson(_))
+    ));
 }
 
 #[test]

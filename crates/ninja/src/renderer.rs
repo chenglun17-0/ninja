@@ -85,15 +85,16 @@ fragment float4 layer_fs(
 }
 "#;
 
-/// 渲染主题色（T-主题：默认 = One Dark Pro，官方色板钉在 [`crate::theme`]；
-/// 选区/光标仍可经 p2 既有的 [theme] TOML 字段覆盖——字段级配置，
-/// 不是主题系统）。
+/// 渲染主题覆盖（T-主题/T2：**字段级** TOML 覆盖，不是主题系统）。
+/// None = 跟随**当前生效色板**（[`crate::theme::current`]：内置 One
+/// Dark Pro 基线，或插件 theme.set 覆盖——渲染读它而非编译期常量，
+/// 换色板即生效）。选区 alpha 永远来自生效色板（ODP 基线 = 官方
+/// `#abb2bf30` 的 0x30）。
 pub struct Theme {
-    pub selection_bg: Rgb,
-    /// 选区 alpha：官方 terminal.selectionBackground `#abb2bf30` 的
-    /// 0x30（TOML 覆盖 selection_bg 时仍用这个 alpha）。
-    pub selection_alpha: f32,
-    pub cursor: Rgb,
+    /// `[theme] selection-bg` 覆盖；None = 生效色板的选区色。
+    pub selection_bg: Option<Rgb>,
+    /// `[theme] cursor` 覆盖；None = 生效色板的光标色。
+    pub cursor: Option<Rgb>,
 }
 
 /// p5 层的渲染快照（layer::draw_list 产出）：纹理（IOSurface 包裹）
@@ -106,10 +107,10 @@ pub struct LayerDraw {
 
 impl Default for Theme {
     fn default() -> Self {
+        // 空 = 全跟随生效色板（ODP 基线下的所见 = T1 行为不变）。
         Self {
-            selection_bg: crate::theme::SELECTION_BG,
-            selection_alpha: crate::theme::SELECTION_ALPHA,
-            cursor: crate::theme::CURSOR,
+            selection_bg: None,
+            cursor: None,
         }
     }
 }
@@ -677,7 +678,7 @@ impl Renderer {
 
             if bg != default_bg || selected || cursor_block {
                 let bg_color = if cursor_block {
-                    rgb_to_f32s(self.theme.cursor)
+                    rgb_to_f32s(self.effective_cursor())
                 } else {
                     bg
                 };
@@ -740,7 +741,7 @@ impl Renderer {
         if let Some(c) = frame.cursor {
             let x0 = f64::from(c.x) * cw;
             let y0 = f64::from(c.y) * ch;
-            let color = rgb_to_f32s(self.theme.cursor);
+            let color = rgb_to_f32s(self.effective_cursor());
             match frame.cursor_style {
                 CursorVisualStyle::Bar => {
                     push_quad(verts, white, edge, x0, y0, 2.0, ch, color);
@@ -760,13 +761,19 @@ impl Renderer {
         }
     }
 
-    /// 选区 quad 色：官方 terminal.selectionBackground `#abb2bf30` =
-    /// 前景色 + 0x30 alpha（管线已开 alpha 混合，盖在背景上即官方
-    /// 合成效果；TOML 覆盖 selection_bg 时仍是这个 alpha）。
+    /// 选区 quad 色：生效色板的选区色 + alpha（ODP 基线 = 官方
+    /// terminal.selectionBackground `#abb2bf30` = 前景 #abb2bf + 0x30
+    /// alpha；TOML 覆盖只换 RGB；插件换色板则整套跟随插件值）。
     fn selection_rgba(&self) -> [f32; 4] {
-        let mut c = rgb_to_f32s(self.theme.selection_bg);
-        c[3] = self.theme.selection_alpha;
+        let pal = crate::theme::current();
+        let mut c = rgb_to_f32s(self.theme.selection_bg.unwrap_or(pal.selection_bg));
+        c[3] = f32::from(pal.selection_alpha) / 255.0;
         c
+    }
+
+    /// 当前生效光标色（TOML 覆盖优先；否则生效色板）。
+    fn effective_cursor(&self) -> Rgb {
+        self.theme.cursor.unwrap_or_else(|| crate::theme::current().cursor)
     }
 
     /// 把 atlas 的 pending 槽位写入纹理（CPU 侧立即写入，Shared 存储；

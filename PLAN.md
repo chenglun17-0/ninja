@@ -51,7 +51,7 @@ p0 核与仓库
 
 ### p3 ADE 协议
 
-盘点：五类消息的 JSON schema；未知字段 / 版本失败策略。
+盘点：消息的 JSON schema（v0 六类：hit/layer/input/spawn/config/theme）；未知字段 / 版本失败策略。
 
 做：`ninja-protocol` 编解码与契约测试。宿主只在启用插件时听 Unix socket。空载不创建 socket、不拉进程。
 

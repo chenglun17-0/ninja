@@ -28,6 +28,13 @@
 //! `layer.close`（双向）→ 摘层还焦点。层打开期间主 runloop 上挂一个
 //! 150ms 轮询 timer 消化插件异步消息（pump；无层时不存在，空载零开销）。
 //!
+//! T2 主题原语：插件可推 `theme.set` 换全色板（协议 theme 类，2026-08
+//! 用户产品决策）。宿主侧运行时覆盖点在 [`crate::theme`]（渲染/vt/容器
+//! 全读「当前生效色板」）；应用即全屏重画（vt 强制 Full 脏，跳帧不吃）；
+//! 拥有者连接死亡/禁用 = 回退内置 One Dark Pro 基线（与 p6 收层同语义，
+//! 见 [`PluginHost::drop_conn`]/[`PluginHost::shutdown`]）。覆盖生效期间
+//! 泵 timer 不停（盯连接死亡，无层也盯）。
+//!
 //! 超时策略：**同步短超时**——claim 汇集 [`HIT_REPLY_TIMEOUT`]（500ms），
 //! 层握手 [`LAYER_HANDSHAKE_TIMEOUT`]（1.5s，只在有插件认领时进入）；
 //! 都发生在点击手势路径上的一次性开销，不新增常驻线程；超预算即降级，
@@ -40,7 +47,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use ninja_protocol::frame::{FrameDecoder, encode_frame};
-use ninja_protocol::{Hit, InputKey, LayerClose, Message, Modifier};
+use ninja_protocol::{Hit, InputKey, LayerClose, Message, Modifier, ThemeSet};
 
 use crate::layer::{self, LayerGeom};
 
@@ -504,6 +511,12 @@ impl PluginHost {
                                     Ok(Message::HitIgnore(m)) if m.id == hit.id => {
                                         responded[i] = true;
                                     }
+                                    Ok(Message::ThemeSet(m)) => {
+                                        // T2：连接后插件随时可推 theme.set
+                                        //（官方 ninja-theme 连上即推；冷
+                                        // 启动窗口内常在 hit 回执前到）。
+                                        Self::handle_theme_set(&m, c.id);
+                                    }
                                     Ok(_) => {} // 其余消息/别的 id：先记下，握手阶段消化
                                     Err(_) => {
                                         // 坏协议（版本/JSON）：断开，视为 ignore
@@ -668,6 +681,11 @@ impl PluginHost {
                 stop_pump_timer_if_idle();
                 HandshakeStep::Continue
             }
+            Ok(Message::ThemeSet(m)) => {
+                // 插件在层握手期间也可推色板（认领型插件顺带换色）。
+                Self::handle_theme_set(&m, conn_id);
+                HandshakeStep::Continue
+            }
             Ok(_) => HandshakeStep::Continue, // 别的 id / 别的消息：握手期忽略
             Err(_) => HandshakeStep::Dead, // 坏协议：断（p3 契约）
         }
@@ -681,6 +699,7 @@ impl PluginHost {
         let mut i = 0;
         while i < self.conns.len() {
             let conn = &mut self.conns[i];
+            let conn_id = conn.id;
             if conn.stream.set_read_timeout(Some(Duration::from_millis(1))).is_err() {
                 self.drop_conn(i);
                 continue;
@@ -706,6 +725,10 @@ impl PluginHost {
                                 Ok(Message::LayerClose(m)) => {
                                     for _ in layer::close(m.layer) {}
                                     stop_pump_timer_if_idle();
+                                }
+                                Ok(Message::ThemeSet(m)) => {
+                                    // T2：覆盖生效期间插件可再推色板换色。
+                                    Self::handle_theme_set(&m, conn_id);
                                 }
                                 Ok(_) => {}
                                 Err(_) => dead = true,
@@ -744,6 +767,8 @@ impl PluginHost {
     /// 不摘则层永久残留且 `any_layers()` 恒真 → 泉 timer 永不停转，
     /// 只能靠用户 Esc 兑底）+ 无层时停泵。`layer::close_by_conn`
     /// 内部对受影响 pane 重画（无主层不再有别的重画时机）。
+    /// T2：该连接若拥有色板覆盖 → 回退内置 ODP 基线并重画（与 p6
+    /// 收层同语义：插件死了它的视觉贡献不能残留）。
     fn drop_conn(&mut self, idx: usize) {
         let Some(c) = self.conns.get(idx) else {
             return;
@@ -753,7 +778,31 @@ impl PluginHost {
         if !layer::close_by_conn(conn_id).is_empty() {
             ade_debug(&format!("conn {conn_id} 死亡：已回收其全部层"));
         }
+        if crate::theme::revoke_owner(conn_id) {
+            eprintln!("ninja: 主题插件连接 {conn_id} 死亡，色板回退内置 One Dark Pro 基线");
+            crate::view::apply_theme_all();
+        }
         stop_pump_timer_if_idle();
+    }
+
+    /// T2：theme.set 处置。色值语义坏（格式/alpha 越界）→ 警告 + 整条
+    /// 忽略（不断连：坏的是值不是协议）；有效 → 全局覆盖点落地 +
+    /// 全部终端面重钉色板重画（vt 侧强制 Full 脏，跳帧不吃全屏换色）
+    /// + 起泵（覆盖生效期间必须盯该连接，死亡即回退基线）。
+    fn handle_theme_set(m: &ThemeSet, conn_id: u64) {
+        match crate::theme::palette_from_wire(m) {
+            Some(p) => {
+                if crate::theme::apply_plugin(p, conn_id) {
+                    eprintln!("ninja: 主题插件已换色板 {:?}（conn {conn_id}）", m.name);
+                    crate::view::apply_theme_all();
+                    ensure_pump_timer();
+                }
+            }
+            None => eprintln!(
+                "ninja: theme.set 色板无效（conn {conn_id}，name={:?}），整条忽略",
+                m.name
+            ),
+        }
     }
 
     /// 按连接 id 发消息（input.key / layer.close 回程）。找不到连接
@@ -806,6 +855,12 @@ impl PluginHost {
             return; // 幂等
         }
         self.disabled = true;
+        // T2：禁用 = 插件能力全回收，色板覆盖一并回退内置基线（与
+        // p6 收层同一语义；再启用后由插件重新推 theme.set 才会再覆盖）。
+        if crate::theme::revoke_all() {
+            eprintln!("ninja: 插件禁用，色板回退内置 One Dark Pro 基线");
+            crate::view::apply_theme_all();
+        }
         for (handle, conn, _pane) in layer::close_all() {
             let _ = self.send_to_conn(conn, &Message::LayerClose(LayerClose::new(handle)));
         }
@@ -891,8 +946,8 @@ fn ensure_pump_timer() {
 
 /// 停泵（幂等）：最后一个层关闭后由 pump/close 路径调用。
 fn stop_pump_timer_if_idle() {
-    if layer::any_layers() {
-        return;
+    if layer::any_layers() || crate::theme::override_active() {
+        return; // 还有层要合成 / 还有色板覆盖要盯（拥有者死亡即回退）
     }
     if let Ok(mut slot) = PUMP_TIMER.lock() {
         if let Some(t) = slot.0.take() {
@@ -911,7 +966,7 @@ fn stop_pump_timer_if_idle() {
 
 /// 泵入口（timer 回调直调；测试可直调）。
 pub fn pump_now() {
-    if !layer::any_layers() {
+    if !layer::any_layers() && !crate::theme::override_active() {
         stop_pump_timer_if_idle();
         return;
     }
@@ -1067,6 +1122,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 协议样例里的 theme.set（solarized-dark，与 golden 同值）。
+    fn sample_theme_set() -> ninja_protocol::ThemeSet {
+        Message::sample_messages()
+            .into_iter()
+            .find_map(|m| match m {
+                Message::ThemeSet(t) => Some(t),
+                _ => None,
+            })
+            .expect("sample 集含 theme.set")
     }
 
     #[test]
@@ -1596,6 +1662,70 @@ mod tests {
         assert!(sock.exists(), "再启用应重绑同一路径");
         again.shutdown();
         assert!(!sock.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2：theme.set 的宿主处置链（进程内对端，不拉真实插件进程）：
+    /// 1) 插件连接推 theme.set → 覆盖生效（current() = 插件色板）；
+    /// 2) 坏色板（格式错）→ 整条忽略且**不断连**；
+    /// 3) 对端死亡（EOF）→ 泵摘连接 + 色板回退 ODP 基线（p6 同语义）。
+    /// （视图层重钉/重画由 view::apply_theme_all 完成，本测试进程无
+    /// 窗口 view = 空转；vt 链路已由 theme.rs 单测覆盖。）
+    #[test]
+    fn theme_set_applies_and_reverts_on_conn_death() {
+        use ninja_protocol::ThemeSet;
+        let _g = crate::theme::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = sandbox("themeset");
+        let sock = dir.join("a.sock");
+        let mut host = PluginHost::bind(sock.clone(), PluginsConfig::default()).expect("bind");
+
+        // 对端：连上 → 先推坏色板（应被忽略）→ 再推好色板 → 等宿主消化
+        //（重试对齐宿主泵拍）→ 断开（= 插件死亡）。
+        let peer = thread::spawn(move || {
+            let mut s = UnixStream::connect(&sock).expect("peer connect");
+            let mut bad = sample_theme_set();
+            bad.bg = "#nope!".into();
+            s.write_all(&encode_frame(&Message::ThemeSet(bad)).unwrap())
+                .unwrap();
+            let good = sample_theme_set();
+            s.write_all(&encode_frame(&Message::ThemeSet(good)).unwrap())
+                .unwrap();
+            // 给宿主时间消化（宿主泵由测试直调，这里只保连接活着）。
+            thread::sleep(Duration::from_millis(400));
+            drop(s); // EOF = 插件死亡
+        });
+        thread::sleep(Duration::from_millis(150));
+        host.pump_plugins(); // accept + 消化两帧
+
+        // 好色板生效（solarized-dark bg #002b36）；坏的那条没生效也没断连。
+        let cur = crate::theme::current();
+        assert_eq!(cur.bg, crate::term::Rgb(0x00, 0x2B, 0x36), "theme.set 应生效");
+        assert_eq!(cur.name, "solarized-dark");
+        assert!(crate::theme::override_active());
+        assert_eq!(host.conns.len(), 1, "坏色板不得断连（忽略的是值不是协议）");
+
+        // 对端死亡 → 泵摘连接 → 回退 ODP。
+        peer.join().unwrap();
+        let mut reverted = false;
+        for _ in 0..40 {
+            host.pump_plugins();
+            if host.conns.is_empty() {
+                reverted = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(reverted, "泵应摘掉死亡对端连接");
+        assert!(!crate::theme::override_active(), "连接死亡必须回退基线");
+        assert_eq!(crate::theme::current(), crate::theme::one_dark_pro());
+
+        // shutdown 路径兜底：覆盖存在时禁用 → 回退（幂等）。
+        let pal = crate::theme::palette_from_wire(&sample_theme_set()).unwrap();
+        assert!(crate::theme::apply_plugin(pal, 42));
+        host.shutdown();
+        assert!(!crate::theme::override_active(), "禁用必须回收色板覆盖");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

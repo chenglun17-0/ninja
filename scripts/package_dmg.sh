@@ -35,6 +35,7 @@ codesign --verify --deep --strict --verbose=2 "$MNT/Ninja.app"
 find "$MNT" -mindepth 1 -maxdepth 1 | sort
 [[ -f "$MNT/Ninja.app/Contents/MacOS/ninja" ]] || { echo "错误：DMG 内缺宿主二进制" >&2; hdiutil detach "$MNT" >/dev/null; exit 1; }
 [[ ! -e "$MNT/Ninja.app/Contents/MacOS/ninja-preview" ]] || { echo "错误：DMG 内进了 ninja-preview（违反默认零插件）" >&2; hdiutil detach "$MNT" >/dev/null; exit 1; }
+[[ ! -e "$MNT/Ninja.app/Contents/MacOS/ninja-theme" ]] || { echo "错误：DMG 内进了 ninja-theme（违反默认零插件；T2 主题插件也不随分发物）" >&2; hdiutil detach "$MNT" >/dev/null; exit 1; }
 hdiutil detach "$MNT" >/dev/null
 
 echo "完成：$DMG"

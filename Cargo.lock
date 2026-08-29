@@ -138,6 +138,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ninja-theme"
+version = "0.1.0"
+dependencies = [
+ "ninja-protocol",
+]
+
+[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

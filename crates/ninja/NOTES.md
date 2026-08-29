@@ -475,3 +475,47 @@ CGEventPostToPid 到不了菜单系统），新增 `synth_input.swift activate/w
 - tab 态系统注入的 Close Window(⇧⌘W) 与 Panes>Close Pane(⌘⇧W) 键位
   相同：实测菜单匹配按栏序 Panes 项赢（⇧⌘W 关 pane，非整窗）——与
   本轮语义一致，未动。
+
+## T2：主题插件原语 + 官方 ninja-theme（2026-08-29）
+
+用户产品决策（同日确认）：宿主内置 One Dark Pro 为不可卸基线；主题切换
+走插件原语；DMG/分发物严格零插件。落地四件：
+
+1. **协议 v0 增补 `theme.set`**（只增不删，第 6 类消息；规则内增补记录
+   见 ninja-protocol 文档规则 6）：插件→宿主推完整色板
+   （bg/fg/cursor/selection_bg+alpha/divider/ansi×16，颜色一律 `#rrggbb`）。
+   golden `theme.set.json` 再生成；Python 参考解码器无需改码（type 无关），
+   文档串同步。
+2. **宿主运行时覆盖点**：`theme::current()` = 全局唯一「当前生效色板」
+   （无覆盖 = ODP 基线）。渲染器选区/光标、pane 容器底色/分隔条/焦点环、
+   vt 默认色/调色板全部改为**现读**它（不再读编译期常量）。p2 的
+   `[theme]` TOML 字段级覆盖保留且优先于插件（用户显式配置 > 插件）。
+   关键点：cell 颜色在解码期经 vt 调色板解析成 RGB，换色板必须强制
+   下一帧 Full 重解码（`TermState::apply_effective_palette`），否则缓存
+   里的旧 SGR 色不会换；Full 脏同时保证跳帧（D-C）吃不掉全屏换色。
+   `[theme]` 配置的 `selection_bg`/`cursor` 因此改为 `Option<Rgb>`
+   （None = 跟随生效色板）。
+3. **回退语义（与 p6 收层同语义）**：拥有色板覆盖的插件连接死亡
+   （EOF/IO 错/坏协议）→ `drop_conn` 里 `revoke_owner` → 回 ODP + 全部
+   存活 pane 重钉重画；同会话禁用/退出 → `shutdown` 里 `revoke_all`。
+   last-writer-wins：多主题插件时最后一个推色板的拥有覆盖，旧 owner
+   死亡不回退（新 owner 在）。泵 timer 维持条件从「有层」扩为
+   「有层 ∨ 覆盖生效」——覆盖期间必须盯连接死亡，无层也盯。
+4. **官方 ninja-theme**（`crates/ninja-theme`，同 ninja-preview 形态）：
+   独立 bin，只依赖 ninja-protocol（无系统框架需求——不画像素），
+   连接后即推 theme.set，随后常驻（hit 回 ignore，EOF 退出）。内置
+   one-light / solarized-dark / solarized-light 三色板（ODP 之外），
+   argv[1] 或 `NINJA_THEME` 选色板。**不进 DMG**（package 脚本注释与
+   零插件清点同步加列 ninja-theme；复跑签名 bundle 仍只含 MacOS/ninja，
+   像素探针 #282C34 基线在）。
+
+E2E（`NINJA_E2E=1 cargo test -p ninja --test theme_switch`，先
+`cargo build -p ninja-theme`）：首击（`NINJA_P4_HIT`）冷启动拉起插件 →
+像素探针背景 #282C34→#002B36 + OSC 10/11 应答换新（fakesh 需把 pty
+改非规范输入——OSC 应答无换行，canonical 模式永远读不到，实测「(none)」
+坑）；杀插件/禁用钩子两场景都验「像素回 #282C34 + OSC 11 回
+2828/2c2c/3434 + 无复活/进程收割」；fakesh 每拍补输出字节刷新 cyclic
+探针槽，防回退断言被旧主题帧空洞通过。连续 8 轮通过。
+
+已知残留：分发物的「换主题」入口 = 用户本地装插件（DISTRIBUTION.md 有
+步骤）；宿主无主题切换 UI（刻意，PRODUCT「颜色」行的不做项）。
