@@ -698,9 +698,11 @@ impl TerminalView {
             (f64::from(cell_w_px), f64::from(cell_h_px), baseline_px),
         )
         .expect("Metal renderer init");
-        // 主题色从 p2 配置注入（p1 硬编码 → TOML）。
+        // 主题色从配置注入（T-主题：默认 = One Dark Pro，见 theme.rs；
+        // [theme] TOML 是字段级覆盖，不是主题切换）。
         renderer.theme = Theme {
             selection_bg: config.selection_bg,
+            selection_alpha: crate::theme::SELECTION_ALPHA,
             cursor: config.cursor,
         };
 

@@ -25,6 +25,29 @@ use objc2_quartz_core::CALayer;
 use crate::config::Config;
 use crate::view::TerminalView;
 
+/// T-主题：容器底色（One Dark Pro editor.background #282c34）。
+/// sRGB 分量直接从 [`crate::theme`] 常量换算，两处 drawRect 共用。
+pub fn theme_background_color() -> Retained<NSColor> {
+    let c = crate::theme::BACKGROUND;
+    NSColor::colorWithSRGBRed_green_blue_alpha(
+        f64::from(c.0) / 255.0,
+        f64::from(c.1) / 255.0,
+        f64::from(c.2) / 255.0,
+        1.0,
+    )
+}
+
+/// T-主题：分隔条 1px 线（One Dark Pro panel.border/focusBorder #3e4452）。
+pub fn theme_divider_color() -> Retained<NSColor> {
+    let c = crate::theme::DIVIDER;
+    NSColor::colorWithSRGBRed_green_blue_alpha(
+        f64::from(c.0) / 255.0,
+        f64::from(c.1) / 255.0,
+        f64::from(c.2) / 255.0,
+        1.0,
+    )
+}
+
 /// 分隔条厚度（points；命中区即此厚度）。
 pub const DIVIDER: f64 = 5.0;
 /// ratio 夹取范围：两侧叶子各保最小占比。
@@ -167,10 +190,11 @@ define_class!(
             self.relayout();
         }
 
-        /// 背景填黑：分隔条缝隙/角落不露白（终端底色一致）。
+        /// 背景填 One Dark Pro 底色：分隔条缝隙/角落不露白（与终端底色
+        /// 一致；旧主题黑底时这里曾是纯黑，T-主题同步官方 #282c34）。
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
-            NSColor::blackColor().set();
+            crate::pane::theme_background_color().set();
             objc2_app_kit::NSRectFill(self.bounds());
         }
 
@@ -756,9 +780,11 @@ define_class!(
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
             let b = self.bounds();
-            NSColor::blackColor().set();
+            crate::pane::theme_background_color().set();
             objc2_app_kit::NSRectFill(b);
-            NSColor::separatorColor().set();
+            // 1px 线 = One Dark Pro panel.border/focusBorder #3e4452
+            //（官方边框色；旧系统 separatorColor 与主题无关）。
+            crate::pane::theme_divider_color().set();
             let line = if b.size.width < b.size.height {
                 // 竖分隔条：居中 1px 竖线。
                 NSRect {

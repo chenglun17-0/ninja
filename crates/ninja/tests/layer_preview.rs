@@ -102,7 +102,8 @@ fn fakesh(dir: &Path, osc7_pwd: Option<&Path>, line: &str) -> PathBuf {
     f
 }
 
-/// PPM（P6）解析：统计「亮」像素数（文本墨迹；层背景是暗色 #1C1F24）。
+/// PPM（P6）解析：统计「亮」像素数（文本墨迹；层背景是 One Dark Pro
+/// 底色 #282c34，暗色不干扰计数）。
 fn ppm_bright_ink(data: &[u8]) -> Option<usize> {
     // 头：P6\n<w> <h>\n255\n（本仓渲染器写出的形态）。逐段找头并
     // 定位像素起始偏移（避免不稳定 API）。

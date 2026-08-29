@@ -139,7 +139,8 @@ pub struct Config {
     /// None = 内置默认等宽（Menlo）。
     pub font_family: Option<String>,
     pub font_size_pt: f64,
-    /// 主题色（p1 硬编码进 renderer 的两个值）。
+    /// 主题色（T-主题：One Dark Pro 官方值钉在 [`crate::theme`]，
+    /// 这两个是 p2 既有的字段级覆盖入口）。
     pub selection_bg: Rgb,
     pub cursor: Rgb,
     /// 动作名 → 键绑定（含全部默认，缺项由默认表补齐）。
@@ -154,8 +155,8 @@ impl Default for Config {
             shell: None,
             font_family: None,
             font_size_pt: 13.0,
-            selection_bg: Rgb(0x35, 0x4B, 0x8C),
-            cursor: Rgb(0xE6, 0xE6, 0xE6),
+            selection_bg: crate::theme::SELECTION_BG,
+            cursor: crate::theme::CURSOR,
             keys: default_keys(),
             plugins: PluginsConfig::default(),
         }
@@ -351,8 +352,9 @@ pub fn default_toml() -> String {
     s.push_str("# font-family = \"Menlo\"\n");
     s.push_str("# font-size = 13.0\n\n");
     s.push_str("[theme]\n");
-    s.push_str("# selection-bg = \"#354B8C\"\n");
-    s.push_str("# cursor = \"#E6E6E6\"\n\n");
+    s.push_str("# 默认 = One Dark Pro（官方色板钉死在代码，见 theme.rs）；\n");
+    s.push_str("# selection-bg = \"#ABB2BF\"   # 官方 #abb2bf30 带alpha，覆盖只换 RGB 不换alpha\n");
+    s.push_str("# cursor = \"#528BFF\"\n\n");
     s.push_str("[keys]\n");
     s.push_str("# new_window = \"cmd+n\"\n");
     s.push_str("# split_right = \"cmd+d\"\n\n");

@@ -8,6 +8,9 @@
 //!
 //! 模块划分（全部只在主线程碰 libghostty-vt 类型，该库非线程安全）：
 //!
+//! - [`theme`]：T-主题：One Dark Pro 唯一默认配色（官方色板钉死，
+//!   vt 默认前景/背景/光标 + ANSI 16 + 选区/光标/分隔条收口）
+//!
 //! - [`pty`]：forkpty 拉起 `$SHELL`，读写各一条线程，per-pane
 //!   CFRunLoopSource 唤醒主线程泵数据
 //! - [`term`]：`Terminal` + `RenderState` 的薄封装，Snapshot → 帧数据（cell 网格）
@@ -54,4 +57,5 @@ pub mod renderer;
 pub mod select;
 pub mod shell;
 pub mod term;
+pub mod theme;
 pub mod view;

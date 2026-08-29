@@ -117,11 +117,17 @@ pub struct TermState {
 
 impl TermState {
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self> {
-        let terminal = Terminal::new(TerminalOptions {
+        let mut terminal = Terminal::new(TerminalOptions {
             cols,
             rows,
             max_scrollback,
         })?;
+        // T-主题：One Dark Pro 钉进 vt 核（默认前景/背景/光标 + ANSI 16
+        // 调色板；每 pane/窗口同一套）。失败只警告——主题是视觉问题，
+        // 不是启动门禁。
+        if !crate::theme::apply_to_terminal(&mut terminal) {
+            eprintln!("ninja: One Dark Pro 主题钉入 vt 核失败（回落内置色）");
+        }
         Ok(Self {
             key_encoder: key::Encoder::new()?,
             gesture: Gesture::new()?,

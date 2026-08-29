@@ -11,12 +11,13 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString};
 use objc2_core_foundation::CGSize;
 use objc2_metal::{
-    MTLCommandEncoder, MTLBlendFactor, MTLClearColor, MTLCommandBuffer, MTLCommandQueue,
-    MTLCompileOptions, MTLDevice, MTLLibrary, MTLPrimitiveType, MTLRenderCommandEncoder,
-    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLRenderPassDescriptor,
-    MTLResourceOptions, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState,
-    MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
-    MTLCreateSystemDefaultDevice, MTLLoadAction, MTLStoreAction, MTLPixelFormat,
+    MTLCommandEncoder, MTLBlendFactor, MTLBlitCommandEncoder, MTLClearColor, MTLCommandBuffer,
+    MTLCommandQueue, MTLCompileOptions, MTLDevice, MTLLibrary, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
+    MTLRenderPassDescriptor, MTLResourceOptions, MTLSamplerDescriptor, MTLSamplerMinMagFilter,
+    MTLSamplerState, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage, MTLCreateSystemDefaultDevice, MTLLoadAction, MTLStoreAction,
+    MTLPixelFormat,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
@@ -84,9 +85,14 @@ fragment float4 layer_fs(
 }
 "#;
 
-/// 渲染主题色（p1 硬编码；p2 配置阶段进 TOML）。
+/// 渲染主题色（T-主题：默认 = One Dark Pro，官方色板钉在 [`crate::theme`]；
+/// 选区/光标仍可经 p2 既有的 [theme] TOML 字段覆盖——字段级配置，
+/// 不是主题系统）。
 pub struct Theme {
     pub selection_bg: Rgb,
+    /// 选区 alpha：官方 terminal.selectionBackground `#abb2bf30` 的
+    /// 0x30（TOML 覆盖 selection_bg 时仍用这个 alpha）。
+    pub selection_alpha: f32,
     pub cursor: Rgb,
 }
 
@@ -101,8 +107,9 @@ pub struct LayerDraw {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            selection_bg: Rgb(0x35, 0x4B, 0x8C),
-            cursor: Rgb(0xE6, 0xE6, 0xE6),
+            selection_bg: crate::theme::SELECTION_BG,
+            selection_alpha: crate::theme::SELECTION_ALPHA,
+            cursor: crate::theme::CURSOR,
         }
     }
 }
@@ -485,9 +492,16 @@ impl Renderer {
             }
             encoder.endEncoding();
         }
+        let drawable_texture = drawable.texture();
         let drawable: &ProtocolObject<dyn objc2_metal::MTLDrawable> = drawable.as_ref();
         cmdbuf.presentDrawable(drawable);
         cmdbuf.commit();
+        // T-主题取证开关：NINJA_DUMP_DRAWABLE=<dir> 时把本帧 drawable
+        // 读回落盘（blit 拷到自建 Shared 纹理，见 dump_drawable_ppm）。
+        // E2E 像素探针：背景 #282C34 / ANSI 官方色。
+        if drawable_probe_dir().is_some() {
+            self.dump_drawable_ppm(&drawable_texture);
+        }
         self.frames_drawn += 1;
         // 已呈现：记录视觉签名（后续 Clean 帧跳帧判据）。
         self.last_present = Some(LastPresent {
@@ -543,6 +557,81 @@ impl Renderer {
         let _ = std::fs::write(dir.join(format!("{}.ppm", l.handle)), out);
     }
 
+    /// T-主题取证：把已呈现的 drawable 读回落盘 PPM（cyclic 3 槽位
+    /// 覆盖写：`<dir>/frame_<n%3>.ppm`，n 为全局已呈现序号）。drawable
+    /// 纹理的存储模式不保证 CPU 直读——先 GPU blit 拷进自建 Shared
+    /// 纹理，等拷贝命令缓冲完成后 getBytes，所见即已呈现像素。
+    /// 失败静默（取证钩子不炸产品路径；仅 NINJA_DUMP_DRAWABLE 开启）。
+    fn dump_drawable_ppm(&self, drawable_texture: &ProtocolObject<dyn MTLTexture>) {
+        let Some(dir) = drawable_probe_dir() else { return };
+        let texture = drawable_texture;
+        let (w, h) = (texture.width(), texture.height());
+        if w == 0 || h == 0 {
+            return;
+        }
+        let desc = MTLTextureDescriptor::new();
+        // SAFETY: 尺寸/格式与源 drawable 一致，仅取证读回用。
+        unsafe {
+            desc.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            desc.setWidth(w);
+            desc.setHeight(h);
+            desc.setStorageMode(MTLStorageMode::Shared);
+            desc.setUsage(MTLTextureUsage::ShaderRead);
+        }
+        let Some(dest) = self.device.newTextureWithDescriptor(&desc) else {
+            return;
+        };
+        let Some(copybuf) = self.queue.commandBuffer() else {
+            return;
+        };
+        let Some(enc) = copybuf.blitCommandEncoder() else {
+            return;
+        };
+        // SAFETY: 区域在两张同格式/同尺寸纹理界内，拷贝后 CPU 读 Shared
+        // 存储（无需 synchronize）。
+        unsafe {
+            enc.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                texture,
+                0,
+                0,
+                objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                objc2_metal::MTLSize { width: w, height: h, depth: 1 },
+                &dest,
+                0,
+                0,
+                objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+            enc.endEncoding();
+        }
+        copybuf.commit();
+        copybuf.waitUntilCompleted();
+        let mut buf = vec![0u8; w * h * 4];
+        // SAFETY: 布局与 BGRA8Unorm 匹配，读回整幅。
+        unsafe {
+            dest.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                std::ptr::NonNull::new(buf.as_mut_ptr().cast()).unwrap(),
+                w * 4,
+                objc2_metal::MTLRegion {
+                    origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: objc2_metal::MTLSize { width: w, height: h, depth: 1 },
+                },
+                0,
+            );
+        }
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        out.reserve(w * h * 3);
+        for px in buf.chunks_exact(4) {
+            out.extend_from_slice(&[px[2], px[1], px[0]]); // BGRA→RGB
+        }
+        let n = DRAWABLE_PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let slot = n % 3;
+        // 原子替换写：先写临时名再 rename，读侧不会看到半截 PPM。
+        let tmp = dir.join(format!("frame_{slot}.ppm.tmp"));
+        if std::fs::write(&tmp, out).is_ok() {
+            let _ = std::fs::rename(&tmp, dir.join(format!("frame_{slot}.ppm")));
+        }
+    }
+
     /// 组一帧的全部顶点：cell 循环（背景/字形/装饰）→ IME 预编辑 →
     /// 非块光标。会经 `atlas.get_or_rasterize` 光栅化新字形并压进
     /// atlas pending（上传由 `upload_pending` 在 draw 内随后消费）。
@@ -576,7 +665,7 @@ impl Renderer {
             }
             let selected = cell.selected;
             if selected {
-                bg = rgb_to_f32s(self.theme.selection_bg);
+                bg = self.selection_rgba();
             }
 
             let is_cursor_cell = frame.cursor.is_some_and(|c| {
@@ -671,6 +760,15 @@ impl Renderer {
         }
     }
 
+    /// 选区 quad 色：官方 terminal.selectionBackground `#abb2bf30` =
+    /// 前景色 + 0x30 alpha（管线已开 alpha 混合，盖在背景上即官方
+    /// 合成效果；TOML 覆盖 selection_bg 时仍是这个 alpha）。
+    fn selection_rgba(&self) -> [f32; 4] {
+        let mut c = rgb_to_f32s(self.theme.selection_bg);
+        c[3] = self.theme.selection_alpha;
+        c
+    }
+
     /// 把 atlas 的 pending 槽位写入纹理（CPU 侧立即写入，Shared 存储；
     /// 在本帧命令缓冲编码前调用，commit 后 GPU 采样即所见）。
     fn upload_pending(&mut self, uploads: Vec<crate::atlas::PendingUpload>) {
@@ -722,7 +820,7 @@ impl Renderer {
             marked,
             frame,
             default_fg,
-            rgb_to_f32s(self.theme.selection_bg),
+            self.selection_rgba(),
             atlas,
             font,
         );
@@ -790,6 +888,16 @@ fn rgb_to_f32s(c: Rgb) -> [f32; 4] {
         1.0,
     ]
 }
+
+/// NINJA_DUMP_DRAWABLE 取证目录（只读一次 env；None = 关）。
+fn drawable_probe_dir() -> Option<std::path::PathBuf> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("NINJA_DUMP_DRAWABLE").map(std::path::PathBuf::from))
+        .clone()
+}
+
+/// NINJA_DUMP_DRAWABLE 的已呈现帧序号（cyclic 3 槽位文件名用）。
+static DRAWABLE_PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn push_quad(
     verts: &mut Vec<Vertex>,

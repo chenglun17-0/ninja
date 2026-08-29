@@ -19,12 +19,14 @@ use objc2_io_surface::{IOSurfaceLockOptions, IOSurfaceRef};
 
 use crate::Target;
 
-/// 主题（pager 自带；插件层不读宿主主题——那不是 v0 协议的一部分）。
-const BG: (f64, f64, f64) = (0.11, 0.12, 0.14);
-const FG: (f64, f64, f64) = (0.85, 0.86, 0.88);
-const HEADER_FG: (f64, f64, f64) = (0.45, 0.50, 0.58);
-const LINE_HL_BG: (f64, f64, f64) = (0.16, 0.22, 0.34);
-const LINE_HL_FG: (f64, f64, f64) = (1.0, 1.0, 1.0);
+/// 层像素配色（T-主题：与宿主同源 One Dark Pro——插件层不读宿主主题，
+/// 那不是 v0 协议的一部分，但视觉必须一套；色值取自官方主题源
+/// OneDark-Pro.json，键名注在行尾）。
+const BG: (f64, f64, f64) = (40.0 / 255.0, 44.0 / 255.0, 52.0 / 255.0);   // editor.background #282c34
+const FG: (f64, f64, f64) = (171.0 / 255.0, 178.0 / 255.0, 191.0 / 255.0); // terminal.foreground #abb2bf
+const HEADER_FG: (f64, f64, f64) = (92.0 / 255.0, 99.0 / 255.0, 112.0 / 255.0); // comment token #5c6370
+const LINE_HL_BG: (f64, f64, f64) = (44.0 / 255.0, 49.0 / 255.0, 60.0 / 255.0); // editor.lineHighlightBackground #2c313c
+const LINE_HL_FG: (f64, f64, f64) = (215.0 / 255.0, 218.0 / 255.0, 224.0 / 255.0); // terminal.ansiWhite #d7dae0
 /// 基础字号（points）；按 layer.ready 的 dpi 换算成像素。
 const BASE_PT: f64 = 13.0;
 /// 预览起始行的前后文（把命中行放进首屏中间偏上）。
