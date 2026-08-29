@@ -1,13 +1,20 @@
-//! 字形 atlas：按 (文本, 粗, 斜) 缓存光栅化结果，摊到一张 R8Unorm 纹理上。
+//! 字形 atlas：按 (文本, 字重, 字体槽) 缓存光栅化结果，摊到一张 R8Unorm
+//! 纹理上。
 //!
 //! 分配是简单的 shelf/行分配器：行高等于 cell 行高（设备像素），一行放满
 //! 换下一行；整版放满就清空重来（缓存条目同时作废，按需重新光栅化）。
 //! p1 不做 LRU 淘汰——2000+ 槽位对单终端足够，满了整版重排成本也可接受。
 //!
-//! D-C：槽位表按字重分四张 `HashMap<String, GlyphRect>`，命中查询走
-//! `Borrow<str>`（零分配）——旧实现每 cell 每帧 `text.to_string()` 建
+//! D-C：槽位表按字重分四张 map，命中查询走 `Borrow<str>`
+//!（零分配）——旧实现每 cell 每帧 `text.to_string()` 建
 //! 查询 key，重画热路径上 1920 次/帧的堆分配是 debug 构建大量输出
 //! 吃力的直接成分之一。
+//!
+//! G-字形回退：同一文本可能渲染自不同字体（基础等宽字体 / 回退字体，
+//! 见 font 模块），槽位表按「字体槽 × 文本」双维度分命名空间
+//!（`HashMap<槽位, HashMap<文本, GlyphRect>>`）——字体槽从
+//! `Font::resolve_slot` 拿，命中路径两次哈希零分配；换字体槽绝不复用
+//! 旧字体的位图。
 
 use std::collections::HashMap;
 
@@ -48,8 +55,9 @@ pub struct GlyphAtlas {
     /// 当前行已用宽。
     cursor_x: u32,
     cursor_y: u32,
-    /// 四张槽位表（Regular/Bold/Italic/BoldItalic）；查询走 Borrow<str>。
-    maps: [HashMap<String, GlyphRect>; 4],
+    /// 四张槽位表（Regular/Bold/Italic/BoldItalic）；表内再按字体槽
+    /// 分命名空间（G：字形+字体双维度）。查询走 Borrow<str>。
+    maps: [HashMap<u32, HashMap<String, GlyphRect>>; 4],
     pending: Vec<PendingUpload>,
     /// 1x1 白块：实心 quad（背景/光标/下划线）走同一管线。
     white: GlyphRect,
@@ -79,7 +87,12 @@ impl GlyphAtlas {
             row_h,
             cursor_x: white.w,
             cursor_y: 0,
-            maps: [HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new()],
+            maps: [
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ],
             pending: vec![PendingUpload {
                 region: white,
                 bytes: vec![255],
@@ -99,14 +112,18 @@ impl GlyphAtlas {
     }
 
     /// 取槽位；未命中则光栅化并占位。返回 None = 没法画（光栅化失败）。
-    /// 命中路径零分配（Borrow<str> 查询，见模块头 D-C 注）。
+    /// 命中路径零分配（字体槽一次查 + Borrow<str> 一次查，见模块头）。
     pub fn get_or_rasterize(
         &mut self,
         text: &str,
         weight: Weight,
         font: &mut Font,
     ) -> Option<GlyphRect> {
-        if let Some(&r) = self.maps[weight_idx(weight)].get(text) {
+        let slot = font.resolve_slot(text);
+        if let Some(&r) = self.maps[weight_idx(weight)]
+            .get(&slot)
+            .and_then(|m| m.get(text))
+        {
             return Some(r);
         }
 
@@ -133,7 +150,10 @@ impl GlyphAtlas {
             dx: glyph.dx,
         };
         self.cursor_x += glyph.w;
-        self.maps[weight_idx(weight)].insert(text.to_string(), rect);
+        self.maps[weight_idx(weight)]
+            .entry(slot)
+            .or_default()
+            .insert(text.to_string(), rect);
         self.total_slots += 1;
         self.pending.push(PendingUpload {
             region: rect,
@@ -209,5 +229,32 @@ mod tests {
         assert!(pending.iter().any(|u| u.region == atlas.white()));
         // 取走后清空。
         assert!(atlas.take_pending().is_empty());
+    }
+
+    /// G 回归：槽位按 字形+字体 双维度——ASCII（基础字体，槽 0）与
+    /// CJK（回退字体，槽 >0）各自缓存互不冒名；同一字体槽内命中缓存。
+    /// 回退字体槽位号由 Font::resolve_slot 给出（字体维度的事实源）。
+    #[test]
+    fn slots_keyed_by_font_dimension() {
+        let mut font = Font::new(13.0, 2.0);
+        let mut atlas = GlyphAtlas::new(32);
+
+        let base_slot = font.resolve_slot("A");
+        let cjk_slot = font.resolve_slot("中");
+        let emoji_slot = font.resolve_slot("\u{1F600}");
+        assert_eq!(base_slot, 0, "ASCII 必须落基础字体槽");
+        assert_ne!(cjk_slot, base_slot, "中文必须落回退字体槽");
+        assert_ne!(emoji_slot, base_slot, "emoji 必须落回退字体槽");
+        assert_ne!(emoji_slot, cjk_slot, "emoji 与中文不应共享回退字体槽");
+
+        let a = atlas.get_or_rasterize("A", Weight::Regular, &mut font).unwrap();
+        let cjk = atlas.get_or_rasterize("中", Weight::Regular, &mut font).unwrap();
+        assert_eq!(atlas.cached_count(), 2);
+        // 命中各自缓存：同 key 同槽位。
+        assert_eq!(atlas.get_or_rasterize("A", Weight::Regular, &mut font).unwrap(), a);
+        assert_eq!(atlas.get_or_rasterize("中", Weight::Regular, &mut font).unwrap(), cjk);
+        assert_eq!(atlas.cached_count(), 2);
+        // 不同字体槽不同位图（不会拿 Menlo 的位图给 PingFang 的字形）。
+        assert_ne!((a.x, a.y), (cjk.x, cjk.y));
     }
 }

@@ -105,4 +105,37 @@ mod tests {
         let bracketed = paste_bytes(&term, "abc\ndef");
         assert_eq!(bracketed, b"\x1b[200~abc\ndef\x1b[201~");
     }
+
+    /// G 回归：CJK 双宽选中复制——宽字形后跟 spacer 占位格，选区文本
+    /// 必须每个汉字只出一次（spacer 不复制、不吞邻字、行尾不粘空格）。
+    #[test]
+    fn cjk_double_width_selection_copy() {
+        use libghostty_vt::screen::GridRef;
+        use libghostty_vt::selection::Selection;
+        use libghostty_vt::terminal::{Point, PointCoordinate};
+
+        // “中文aかな”：宽×4（占 8 列）+ 窄×1 + 宽×2（占 4 列）= 13 列。
+        let term = term_with("中文aかな".as_bytes());
+        fn at<'t>(t: &'t Terminal<'_, '_>, x: u16, y: u32) -> GridRef<'t> {
+            t.grid_ref(Point::Active(PointCoordinate { x, y })).unwrap()
+        }
+
+        // 线性选区盖住整段（含尾部宽字形的 spacer 槽）。
+        let sel = Selection::new(at(&term, 0, 0), at(&term, 12, 0), false);
+        term.set_selection(Some(&sel)).unwrap();
+        let text = selection_text(&term).expect("selection text");
+        assert_eq!(text.trim(), "中文aかな", "双宽选中复制不得重复/丢字：{text:?}");
+
+        // 只选中中间一个汉字（首尾都切断在宽字形边界）：拿到单个汉字。
+        let sel2 = Selection::new(at(&term, 2, 0), at(&term, 3, 0), false);
+        term.set_selection(Some(&sel2)).unwrap();
+        let text2 = selection_text(&term).expect("selection text 2");
+        assert_eq!(text2.trim(), "文", "单汉字选中：{text2:?}");
+
+        // 矩形选区同理不重复。
+        let sel3 = Selection::new(at(&term, 0, 0), at(&term, 12, 0), true);
+        term.set_selection(Some(&sel3)).unwrap();
+        let text3 = selection_text(&term).expect("selection text 3");
+        assert_eq!(text3.trim(), "中文aかな", "矩形双宽选中：{text3:?}");
+    }
 }

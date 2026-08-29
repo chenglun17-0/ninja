@@ -636,6 +636,8 @@ impl Renderer {
     /// 组一帧的全部顶点：cell 循环（背景/字形/装饰）→ IME 预编辑 →
     /// 非块光标。会经 `atlas.get_or_rasterize` 光栅化新字形并压进
     /// atlas pending（上传由 `upload_pending` 在 draw 内随后消费）。
+    /// cell 循环本体在 [`build_cell_pass`]（自由函数，无 Metal 依赖，
+    /// 宽字形/占位格回归测试直接看顶点）。
     fn build_verts(
         &mut self,
         verts: &mut Vec<Vertex>,
@@ -643,102 +645,39 @@ impl Renderer {
         atlas: &mut GlyphAtlas,
         font: &mut Font,
     ) {
-        let white = atlas.white();
-        let edge = atlas.edge() as f32;
-        let (cw, ch, baseline) = self.cell_px;
-        let default_bg = rgb_to_f32s(frame.bg);
-        let default_fg = rgb_to_f32s(frame.fg);
-
-        for (i, cell) in frame.cells.iter().enumerate() {
-            if matches!(cell.wide, CellWideKind::SpacerTail | CellWideKind::SpacerHead) {
-                continue;
-            }
-            let col = f64::from((i % usize::from(frame.cols)) as u32);
-            let row = f64::from((i / usize::from(frame.cols)) as u32);
-            let x0 = col * cw;
-            let y0 = row * ch;
-
-            // 有效前景/背景：inverse 交换；选区覆盖；块光标再覆盖。
-            let mut fg = cell.fg.map(rgb_to_f32s).unwrap_or(default_fg);
-            let mut bg = cell.bg.map(rgb_to_f32s).unwrap_or(default_bg);
-            if cell.inverse {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            let selected = cell.selected;
-            if selected {
-                bg = self.selection_rgba();
-            }
-
-            let is_cursor_cell = frame.cursor.is_some_and(|c| {
-                usize::from(c.x) == i % usize::from(frame.cols)
-                    && usize::from(c.y) == i / usize::from(frame.cols)
-            });
-            let cursor_block =
-                is_cursor_cell && matches!(frame.cursor_style, CursorVisualStyle::Block);
-
-            if bg != default_bg || selected || cursor_block {
-                let bg_color = if cursor_block {
-                    rgb_to_f32s(self.effective_cursor())
-                } else {
-                    bg
-                };
-                let span = if cell.wide == CellWideKind::Wide { 2.0 } else { 1.0 };
-                push_quad(verts, white, edge, x0, y0, cw * span, ch, bg_color);
-                if cursor_block {
-                    fg = default_bg; // 块光标上字形反色
-                }
-            }
-
-            // 字形。
-            if !cell.text.is_empty() {
-                let weight = match (cell.bold, cell.italic) {
-                    (true, true) => Weight::BoldItalic,
-                    (true, false) => Weight::Bold,
-                    (false, true) => Weight::Italic,
-                    (false, false) => Weight::Regular,
-                };
-                if let Some(rect) = atlas.get_or_rasterize(&cell.text, weight, font) {
-                    // ink 左沿贴 cell（dx = ink.x - 1px 边距）。
-                    let gx = x0 + rect.dx;
-                    let gy = y0 + baseline + rect.baseline_to_top;
-                    push_glyph_quad(
-                        verts,
-                        &rect,
-                        edge,
-                        gx,
-                        gy,
-                        rect.w as f32,
-                        rect.h as f32,
-                        fg,
-                    );
-                }
-            }
-
-            // 下划线 / 删除线。
-            if cell.underline {
-                push_quad(verts, white, edge, x0, y0 + baseline + 1.0, cw, 1.0, fg);
-            }
-            if cell.strikethrough {
-                push_quad(
-                    verts,
-                    white,
-                    edge,
-                    x0,
-                    y0 + baseline - ch * 0.28,
-                    cw,
-                    1.0,
-                    fg,
-                );
-            }
-        }
+        let selection = self.selection_rgba();
+        let cursor_color = self.effective_cursor();
+        build_cell_pass(
+            verts,
+            frame,
+            self.cell_px,
+            selection,
+            cursor_color,
+            atlas,
+            font,
+        );
 
         // IME 预编辑串：从光标 cell 起按字符宽度逐字落格，下划线标记。
         if let Some(marked) = &frame.marked {
-            self.draw_marked(verts, white, edge, marked, frame, default_fg, atlas, font);
+            let white = atlas.white();
+            let edge = atlas.edge() as f32;
+            self.draw_marked(
+                verts,
+                white,
+                edge,
+                marked,
+                frame,
+                rgb_to_f32s(frame.fg),
+                atlas,
+                font,
+            );
         }
 
         // 非块光标样式：条 / 下划线 / 空心块。
         if let Some(c) = frame.cursor {
+            let white = atlas.white();
+            let edge = atlas.edge() as f32;
+            let (cw, ch, baseline) = self.cell_px;
             let x0 = f64::from(c.x) * cw;
             let y0 = f64::from(c.y) * ch;
             let color = rgb_to_f32s(self.effective_cursor());
@@ -896,6 +835,113 @@ fn rgb_to_f32s(c: Rgb) -> [f32; 4] {
     ]
 }
 
+/// cell 循环本体（背景/字形/下划线/删除线），从 `Renderer::build_verts`
+/// 提出的自由函数：不碰 Metal 状态机，宽字形（East Asian Width：vt 核
+/// 给的 `CellWideKind::Wide`）的背景/装饰 span 两格，占位格
+///（SpacerTail/SpacerHead）整体跳过。回归测试直接看顶点缓冲。
+#[allow(clippy::too_many_arguments)]
+fn build_cell_pass(
+    verts: &mut Vec<Vertex>,
+    frame: &Frame,
+    cell_px: (f64, f64, f64),
+    selection: [f32; 4],
+    cursor_color: Rgb,
+    atlas: &mut GlyphAtlas,
+    font: &mut Font,
+) {
+    let white = atlas.white();
+    let edge = atlas.edge() as f32;
+    let (cw, ch, baseline) = cell_px;
+    let default_bg = rgb_to_f32s(frame.bg);
+    let default_fg = rgb_to_f32s(frame.fg);
+
+    for (i, cell) in frame.cells.iter().enumerate() {
+        if matches!(cell.wide, CellWideKind::SpacerTail | CellWideKind::SpacerHead) {
+            continue;
+        }
+        let col = f64::from((i % usize::from(frame.cols)) as u32);
+        let row = f64::from((i / usize::from(frame.cols)) as u32);
+        let x0 = col * cw;
+        let y0 = row * ch;
+
+        // 有效前景/背景：inverse 交换；选区覆盖；块光标再覆盖。
+        let mut fg = cell.fg.map(rgb_to_f32s).unwrap_or(default_fg);
+        let mut bg = cell.bg.map(rgb_to_f32s).unwrap_or(default_bg);
+        if cell.inverse {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        let selected = cell.selected;
+        if selected {
+            bg = selection;
+        }
+
+        let is_cursor_cell = frame.cursor.is_some_and(|c| {
+            usize::from(c.x) == i % usize::from(frame.cols)
+                && usize::from(c.y) == i / usize::from(frame.cols)
+        });
+        let cursor_block =
+            is_cursor_cell && matches!(frame.cursor_style, CursorVisualStyle::Block);
+
+        // 宽字形 span：East Asian Width 双宽占两格（vt 核 CellWide::Wide）。
+        let span = if cell.wide == CellWideKind::Wide { 2.0 } else { 1.0 };
+
+        if bg != default_bg || selected || cursor_block {
+            let bg_color = if cursor_block {
+                rgb_to_f32s(cursor_color)
+            } else {
+                bg
+            };
+            push_quad(verts, white, edge, x0, y0, cw * span, ch, bg_color);
+            if cursor_block {
+                fg = default_bg; // 块光标上字形反色
+            }
+        }
+
+        // 字形（G 回退：atlas 槽位按字体+字形双维度，回退字体字形不冒名）。
+        if !cell.text.is_empty() {
+            let weight = match (cell.bold, cell.italic) {
+                (true, true) => Weight::BoldItalic,
+                (true, false) => Weight::Bold,
+                (false, true) => Weight::Italic,
+                (false, false) => Weight::Regular,
+            };
+            if let Some(rect) = atlas.get_or_rasterize(&cell.text, weight, font) {
+                // ink 左沿贴 cell（dx = ink.x - 1px 边距）。
+                let gx = x0 + rect.dx;
+                let gy = y0 + baseline + rect.baseline_to_top;
+                push_glyph_quad(
+                    verts,
+                    &rect,
+                    edge,
+                    gx,
+                    gy,
+                    rect.w as f32,
+                    rect.h as f32,
+                    fg,
+                );
+            }
+        }
+
+        // 下划线 / 删除线：跟着宽字形 span（G：宽字形装饰旧实现只画
+        // 一格宽，CJK 下划线在双宽字后半截缺失）。
+        if cell.underline {
+            push_quad(verts, white, edge, x0, y0 + baseline + 1.0, cw * span, 1.0, fg);
+        }
+        if cell.strikethrough {
+            push_quad(
+                verts,
+                white,
+                edge,
+                x0,
+                y0 + baseline - ch * 0.28,
+                cw * span,
+                1.0,
+                fg,
+            );
+        }
+    }
+}
+
 /// NINJA_DUMP_DRAWABLE 取证目录（只读一次 env；None = 关）。
 fn drawable_probe_dir() -> Option<std::path::PathBuf> {
     static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
@@ -990,7 +1036,9 @@ mod tests {
         };
         r.drawable_size = (f64::from(cw) * 10.0, f64::from(ch) * 4.0);
 
-        // 一帧 "bash$ " + 空白格（bash 启动提示符的最小化身）。
+        // 一帧 "bash$ " + 空白格（bash 启动提示符的最小化身）+ G：首帧就
+        // 带回退字体字形（中文 / emoji——分别落 PingFang / AppleColorEmoji
+        // 槽），验证回退路径同帧上传不被跳帧吃掉。
         let mut frame = Frame {
             cols: 10,
             rows: 4,
@@ -1003,7 +1051,12 @@ mod tests {
             cells: vec![FrameCell::default(); 40],
             marked: None,
         };
-        for (i, c) in "bash$ ".chars().enumerate() {
+        for (i, c) in "bash$ "
+            .chars()
+            .chain("中".chars())
+            .chain("\u{1F600}".chars())
+            .enumerate()
+        {
             frame.cells[i].text = c.to_string();
         }
 
@@ -1037,6 +1090,8 @@ mod tests {
         }
         let ink = buf[1..].iter().filter(|&&v| v > 0).count();
         assert!(ink > 50, "atlas ink beyond white block: {ink} (want >50)");
+        // 回退字形确实进了 atlas：基础槽 + 中/emoji 回退槽部有位图。
+        assert!(atlas.cached_count() >= 8, "ASCII + 中文 + emoji 全部入槽");
     }
 
     /// D-C 回归（需 drawable，headless 自动跳过）：Clean 且视觉未变的
@@ -1208,5 +1263,122 @@ mod tests {
         ));
         // atlas 还有待上传（首帧字形同帧上传兜底）。
         assert!(should_present_with(Some(&last), (800.0, 600.0), &same, false, true));
+    }
+
+    /// G 回归（纯函数，无 Metal/无 drawable）：cell pass 顶点几何。
+    /// ① 宽字形（EAW 双宽）：背景/下划线/删除线 span 两格；
+    /// ② 占位格（SpacerTail）整体跳过（带下划线也不画）；
+    /// ③ 窄字形装饰一格宽。
+    #[test]
+    fn wide_cell_decorations_span_two_cells_and_spacers_skipped() {
+        struct Quad {
+            x0: f64,
+            x1: f64,
+            y0: f64,
+            y1: f64,
+            rgba: [f32; 4],
+        }
+        let as_quads = |verts: &[Vertex]| -> Vec<Quad> {
+            verts
+                .chunks_exact(6)
+                .map(|c| Quad {
+                    x0: c[0].x as f64,
+                    x1: c[1].x as f64,
+                    y0: c[0].y as f64,
+                    y1: c[2].y as f64,
+                    rgba: [c[0].r, c[0].g, c[0].b, c[0].a],
+                })
+                .collect()
+        };
+
+        let scale = 2.0;
+        let mut font = Font::new(13.0, scale);
+        let cw = font.metrics.cell_w * scale;
+        let ch = (font.metrics.cell_h * scale).ceil();
+        let baseline = font.baseline_offset() * scale;
+        let mut atlas = GlyphAtlas::new(ch as u32);
+
+        let mut frame = Frame {
+            cols: 4,
+            rows: 1,
+            fg: Rgb(255, 255, 255),
+            bg: Rgb(0, 0, 0),
+            cursor: None,
+            cursor_style: CursorVisualStyle::Block,
+            cursor_blinking: false,
+            dirty: Dirty::Clean,
+            cells: vec![FrameCell::default(); 4],
+            marked: None,
+        };
+        // col0: 宽字形（中文，选中 + 下划线 + 删除线）；col1: 占位格
+        //（也开了下划线——必须被跳过）；col2: 窄字形下划线；col3: 空白。
+        frame.cells[0] = FrameCell {
+            text: "中".into(),
+            wide: CellWideKind::Wide,
+            selected: true,
+            underline: true,
+            strikethrough: true,
+            ..FrameCell::default()
+        };
+        frame.cells[1] = FrameCell {
+            wide: CellWideKind::SpacerTail,
+            underline: true,
+            ..FrameCell::default()
+        };
+        frame.cells[2] = FrameCell {
+            text: "b".into(),
+            underline: true,
+            ..FrameCell::default()
+        };
+
+        let sel = [0.3f32, 0.4, 0.5, 0.6];
+        let mut verts = Vec::new();
+        build_cell_pass(
+            &mut verts,
+            &frame,
+            (cw, ch, baseline),
+            sel,
+            Rgb(255, 255, 255),
+            &mut atlas,
+            &mut font,
+        );
+        let quads = as_quads(&verts);
+
+        // ① 选区背景：一块 cell 高、两格宽、起点 col0，颜色 = 选区色。
+        let bg: Vec<&Quad> = quads.iter().filter(|q| (q.y1 - q.y0 - ch).abs() < 0.01).collect();
+        assert_eq!(bg.len(), 1, "选中背景 quad 应只有一块（宽字形跨两格）");
+        assert!((bg[0].x1 - bg[0].x0 - 2.0 * cw).abs() < 0.5, "宽字形背景必须两格宽");
+        assert_eq!(bg[0].x0, 0.0);
+        assert_eq!(bg[0].rgba, sel);
+
+        // ②/③ 装饰条：高度 1 的 quad（下划线在 baseline+1，删除线在其上）。
+        // 宽字形下划线两格宽；窄字形下划线一格宽；占位格的下划线不存在。
+        let bars: Vec<&Quad> = quads
+            .iter()
+            .filter(|q| (q.y1 - q.y0 - 1.0).abs() < 0.01)
+            .collect();
+        assert_eq!(bars.len(), 3, "下划线×2 + 删除线×1（占位格被跳过）");
+        let mut underline: Vec<f64> = bars
+            .iter()
+            .filter(|q| (q.y0 - baseline - 1.0).abs() < 0.01)
+            .map(|q| q.x1 - q.x0)
+            .collect();
+        underline.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(underline.len(), 2, "两条下划线（宽 + 窄）");
+        assert!((underline[0] - cw).abs() < 0.5, "窄下划线一格宽");
+        assert!((underline[1] - 2.0 * cw).abs() < 0.5, "宽字形下划线必须两格宽");
+        // 删除线（宽字形）也两格宽。
+        let strike: Vec<&Quad> = bars
+            .iter()
+            .filter(|q| (q.y0 - (baseline - ch * 0.28)).abs() < 0.01)
+            .copied()
+            .collect();
+        assert_eq!(strike.len(), 1);
+        assert!((strike[0].x1 - strike[0].x0 - 2.0 * cw).abs() < 0.5, "宽字形删除线必须两格宽");
+
+        // ②占位格无任何自有 quad：背景1 + 下划线2 + 删除线1 + 字形2 = 6。
+        assert_eq!(quads.len(), 6, "占位格不得贡献 quad");
+        // 字形 quad：中（回退字体槽）与 b（基础字体槽）都拿得到槽位。
+        assert_eq!(atlas.cached_count(), 2);
     }
 }

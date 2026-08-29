@@ -4,16 +4,34 @@
 //! 给出 cell 度量（宽 = 'M' advance，高 = ascent+descent+leading），
 //! 把任意字符串（grapheme cluster，含中文/emoji 序列）按 CTLine 光栅化成
 //! 8-bit 灰度覆盖率位图：黑底白字，像素取反即覆盖率，直接喂 atlas。
+//!
+//! G-字形回退：单字体（Menlo）覆盖不了的字形原来靠 CTLine 隐式 cascade，
+//! PUA（Powerline U+E0B0 系）会落到 LastResort 豆腐。现在的解析链
+//! （全部 CoreText 系统级，禁止打包字体/第三方字体引擎——STACK 红线）：
+//!
+//! 1. 基础字体覆盖（`CTFontGetGlyphsForCharacters` 全非 0）→ 用基础字体；
+//! 2. `CTFontCreateForString`（沿系统 cascade list）选出的回退字体
+//!    真覆盖 → 用它（中文/假名 → PingFang，emoji → AppleColorEmoji）；
+//!    返回 LastResort = cascade 无源（PUA 常见）；
+//! 3. 惰性扫一次全字体集合（CTFontCollection）找覆盖源——用户装的
+//!    Powerline/Nerd 字体不在系统 cascade list 里，但字体在就渲染；
+//! 4. 三步全空 → 残留如实记录（[`Font::residuals`]）+ 渲染回基础字体
+//!    （CTLine 自动回退画 LastResort 豆腐，不假装有字形，不打包字体）。
+//!
+//! 解析按「簇首字符」缓存（[`Font::resolve_slot`]），命中路径一次 HashMap
+//! 查询；回退字体注册进 [`Font::fallbacks`]，atlas 槽位按 字形+字体槽
+//! 双维度分开（见 atlas 模块），同一文本不会拿错字体的槽位。
 
 use std::collections::HashMap;
 
 use objc2_core_foundation::{
-    CFAttributedString, CFBoolean, CFDictionary, CFRetained, CFString, CGPoint, CGRect, CGSize,
+    CFArray, CFAttributedString, CFBoolean, CFDictionary, CFRetained, CFString, CGPoint, CGRect,
+    CGSize,
 };
 use objc2_core_graphics::{CGColorSpace, CGContext};
 use objc2_core_text::{
     kCTFontAttributeName, kCTForegroundColorFromContextAttributeName, CTFont,
-    CTFontOrientation, CTFontSymbolicTraits, CTLine,
+    CTFontCollection, CTFontDescriptor, CTFontOrientation, CTFontSymbolicTraits, CTLine,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -37,6 +55,17 @@ pub struct Metrics {
     pub descent: f64,
 }
 
+/// 一个已解析的回退字体槽：描述符级基础字体 + 按字重惰性派生的变体。
+/// （slot 0 恒为基础等宽字体，不进这张表。）
+struct FallbackFont {
+    /// PostScript 名（取证/残留区分用）。
+    postscript: String,
+    /// 光栅化尺寸的基础引用（cascade 或集合扫描选出）。
+    base: CFRetained<CTFont>,
+    /// 按字重派生（copy_with_symbolic_traits，失败回落 base）。
+    variants: HashMap<Weight, CFRetained<CTFont>>,
+}
+
 /// 四变体字体 + 光栅化器。仅主线程使用（CG/CT 上下文非线程安全）。
 /// 度量用基础字号（points）；光栅化用 `size_pt * scale`（设备像素），
 /// 视网膜屏不清糊。
@@ -46,6 +75,16 @@ pub struct Font {
     pub scale: f64,
     /// 位图上下文的行缓冲复用（光栅化期间独占使用）。
     scratch: Vec<u8>,
+    /// 光栅化字号（设备像素；集合扫描造字体用）。
+    raster_pt: f64,
+    /// G 回退：簇首字符 → 字体槽（0=基础）。命中路径一次查询。
+    resolve_cache: HashMap<char, u32>,
+    /// 已注册回退字体（槽位 i ↔ fallbacks[i-1]）。
+    fallbacks: Vec<FallbackFont>,
+    /// 惰性加载的全字体描述符集合（CTFontCollection，扫 PUA 覆盖源用）。
+    scan: Option<CFRetained<CFArray>>,
+    /// 三步解析全空、确实无覆盖源的码点（如实记录，不假装有字形）。
+    residuals: Vec<char>,
 }
 
 /// 光栅化结果：覆盖率位图（0=透明 255=实心），尺寸/偏移均为设备像素。
@@ -121,6 +160,11 @@ impl Font {
             metrics,
             scale,
             scratch: Vec::new(),
+            raster_pt,
+            resolve_cache: HashMap::new(),
+            fallbacks: Vec::new(),
+            scan: None,
+            residuals: Vec::new(),
         }
     }
 
@@ -130,13 +174,166 @@ impl Font {
             .unwrap_or_else(|| self.fonts.get(&Weight::Regular).unwrap())
     }
 
+    /// 解析 `text`（grapheme cluster）应渲染自哪个字体槽：0 = 基础等宽
+    /// 字体，>0 = [`Font::fallbacks`] 里的回退槽。按簇首字符缓存，命中
+    /// 路径零光栅化；atlas 用槽位做第二维 key（见 atlas 模块头）。
+    /// 解析链见模块头（覆盖 → cascade → 集合扫描 → 残留）。
+    pub fn resolve_slot(&mut self, text: &str) -> u32 {
+        let Some(first) = text.chars().next() else {
+            return 0;
+        };
+        if let Some(&slot) = self.resolve_cache.get(&first) {
+            return slot;
+        }
+        let slot = self.resolve_slow(first);
+        self.resolve_cache.insert(first, slot);
+        slot
+    }
+
+    /// 慢路径：按单码点（簇首）三步解析。全空时记残留并回 0。
+    fn resolve_slow(&mut self, first: char) -> u32 {
+        let mut buf = [0u8; 4];
+        let probe: &str = first.encode_utf8(&mut buf);
+        // ① 基础字体覆盖。
+        if covers(self.fonts.get(&Weight::Regular).unwrap(), probe) {
+            return 0;
+        }
+        // ② CTFontCreateForString：系统级 cascade（range 必须给真实长度）。
+        // SAFETY: probe 是活的 CFString；range 覆盖全串。
+        let cascade = unsafe {
+            let cf = CFString::from_str(probe);
+            self.fonts
+                .get(&Weight::Regular)
+                .unwrap()
+                .for_string(
+                    &cf,
+                    objc2_core_foundation::CFRange {
+                        location: 0,
+                        length: probe.encode_utf16().count() as isize,
+                    },
+                )
+        };
+        // SAFETY: 参数平凡。
+        let cascade_ps = unsafe { cascade.post_script_name().to_string() };
+        if cascade_ps != "LastResort" && covers(&cascade, probe) {
+            return self.push_fallback(cascade, cascade_ps);
+        }
+        // ③ cascade 无源（LastResort 或返回的基础字体本身不覆盖）：扫
+        //    全字体集合——用户装的 Powerline/Nerd 字体不在系统 cascade
+        //    list 里，但字体在就渲染（「有回退源就渲染」）。
+        if let Some(found) = self.scan_covering(probe) {
+            // SAFETY: 参数平凡。
+            let ps = unsafe { found.post_script_name().to_string() };
+            return self.push_fallback(found, ps);
+        }
+        // ④ 残留如实记录：渲染回基础字体（CTLine 自动回退画 LastResort
+        //    豆腐）。不打包 Nerd Font（STACK 红线）。
+        eprintln!(
+            "ninja: U+{:04X} 无系统回退源（豆腐如实呈现；不打包字体）",
+            first as u32
+        );
+        self.residuals.push(first);
+        0
+    }
+
+    /// 注册一个回退字体槽，返回槽位号。
+    fn push_fallback(&mut self, font: CFRetained<CTFont>, postscript: String) -> u32 {
+        self.fallbacks.push(FallbackFont {
+            postscript,
+            base: font,
+            variants: HashMap::new(),
+        });
+        self.fallbacks.len() as u32
+    }
+
+    /// 惰性加载全字体描述符集合，扫一个覆盖 `text` 的字体（先到先得）。
+    fn scan_covering(&mut self, text: &str) -> Option<CFRetained<CTFont>> {
+        if self.scan.is_none() {
+            // SAFETY: 参数平凡（nil options = 系统默认匹配规则）。
+            self.scan = unsafe {
+                CTFontCollection::from_available_fonts(None)
+                    .matching_font_descriptors()
+            };
+        }
+        let arr = self.scan.as_ref()?;
+        // SAFETY: CoreText 声明元素类型为 CTFontDescriptor。
+        let arr: &CFArray<CTFontDescriptor> = unsafe { arr.cast_unchecked() };
+        // SAFETY: 索引在界内；descriptor 参数平凡。
+        unsafe {
+            for i in 0..arr.len() {
+                let Some(d) = arr.get(i) else { continue };
+                let f = CTFont::with_font_descriptor(&d, self.raster_pt, std::ptr::null());
+                if covers(&f, text) {
+                    return Some(f);
+                }
+            }
+        }
+        None
+    }
+
+    /// 取槽位在指定字重下实际使用的字体（retain 一份所有权给光栅化）。
+    /// 回退槽的字重变体惰性派生（copy_with_symbolic_traits，失败回 base）。
+    fn take_font_for(&mut self, slot: u32, weight: Weight) -> CFRetained<CTFont> {
+        let base_ref: &CFRetained<CTFont> = if slot == 0 {
+            self.fonts.get(&weight).unwrap_or_else(|| {
+                self.fonts.get(&Weight::Regular).unwrap()
+            })
+        } else {
+            let fb = self
+                .fallbacks
+                .get_mut(slot as usize - 1)
+                .expect("slot registered");
+            if !fb.variants.contains_key(&weight) {
+                let v = match weight {
+                    // SAFETY: 合法 retain 过的 CTFont，再 retain 一个所有权。
+                    Weight::Regular => unsafe {
+                        CFRetained::retain(std::ptr::NonNull::from(&*fb.base))
+                    },
+                    Weight::Bold => variant(&fb.base, true, false),
+                    Weight::Italic => variant(&fb.base, false, true),
+                    Weight::BoldItalic => variant(&fb.base, true, true),
+                };
+                fb.variants.insert(weight, v);
+            }
+            fb.variants.get(&weight).unwrap()
+        };
+        // SAFETY: 合法 retain 过的 CTFont，再 retain 一个所有权。
+        unsafe { CFRetained::retain(std::ptr::NonNull::from(&**base_ref)) }
+    }
+
+    /// 取证探针：`text` 解析到的字体 PostScript 名（"Menlo-Regular" =
+    /// 基础字体；回退槽给回退字体名）。测试/取证用，热路径不走。
+    pub fn font_postscript_of(&mut self, text: &str) -> String {
+        let slot = self.resolve_slot(text);
+        if slot == 0 {
+            // SAFETY: 参数平凡。
+            unsafe {
+                self.fonts
+                    .get(&Weight::Regular)
+                    .unwrap()
+                    .post_script_name()
+                    .to_string()
+            }
+        } else {
+            self.fallbacks[slot as usize - 1].postscript.clone()
+        }
+    }
+
+    /// 残留码点（三步解析全空：系统确实无覆盖源）。取证/测试用。
+    pub fn residuals(&self) -> &[char] {
+        &self.residuals
+    }
+
     /// 光栅化一个 grapheme cluster。`max_w_px` 是位图宽上限（设备像素，
     /// cell 宽的倍数），防超宽 emoji 序列把 atlas 行撑爆。
     pub fn rasterize(&mut self, text: &str, weight: Weight, max_w_px: f64) -> Option<RasterGlyph> {
         if text.is_empty() {
             return None;
         }
-        let font: &CTFont = self.font(weight);
+        // G 回退：光栅化用解析出的字体（0=基础，>0=回退槽），不再单盯
+        // Menlo——簇内个别字符回退字体不覆盖时由 CTLine 自动 cascade 兜底。
+        let slot = self.resolve_slot(text);
+        let font = self.take_font_for(slot, weight);
 
         // CFAttributedString { font, foreground-from-context }。
         // macOS ≥10.13 的 CTLineDraw 默认忽略 context 填充色，必须显式打开
@@ -325,6 +522,43 @@ fn default_monospace(size_pt: f64) -> CFRetained<CTFont> {
     unsafe { CTFont::with_name(&name, size_pt, std::ptr::null()) }
 }
 
+/// 字体是否真覆盖字符串：逐 UTF-16 单元取字形，glyph id 全非 0 才算。
+/// 代理对（astral：emoji/CJK 扩展）字形只落在高代理槽，低代理槽的 0
+/// 不算缺失；变体选择子（U+FE00..FE0F）与 ZWJ 容忍 0（布局器自会处理）。
+fn covers(font: &CTFont, s: &str) -> bool {
+    let utf16: Vec<u16> = s.encode_utf16().collect();
+    let mut glyphs = vec![0u16; utf16.len()];
+    // SAFETY: 输入/输出缓冲按 count 配对，单次同步调用。
+    let ok = unsafe {
+        font.glyphs_for_characters(
+            std::ptr::NonNull::new(utf16.as_ptr() as *mut u16).unwrap(),
+            std::ptr::NonNull::new(glyphs.as_mut_ptr()).unwrap(),
+            utf16.len() as isize,
+        )
+    };
+    if !ok {
+        return false;
+    }
+    let mut i = 0;
+    while i < glyphs.len() {
+        let u = utf16[i];
+        if (0xD800..0xDC00).contains(&u) {
+            // 高代理：字形在首槽，下一槽（低代理）必为 0。
+            if glyphs[i] == 0 {
+                return false;
+            }
+            i += 2;
+        } else if (0xFE00..=0xFE0F).contains(&u) || u == 0x200D {
+            i += 1;
+        } else if glyphs[i] == 0 {
+            return false;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
 /// 按名字取字体；CTFontCreateWithName 对不存在的名字会静默回退系统字体，
 /// 这里比对 family 名，对不上就当不可用（让上层回退 Menlo）。
 fn named_monospace(name: &str, size_pt: f64) -> Option<CFRetained<CTFont>> {
@@ -404,6 +638,91 @@ mod tests {
         let a = f.rasterize("A", Weight::Regular, 320.0).unwrap();
         let cjk = f.rasterize("中", Weight::Regular, 320.0).unwrap();
         assert!(cjk.w > a.w, "CJK {} not wider than A {}", cjk.w, a.w);
+    }
+
+    /// G 回归：CoreText 系统级回退验收——样本逐类像素探针（非空白）+ 字体解析
+    /// （非豆腐：解析不到 LastResort）。六类：制表画框/符号/Powerline/
+    /// 中日/emoji/变音符-希腊-西里尔。
+    #[test]
+    fn fallback_renders_acceptance_categories() {
+        let mut f = Font::new(13.0, 2.0);
+        let max_w = 4.0 * f.metrics.cell_w * f.scale;
+
+        let cats: [(&str, &[&str]); 7] = [
+            ("box", &["│","┌","┐","└","┘","├","┤","┬","┴","┼","═","║"]),
+            ("sym", &["→","←","⇄","✓","✗","●","▲","△","◆","★","☆"]),
+            ("cjk", &["中","文","日","本","か","な","漢","あ"]),
+            ("emoji", &["\u{1F600}","\u{1F389}","\u{1F44D}"]),
+            ("latin", &["é","à","ü","ß","ñ","ő"]),
+            ("greek", &["Ω","α","β","λ"]),
+            ("cyr", &["П","р","и","в","е","т"]),
+        ];
+        for (name, samples) in &cats {
+            for s in *samples {
+                let ps = f.font_postscript_of(s);
+                assert_ne!(ps, "LastResort", "{name} {s:?} 不得落到 LastResort 豆腐");
+                let g = f
+                    .rasterize(s, Weight::Regular, max_w)
+                    .unwrap_or_else(|| panic!("rasterize {name} {s:?}"));
+                let ink = g.coverage.iter().filter(|&&c| c > 40).count();
+                assert!(ink > 0, "{name} {s:?} ({ps}) 空白位图");
+            }
+        }
+
+        // 字体槽双维度的事实：ASCII 基础槽、中文/emoji 各自回退槽互不相同。
+        assert_eq!(f.resolve_slot("A"), 0);
+        let cjk = f.resolve_slot("中");
+        let emoji = f.resolve_slot("\u{1F600}");
+        assert_ne!(cjk, 0);
+        assert_ne!(emoji, 0);
+        assert_ne!(cjk, emoji);
+        // 解析按簇首字符缓存：重复解析稳定。
+        assert_eq!(f.resolve_slot("中"), cjk);
+        assert!(f.residuals().is_empty(), "六类样本不得有残留");
+    }
+
+    /// G 回归（Powerline U+E0B0 系）：有回退源就渲染（非 LastResort、
+    /// E0B0/E0B2 位图不得是同一张豆腐）；系统确实没有覆盖源时如实记
+    /// 残留（不打包 Nerd Font——STACK 红线）。本机取证：ProFontForPowerline
+    /// 覆盖 E0B0-E0B3。
+    #[test]
+    fn powerline_renders_or_records_residual() {
+        let mut f = Font::new(13.0, 2.0);
+        let max_w = 4.0 * f.metrics.cell_w * f.scale;
+        let pl = '\u{E0B0}';
+        let ps = f.font_postscript_of("\u{E0B0}");
+        if !f.residuals().contains(&pl) {
+            // 有回退源：真字形（非豆腐），且左右三角不是同一张位图。
+            assert_ne!(ps, "LastResort", "E0B0 不得渲染自 LastResort");
+            assert_ne!(ps, f.font_postscript_of("A"), "E0B0 不得静默回基础字体");
+            let right = f.rasterize("\u{E0B0}", Weight::Regular, max_w).unwrap();
+            let left = f.rasterize("\u{E0B2}", Weight::Regular, max_w).unwrap();
+            assert!(right.coverage.iter().filter(|&&c| c > 40).count() > 0, "E0B0 空白");
+            assert!(left.coverage.iter().filter(|&&c| c > 40).count() > 0, "E0B2 空白");
+            assert_ne!(right.coverage, left.coverage, "E0B0/E0B2 位图一致 = 豆腐");
+            assert!(!f.residuals().contains(&pl), "有覆盖源时不得记残留");
+        } else {
+            // 无覆盖源：残留如实记录 + 渲染回基础字体（CTLine 自动回退）。
+            assert!(f.residuals().contains(&pl), "无覆盖源必须如实记残留");
+        }
+    }
+
+    /// G 回归：确实无覆盖源的码点（未分配码位，系统字体不会有）记残留、
+    /// 渲染不 panic（CTLine 自动回退画豆腐）。
+    #[test]
+    fn no_source_codepoint_records_residual() {
+        let mut f = Font::new(13.0, 2.0);
+        let unassigned = '\u{0378}'; // Latin 扩展区未分配码位
+        let ps = f.font_postscript_of(unassigned.encode_utf8(&mut [0u8; 4]));
+        assert!(
+            f.residuals().contains(&unassigned),
+            "U+0378 应记残留（解析到 {ps}）"
+        );
+        let max_w = 4.0 * f.metrics.cell_w * f.scale;
+        // 光栅化不 panic（豆腐/空白均可接受——系统确实没有字形）。
+        let _ = f.rasterize("\u{0378}", Weight::Regular, max_w);
+        // 残留码点缓存稳定：重复解析不再扫集合。
+        assert_eq!(f.resolve_slot("\u{0378}"), 0);
     }
 
     /// 防回归：验证阶段发现的基线错位（基线误放距底 ascent+1）会把

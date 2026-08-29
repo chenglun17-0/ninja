@@ -519,3 +519,73 @@ E2E（`NINJA_E2E=1 cargo test -p ninja --test theme_switch`，先
 
 已知残留：分发物的「换主题」入口 = 用户本地装插件（DISTRIBUTION.md 有
 步骤）；宿主无主题切换 UI（刻意，PRODUCT「颜色」行的不做项）。
+
+## G：字形回退——CoreText 系统级回退链（2026-08-29，第二轮用户反馈）
+
+### 复现（修复前，2026-08-29 本机取证）
+
+单字体 Menlo + CTLine 隐式 cascade。事实（examples 探针，已删，事实进
+测试）：制表画框/符号/变音符/希腊/西里尔 Menlo 自己覆盖（真字形）；
+中文/假名 → PingFang、emoji → AppleColorEmoji（mono 降级，有字形）；
+**Powerline U+E0B0-E0B3 CTFontCreateForString 返回 LastResort（豆腐），
+且 E0B0/E0B2 渲染位图逐像素相同（同一张 LastResort 豆腐图）**。用户机
+装有 Powerline/Nerd 字体（ProFontForPowerline 覆盖 E0B0-E0B3，
+JetBrainsMonoNFM 覆盖 E0B4/F00B0），但它们不在系统 cascade list 里，
+隐式回退永远够不到 → 大量 PUA 字符豆腐。
+
+### 修复（font.rs，全部 CoreText 系统级；禁止打包字体/第三方字体引擎——
+STACK 红线）
+
+按「簇首字符」三步解析（`Font::resolve_slot`，缓存命中零光栅化）：
+
+1. 基础字体覆盖（`CTFontGetGlyphsForCharacters` 全非 0；代理对字形落
+   高代理槽、VS/ZWJ 容忍 0）→ 基础字体（槽 0）；
+2. `CTFontCreateForString(base, text, 真实 range)`（沿系统 cascade）真
+   覆盖 → 回退槽（中文→PingFangSC、emoji→AppleColorEmoji）；返回
+   LastResort = cascade 无源；
+3. 惰性扫一次全字体集合（`CTFontCollection` + matching descriptors，
+   ~874 字体）找覆盖源 → 用户装的 Powerline/Nerd 字体由此够到
+   （E0B0→ProFontForPowerline，F00B0→JetBrainsMonoNF）；
+4. 三步全空 → 残留如实记录（`Font::residuals` + eprintln 一次/码点），
+   渲染回基础字体（CTLine 自动回退画 LastResort 豆腐）。**不打包 Nerd
+   Font**；系统装了 Nerd Font 就自动用（不写死字体名，扫的是覆盖性）。
+
+atlas 槽位改 字形+字体槽 双维度（`HashMap<槽位, HashMap<文本, GlyphRect>>`
+×四字重）：同一文本换字体槽绝不复用旧字体位图；命中路径两次哈希零分配
+（D-C 纪律保持）。
+
+宽字形按 East Asian Width：vt 核 `CellWide::Wide`（EAW 双宽）驱动背景
+ quad span 两格（原已对）；**下划线/删除线旧实现只画一格宽——CJK 宽字
+形装饰后半截缺失，修为跟 span 两格**（`build_cell_pass`）。IME 预编辑
+落格本来就走 `codepoint_width`（EAW），不动。
+
+### 验收（复跑）
+
+- 逐类像素探针（非空白非豆腐）：`cargo test -p ninja --lib
+  font::tests::fallback_renders_acceptance_categories`——制表画框
+  │┌┐└┘├┤┬┴┼═║ / 符号 →←⇄✓✗●▲△◆★☆ / 中文假名 / emoji（mono 降级有
+  字形）/ 变音符-希腊-西里尔，每样本 ink>0 且解析字体 ≠LastResort；
+- Powerline：`powerline_renders_or_records_residual`——有回退源（本机
+  ProFontForPowerline）→ 真字形且 E0B0/E0B2 位图必须不同；无源 → 残留
+  如实记录。真无源码点（U+0378 未分配）：`no_source_codepoint_records_
+  residual`；
+- atlas 双维度：`atlas::tests::slots_keyed_by_font_dimension`；
+- 宽字形装饰两格 + 占位格跳过：`renderer::tests::
+  wide_cell_decorations_span_two_cells_and_spacers_skipped`（纯函数，
+  无 Metal）；
+- CJK 双宽选中复制：`select::tests::cjk_double_width_selection_copy`
+  （线性/单字/矩形三选法，汉字不重复不丢）；
+- 同帧上传 + 回退字体首帧：`renderer::tests::
+  first_frame_glyphs_uploaded_same_frame`（帧内容加了中/emoji——回退槽
+  字形同帧进 atlas 纹理，跳帧判据不吃掉）；
+- CLI 取证：`cargo run -p ninja --example g_fallback_probe`（逐样本打
+  解析字体 + 墨迹量）。
+
+### 已知残留
+
+- 未分配码位/系统确实无字形的码位 → LastResort 豆腐如实呈现（eprintln
+  + `Font::residuals` 可查），产品决策：不打包字体；
+- emoji 为灰度 mono 降级（产品决策接受：有字形即可；颜色 emoji 需彩位
+  图管线，第一年不做）；
+- 全字体集合扫描只在「cascade 返回 LastResort」时触发且按码点缓存，
+  首个 PUA 码点约 20ms（一次），命中后零成本。

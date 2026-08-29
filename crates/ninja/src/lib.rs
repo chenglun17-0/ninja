@@ -16,8 +16,10 @@
 //! - [`pty`]：forkpty 拉起 `$SHELL`，读写各一条线程，per-pane
 //!   CFRunLoopSource 唤醒主线程泵数据
 //! - [`term`]：`Terminal` + `RenderState` 的薄封装，Snapshot → 帧数据（cell 网格）
-//! - [`font`]：CoreText 字体度量 + 光栅化（CGBitmapContext，灰度 → 覆盖率）
-//! - [`atlas`]：字形 atlas（按 (文本, 粗, 斜) 缓存，满则整版重建）
+//! - [`font`]：CoreText 字体度量 + 光栅化（CGBitmapContext，灰度 → 覆盖率）；
+//!   G 起字形回退也走 CoreText 系统级（覆盖 → cascade → 全字体集合扫描
+//!   → 残留如实记录，不打包字体）
+//! - [`atlas`]：字形 atlas（按 字形+字重+字体槽 三维缓存，满则整版重建）
 //! - [`renderer`]：自研 Metal cell 绘制（一个管线吃背景/字形/光标/选区 quad）
 //! - [`keymap`]：NSEvent → `key::Encoder` 事件、doCommandBySelector 选择子表
 //! - [`view`]：NSView 子类（一个 pane：键盘/IME/鼠标选区/滚轮/resize）
