@@ -236,8 +236,18 @@ impl Font {
         0
     }
 
-    /// 注册一个回退字体槽，返回槽位号。
+    /// 注册一个回退字体槽，返回槽位号。同一 PostScript 名去重：同一
+    /// 回退字体（如全部 emoji → AppleColorEmoji）只占一个槽。X1 前的
+    /// 实现每个码点各推一个新槽（即使解析出的是同一字体），槽表随
+    /// 会话码点数无界膨胀，atlas 也跟着多建一堆等价命名空间。
     fn push_fallback(&mut self, font: CFRetained<CTFont>, postscript: String) -> u32 {
+        if let Some(i) = self
+            .fallbacks
+            .iter()
+            .position(|f| f.postscript == postscript)
+        {
+            return (i + 1) as u32;
+        }
         self.fallbacks.push(FallbackFont {
             postscript,
             base: font,
@@ -723,6 +733,56 @@ mod tests {
         let _ = f.rasterize("\u{0378}", Weight::Regular, max_w);
         // 残留码点缓存稳定：重复解析不再扫集合。
         assert_eq!(f.resolve_slot("\u{0378}"), 0);
+    }
+
+    /// X1 回归：图形字符（🔒 一类 emoji/符号、robbyrussell 提示符符号、
+    /// Nerd Font PUA 图标）不得渲染成 '~'。每个样本：解析字体非
+    /// LastResort（三步解析构造上已验有该码点字形）、位图非空白、且
+    /// 位图 ≠ 解析字体自己的 '~' 位图；同一回退字体的码点共享槽位。
+    #[test]
+    fn graphical_chars_not_rendered_as_tilde() {
+        let mut f = Font::new(13.0, 2.0);
+        let max_w = 4.0 * f.metrics.cell_w * f.scale;
+        let samples = [
+            '\u{1F510}', '\u{1F511}', '\u{1F512}', '\u{1F513}', '\u{1F514}', // 🔐🔑🔒🔓🔔
+            '\u{1F600}', '\u{1F389}', '\u{231A}',                              // 😀🎉⌚
+            '\u{279C}',                                                          // ➜ 提示符箭头
+            '\u{2717}',                                                          // ✗ 提示符叉
+            '\u{E0B0}', '\u{E0B2}', '\u{F108}',                                  // Powerline/Nerd PUA
+        ];
+        let mut tilde_by_ps: HashMap<String, Vec<u8>> = HashMap::new();
+        for &c in &samples {
+            let s = c.to_string();
+            let ps = f.font_postscript_of(&s);
+            assert_ne!(ps, "LastResort", "U+{:04X} 不得落到 LastResort", c as u32);
+            assert!(
+                !f.residuals().contains(&c),
+                "U+{:04X} 本机应有覆盖源",
+                c as u32
+            );
+            let g = f
+                .rasterize(&s, Weight::Regular, max_w)
+                .unwrap_or_else(|| panic!("rasterize U+{:04X}", c as u32));
+            let ink = g.coverage.iter().filter(|&&v| v > 40).count();
+            assert!(ink > 0, "U+{:04X} ({ps}) 空白位图", c as u32);
+            if !tilde_by_ps.contains_key(&ps) {
+                let t = f.rasterize("~", Weight::Regular, max_w).unwrap();
+                tilde_by_ps.insert(ps.clone(), t.coverage);
+            }
+            let tilde = &tilde_by_ps[&ps];
+            assert_ne!(
+                g.coverage, *tilde,
+                "U+{:04X} ({ps}) 位图 == 该字体的 '~' 位图",
+                c as u32
+            );
+        }
+        // 槽位去重（X1）：同一回退字体（AppleColorEmoji）的码点共享槽。
+        let a = f.resolve_slot("\u{1F512}");
+        let b = f.resolve_slot("\u{1F513}");
+        assert_ne!(a, 0);
+        assert_eq!(a, b, "同一回退字体应共享槽位（AppleColorEmoji）");
+        assert_eq!(f.resolve_slot("\u{1F512}"), a, "解析缓存稳定");
+        assert!(f.residuals().is_empty());
     }
 
     /// 防回归：验证阶段发现的基线错位（基线误放距底 ascent+1）会把

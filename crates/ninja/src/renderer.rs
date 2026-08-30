@@ -363,16 +363,24 @@ impl Renderer {
         // ---- 组顶点（复用缓冲，跨帧保容量；编码完归还 self）----
         // atlas 满版 reset 会作废本 pass 已建 quad 的槽位（map 清空、
         // 槽位重分）→ 有 reset 就重建一遍顶点。上限 3 pass：reset 只
-        // 由光栅化新字形触发，空闲帧不退循环，无自旋。
+        // 由光栅化新字形触发，空闲帧不退循环，无自旋。3 pass 仍未收敛
+        // （单帧不同形数超过整版容量）时如实取证——顶点可能引用已被
+        // 重新分配的槽位，字形会错乱，不能无声吞掉（X1 取证路径）。
         let mut verts = std::mem::take(&mut self.verts);
         verts.clear();
         verts.reserve(frame.cells.len() * 6);
-        for _ in 0..3 {
+        for pass in 0..3 {
             let resets_before = atlas.resets();
             verts.clear();
             self.build_verts(&mut verts, frame, atlas, font);
             if atlas.resets() == resets_before {
                 break;
+            }
+            if pass == 2 {
+                eprintln!(
+                    "ninja: 本帧不同字形数超过 atlas 容量（{} 次 reset 仍未收敛），字形可能错乱",
+                    atlas.resets()
+                );
             }
         }
 
