@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 ghostty-sys = { path = "../ghostty-sys" }
 libc = "0.2"
+# q2 配置：ninja.toml 收缩后的解析（[plugins] 等）。
+toml = "0.9"
 
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [

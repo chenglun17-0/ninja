@@ -39,6 +39,12 @@ fn main() {
                     .join("patches/0001-darwin-install-static-embed-lib.patch")
                     .display()
             );
+            println!(
+                "cargo:rerun-if-changed={}",
+                vendor
+                    .join("patches/0002-install-themes-on-embed-route.patch")
+                    .display()
+            );
             let archive = vendor.join("out/lib/libghostty-internal.a");
             let need_build = !archive.exists() || scripts_newer_than(&vendor, &archive);
             if need_build {

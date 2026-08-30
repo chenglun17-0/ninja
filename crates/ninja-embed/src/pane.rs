@@ -19,7 +19,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{NSEvent, NSResponder, NSView, NSWindowStyleMask};
 use objc2_core_graphics::CGColor;
@@ -205,61 +204,9 @@ define_class!(
             objc2_app_kit::NSRectFill(self.bounds());
         }
 
-        // ---- 菜单动作（first responder 不接 → 冒泡到本容器）----
-
-        #[unsafe(method(ninjaSplitRight:))]
-        fn split_right(&self, _sender: Option<&AnyObject>) {
-            self.split_focused(Dir::Horizontal, false);
-        }
-
-        #[unsafe(method(ninjaSplitDown:))]
-        fn split_down(&self, _sender: Option<&AnyObject>) {
-            self.split_focused(Dir::Vertical, false);
-        }
-
-        #[unsafe(method(ninjaClosePane:))]
-        fn close_pane(&self, _sender: Option<&AnyObject>) {
-            if let Some(view) = self.focused_leaf() {
-                self.close_leaf(&view);
-            }
-        }
-
-        #[unsafe(method(ninjaFocusLeft:))]
-        fn focus_left(&self, _sender: Option<&AnyObject>) {
-            self.focus_dir(Dir::Horizontal, false);
-        }
-
-        #[unsafe(method(ninjaFocusRight:))]
-        fn focus_right(&self, _sender: Option<&AnyObject>) {
-            self.focus_dir(Dir::Horizontal, true);
-        }
-
-        #[unsafe(method(ninjaFocusUp:))]
-        fn focus_up(&self, _sender: Option<&AnyObject>) {
-            self.focus_dir(Dir::Vertical, false);
-        }
-
-        #[unsafe(method(ninjaFocusDown:))]
-        fn focus_down(&self, _sender: Option<&AnyObject>) {
-            self.focus_dir(Dir::Vertical, true);
-        }
-
-        #[unsafe(method(ninjaPrevPane:))]
-        fn prev_pane(&self, _sender: Option<&AnyObject>) {
-            self.cycle_focus(-1);
-        }
-
-        #[unsafe(method(ninjaNextPane:))]
-        fn next_pane(&self, _sender: Option<&AnyObject>) {
-            self.cycle_focus(1);
-        }
-
-        /// ⌘⇧Enter（菜单 Panes → Zoom Pane；ghostty TOGGLE_SPLIT_ZOOM
-        /// action 同途）：多 pane 放大焦点面 / 再按还原；无分屏 = 窗口 zoom。
-        #[unsafe(method(ninjaToggleZoom:))]
-        fn toggle_zoom_action(&self, _sender: Option<&AnyObject>) {
-            self.toggle_zoom();
-        }
+        // q2：菜单动作全部改由 AppDelegate 经 ghostty_surface_binding_action
+        // 驱动（键位同源，见 app.rs/perform_menu_binding）；v1 平行键位层
+        // 的容器侧菜单方法（ninjaSplitRight: 等 10 个 selector）已删。
     }
 );
 
@@ -1290,10 +1237,11 @@ impl FocusRingView {
         // SAFETY: 组件数组布局正确（CGColorCreate，sRGB 空间）。
         unsafe {
             if let Some(space) = objc2_core_graphics::CGColorSpace::new_device_rgb() {
+                let ring = crate::host::ring_rgb();
                 let comps: [f64; 4] = [
-                    f64::from(crate::host::RING_COLOR.0) / 255.0,
-                    f64::from(crate::host::RING_COLOR.1) / 255.0,
-                    f64::from(crate::host::RING_COLOR.2) / 255.0,
+                    f64::from(ring.0) / 255.0,
+                    f64::from(ring.1) / 255.0,
+                    f64::from(ring.2) / 255.0,
                     0.9,
                 ];
                 if let Some(c) = CGColor::new(Some(&*space), comps.as_ptr()) {

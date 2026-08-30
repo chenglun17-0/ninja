@@ -1,0 +1,44 @@
+ninja q2: install bundled themes on the darwin static-embed route
+
+q0's patch installs the static embed library on Darwin but no runtime
+resources. Ghostty resolves named `theme = <name>` configuration from
+<resources>/themes (see src/config/theme.zig Location.resources), so an
+embedded host that loads user configuration cannot resolve any named
+theme unless the themes directory ships next to it.
+
+This patch installs the bundled themes (pinned lazy dependency
+`iterm2_themes` from build.zig.zon) into <prefix>/share/ghostty/themes
+on the same route, matching what GhosttyResources.zig installs for real
+app bundles. Embedded hosts set GHOSTTY_RESOURCES_DIR=<prefix>/share/
+ghostty (read once at ghostty_init, see src/os/resourcesdir.zig) to
+make theme resolution work.
+
+Applied by vendor/ghostty/build.sh after 0001 (idempotent).
+
+--- a/build.zig
++++ b/build.zig
+@@ -208,7 +208,23 @@
+             // route is the xcodebuild xcframework); ninja links the combined
+             // static archive straight into the Rust host (cmux route).
+             lib_static.installHeader();
+             lib_static.install("libghostty-internal.a");
++
++            // ninja q2: also install the bundled themes so an embedded host
++            // can resolve named `theme =` configuration. The themes come
++            // from the pinned lazy dependency in build.zig.zon. Point
++            // GHOSTTY_RESOURCES_DIR at <prefix>/share/ghostty.
++            if (config.emit_themes) {
++                if (b.lazyDependency("iterm2_themes", .{})) |upstream| {
++                    const themes_install = b.addInstallDirectory(.{
++                        .source_dir = upstream.path(""),
++                        .install_dir = .{ .custom = "share" },
++                        .install_subdir = b.pathJoin(&.{ "ghostty", "themes" }),
++                        .exclude_extensions = &.{".md"},
++                    });
++                    b.getInstallStep().dependOn(&themes_install.step);
++                }
++            }
+         }
+     }
+ 
+

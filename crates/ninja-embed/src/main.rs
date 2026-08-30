@@ -1,11 +1,12 @@
 //! ninja-embed：v2 嵌入路径宿主。
 //!
-//! - 默认（无参数）：q1 交互壳——多窗/原生标签/分屏布局树接 libghostty
-//!   surface（[`app::run`]）。
+//! - 默认（无参数）：q2 配置壳——ghostty 配置全量装载（主题/字体/键位
+//!   全继承，菜单/热重载接配置系统，[`app::run`]）。
 //! - `--evidence-dir DIR`：q0 取证模式保留可重跑（[`q0_demo::run`]，
 //!   审计文档 docs/Q0-CAPABILITY-AUDIT.md 的复现入口，勿破坏）。
 
 mod app;
+mod config;
 mod host;
 mod keymap;
 mod pane;
@@ -20,6 +21,11 @@ mod surface;
 use std::path::PathBuf;
 
 fn main() {
+    // 具名主题资源目录（q2）：vendored 构建烘入的路径在 ghostty_init
+    // **之前**设为 GHOSTTY_RESOURCES_DIR（resourcesdir.zig 在 init 时读
+    // 一次；ReleaseFast 下环境变量优先）。已设（用户覆盖/调试）不动。
+    config::ensure_resources_dir();
+
     let args: Vec<String> = std::env::args().collect();
     let mut evidence_dir: Option<PathBuf> = None;
     let mut i = 1;

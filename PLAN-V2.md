@@ -39,12 +39,21 @@ cmux（manaflow-ai/cmux）为可行性存在证明；嵌入 API 官方声明 pre
 
 过：标签分屏日常用法在嵌入引擎上成立；⌘W/⌘⇧Enter 等既有语义保持。
 
-### q2 配置系统
+### q2 配置系统 ✅（2026-08-31，证据 docs/q2-evidence/）
 
 做：加载 Ghostty 配置（含主题、字体、键位）+ 热重载；ninja.toml 收缩为
 宿主/插件特有（plugins、spawn、面板）；ODP 为缺省主题。
 
 过：用户既有 ghostty 配置的常用子集直接生效；主题/字体/键位实测。
+
+实施定案（详见 docs/q2-evidence/README.md）：键位全量继承 ghostty
+（菜单 keyEquivalent 由 config_trigger 推导、点击走 surface_binding_action，
+ItemSpec 平行键位层已删）；ninja 特有动作（插件面板）认领空闲动作
+toggle_visibility 绑 ⌘,（ghostty 动作集封闭，自定义动作名不可用）；
+主题资源随宿主分发（vendored 补丁 0002 + GHOSTTY_RESOURCES_DIR，
+574 主题含 Dracula）；ODP 层在用户设 theme= 时让位（finalize 的
+loadTheme 会把已载配置重放在主题之上）；热重载双路径（mtime 监视 +
+⌘⇧, reload_config action）→ ghostty_app_update_config 传播全部 surface。
 
 ### q3 ADE 重接 + 三门禁重跑
 

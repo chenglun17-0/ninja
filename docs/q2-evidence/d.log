@@ -1,0 +1,11 @@
+ninja-embed q2 shell — libghostty 1.3.2-HEAD-+f1b8fc4；配置：用户 theme=false ODP=true 监视 2 文件；资源目录 "/Users/jal/my_repos/ninja/vendor/ghostty/out/share/ghostty"
+ninja-embed: action tag=41 has_view=false
+ninja-embed: action tag=25 has_view=true
+ninja-embed: action tag=22 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=32 has_view=true
+ninja-embed: keyDown code=43 flags=0x100000 chars=Some(",")
+2026-08-31 02:06:24.377 ninja-embed[27974:11099802] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+ninja-embed: action tag=44 has_view=true
+ninja-embed: action tag=12 has_view=false

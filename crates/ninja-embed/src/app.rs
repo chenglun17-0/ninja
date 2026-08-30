@@ -1,19 +1,25 @@
-//! q1 AppKit 壳引导：NSApplication（Regular）+ AppDelegate（窗口注册表、
-//! 裸⌘W 决策、windowWillClose 收尾、⌘, 面板）+ 菜单 + 取证钩子。
-//! 移植自 v1 crates/ninja/src/app.rs（p2/X3 资产）：
+//! q2 配置系统 + q1 AppKit 壳引导：NSApplication（Regular）+
+//! AppDelegate（窗口注册表、裸⌘W 决策、windowWillClose 收尾、⌘, 面板）
+//! + **键位全量继承 ghostty 的菜单** + 取证钩子。
 //!
-//! - 菜单：App（Plugins… ⌘, / Quit ⌘Q）、File（⌘N/⌘T/Close ⌘W）、
-//!   Panes（⌘D/⌘⇧D/⌘⇧W/⌘⇧Enter/焦点导航 ⌥⌘方向键/⌘[/⌘]）、
-//!   Window（⌘⇧[/⌘⇧]）、Edit（⌘C/⌘V/⌘A）。键位与 v1 默认表一致
-//!   （ghostty 默认绑定同键位走 surface_key 时由 action_cb 汇到同一批
-//!   操作；⌘W 菜单=performClose 路径 vs ghostty close_surface 绑定路径
-//!   双通道同语义；差异项如 close_pane=⌘⇧W 留 q2 配置系统统一）。
+//! - 键位单一来源（2026-08-30 指令）：菜单 keyEquivalent 全部由
+//!   `ghostty_config_trigger(action)` 推导（用户 ghostty keybind 重绑后
+//!   菜单同步），菜单项触发走 `ghostty_surface_binding_action`（与键位
+//!   同一 action 路径）；v1 [keys] 平行键位层已删（ItemSpec 硬编码表
+//!   移除，ninja.toml [keys] 语义不复活）。⌘W 菜单项保留 performClose:
+//!   裸⌘W 窗口决策（shell.rs，非键位绑定层；keyEquivalent 仍取
+//!   trigger(close_surface)）。
+//! - ninja 特有动作（插件面板 ⌘,）：认领 ghostty 空闲动作
+//!   toggle_visibility，宿主层绑 ⌘,，用户可 `keybind = …=toggle_visibility`
+//!   统一重绑（ghostty 动作集封闭，自定义动作名不可用——已取证）。
+//! - 热重载：NSTimer 轮询配置文件 mtime → host::schedule_reload（管线
+//!   重跑 + ghostty_app_update_config + 菜单/派生态刷新）。
 //! - 窗口注册表 + releasedWhenClosed(false) + 延迟 prune（v1 SIGSEGV
 //!   教训）。
 //! - 取证钩子：NINJA_P2_SELFTEST（tab,split,win,close,closepane,
-//!   closebinding）+ NINJA_ZOOM_FILE/NINJA_ZOOM_DUMP（zoom dump JSON），
-//!   供独立验证免 CGEvent 驱动。
-//! - 面板入口：⌘, 开/复用空面板（q1 无插件运行时）。
+//!   closebinding,reloadcfg,cfgdump）+ NINJA_ZOOM_FILE/NINJA_ZOOM_DUMP
+//!   + NINJA_CFG_DUMP（生效配置 JSON，启动/重载/cfgdump 时写）。
+//! - 面板入口：⌘, 开/复用空面板（q2 仍零插件运行时，q3 接监督器）。
 
 #![allow(non_snake_case)] // ObjC selector 方法名
 use std::cell::{Cell, RefCell};
@@ -79,11 +85,31 @@ define_class!(
                 app.activateIgnoringOtherApps(true);
             }
 
+            // 热重载监视拍（0.5s 轮询配置文件 mtime；配置链见
+            // crate::config）。变化 → host::schedule_reload（下一拍重跑
+            // 装载管线 + ghostty_app_update_config + 菜单/派生态刷新）。
+            {
+                // SAFETY: 同上（-self 返回 retain 过的引用）。
+                let target: Retained<objc2::runtime::AnyObject> = unsafe { msg_send![self, self] };
+                // SAFETY: scheduledTimer 平凡。
+                let timer = unsafe {
+                    objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                        0.5,
+                        &target,
+                        objc2::sel!(ninjaConfigTick:),
+                        None,
+                        true,
+                    )
+                };
+                std::mem::forget(timer); // 进程生命期常驻
+            }
+
             // 取证钩子：NINJA_P2_SELFTEST=tab,split,win,close,closepane,
-            // closebinding——runloop 起转、首窗 key 后按序触发（免
-            // CGEvent 抖动）。close=菜单 performClose 路径（裸⌘W 决策）；
-            // closebinding=ghostty close_surface 绑定路径（surface_
-            // binding_action 直驱）。未知项忽略。
+            // closebinding,reloadcfg,cfgdump——runloop 起转、首窗 key 后
+            // 按序触发（免 CGEvent 抖动）。close=菜单 performClose 路径
+            //（裸⌘W 决策）；closebinding=ghostty close_surface 绑定路径
+            //（surface_binding_action 直驱）；reloadcfg=⌘⇧, 同途的
+            // reload_config action；cfgdump=写 NINJA_CFG_DUMP。未知项忽略。
             if let Ok(seq) = std::env::var("NINJA_P2_SELFTEST") {
                 self.ivars().selftest.replace(Some(seq));
                 // SAFETY: ObjC 的 -self 按约定返回 retain 过的自身引用。
@@ -104,7 +130,9 @@ define_class!(
             // zoom 取证钩子：NINJA_ZOOM_FILE=<path> 每 0.2s 读文件，内容
             // 变化才动作——"toggle"/"zoom"/"unzoom"/"split" 走 key window
             // 容器的 zoom 路径（⌘⇧Enter 同途）；"dump" 把 zoom 态 JSON 写
-            // 到 NINJA_ZOOM_DUMP（布局/隐藏/网格尺寸/内容取证）。E2E 用。
+            // 到 NINJA_ZOOM_DUMP（布局/隐藏/网格尺寸/内容取证）；q2 增
+            // "cfgdump"（写 NINJA_CFG_DUMP）与 "reloadcfg"（⌘⇧, 同途的
+            // 绑定驱动热重载）。E2E 用。
             if let Ok(f) = std::env::var("NINJA_ZOOM_FILE") {
                 self.ivars().zoom_file.replace(Some(f));
                 // SAFETY: 同上（-self 返回 retain 过的引用）。
@@ -290,6 +318,34 @@ define_class!(
                         // SAFETY: 公开 C API；surface 句柄存活。
                         unsafe { ghostty_sys::ghostty_surface_request_close(s) };
                     }
+                    // reload_config action 路径（⌘⇧, 同途）：绑定驱动热重载。
+                    "reloadcfg" => {
+                        let f = (|| {
+                            let w = key_container()?;
+                            let container = crate::pane::container_of(&w)?;
+                            container
+                                .focused_leaf()
+                                .or_else(|| container.leaves().first().cloned())
+                                .and_then(|f| f.surface_opt())
+                        })();
+                        let Some(s) = f else {
+                            eprintln!("ninja-embed: NINJA_P2_SELFTEST reloadcfg 无可用 surface");
+                            continue;
+                        };
+                        // SAFETY: 公开 C API；reload_config 是 app-scoped，
+                        // surface_binding_action 会转发到 app 路径。
+                        unsafe {
+                            ghostty_sys::ghostty_surface_binding_action(
+                                s,
+                                c"reload_config".as_ptr(),
+                                c"reload_config".to_bytes().len(),
+                            )
+                        };
+                    }
+                    // 写 NINJA_CFG_DUMP（此刻 surface 已建，取证用）。
+                    "cfgdump" => {
+                        host::dump_config_if_requested();
+                    }
                     other => eprintln!("ninja-embed: NINJA_P2_SELFTEST 未知步骤 {other:?}"),
                 }
             }
@@ -335,6 +391,73 @@ define_class!(
                 "unzoom" | "restore" => container.unzoom(),
                 // split：E2E 布置双 pane（同 v1 钩子）。
                 "split" => container.split_focused(crate::pane::Dir::Horizontal, false),
+                // bindact:<action>：任意 ghostty 动作经 binding_action
+                //（performBindingAction，与键位派发同一 action 核心）直驱
+                // ——E2E 对不在菜单镜像里的动作用（decrease_font_size 等）。
+                s if s.starts_with("bindact:") => {
+                    let name = s["bindact:".len()..].to_string();
+                    let Some(f) = container
+                        .focused_leaf()
+                        .or_else(|| container.leaves().first().cloned())
+                        .and_then(|f| f.surface_opt())
+                    else {
+                        eprintln!("ninja-embed: NINJA_ZOOM_FILE bindact 无可用 surface");
+                        return;
+                    };
+                    // SAFETY: 公开 C API；动作名合法（E2E 固定值）。
+                    unsafe {
+                        ghostty_sys::ghostty_surface_binding_action(
+                            f,
+                            name.as_ptr() as *const std::ffi::c_char,
+                            name.len(),
+                        )
+                    };
+                }
+                // panel：binding_action("toggle_visibility")——ninja 特有
+                // 动作经 ghostty 绑定系统驱动（不经菜单拦截；E2E 直证
+                // TOGGLE_VISIBILITY action 到宿主 dispatch）。
+                "panel" => {
+                    let Some(f) = container
+                        .focused_leaf()
+                        .or_else(|| container.leaves().first().cloned())
+                        .and_then(|f| f.surface_opt())
+                    else {
+                        eprintln!("ninja-embed: NINJA_ZOOM_FILE panel 无可用 surface");
+                        return;
+                    };
+                    // SAFETY: 公开 C API；toggle_visibility 是 app-scoped，
+                    // surface_binding_action 转发 app 路径 → action_cb。
+                    unsafe {
+                        ghostty_sys::ghostty_surface_binding_action(
+                            f,
+                            c"toggle_visibility".as_ptr(),
+                            c"toggle_visibility".to_bytes().len(),
+                        )
+                    };
+                }
+                // cfgdump：写 NINJA_CFG_DUMP（E2E 在任意时刻取生效配置快照）。
+                "cfgdump" => host::dump_config_if_requested(),
+                // reloadcfg：⌘⇧,（reload_config action）同途的绑定驱动
+                // 热重载（q2 E2E 可在任意时刻触发 action 路径）。
+                "reloadcfg" => {
+                    let Some(f) = container
+                        .focused_leaf()
+                        .or_else(|| container.leaves().first().cloned())
+                        .and_then(|f| f.surface_opt())
+                    else {
+                        eprintln!("ninja-embed: NINJA_ZOOM_FILE reloadcfg 无可用 surface");
+                        return;
+                    };
+                    // SAFETY: 公开 C API；reload_config 是 app-scoped，
+                    // surface_binding_action 转发 app 路径。
+                    unsafe {
+                        ghostty_sys::ghostty_surface_binding_action(
+                            f,
+                            c"reload_config".as_ptr(),
+                            c"reload_config".to_bytes().len(),
+                        )
+                    };
+                }
                 // "dump"/"dump2"/… 前缀都算 dump（轮询递增后缀绕去抖）。
                 s if s.starts_with("dump") => {
                     let Some(out) = std::env::var_os("NINJA_ZOOM_DUMP") else {
@@ -349,36 +472,98 @@ define_class!(
             }
         }
 
-        /// ⌘N：新窗口（nil target 动作最终落到 delegate）。
-        #[unsafe(method(ninjaNewWindow:))]
-        fn ninja_new_window(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let Some(mtm) = MainThreadMarker::new() else { return };
-            let app = NSApplication::sharedApplication(mtm);
-            let parent = app
-                .keyWindow()
-                .and_then(|w| crate::pane::container_of(&w))
-                .and_then(|c| c.focused_leaf().or_else(|| c.leaves().first().cloned()));
-            shell::new_window(mtm, parent.as_deref()); // make_window 内 wire_window
+        /// File→New Window：键位同源（binding_action("new_window") =
+        /// ⌘N 绑定的同一 action 路径）；无可用 surface（面板焦点态）直驱。
+        #[unsafe(method(ninjaActNewWindow:))]
+        fn ninja_act_new_window(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if !perform_menu_binding("new_window") {
+                let Some(mtm) = MainThreadMarker::new() else { return };
+                shell::new_window(mtm, None);
+            }
+        }
+
+        /// File→New Tab：同上（binding_action("new_tab")）。
+        #[unsafe(method(ninjaActNewTab:))]
+        fn ninja_act_new_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if !perform_menu_binding("new_tab") {
+                let Some(mtm) = MainThreadMarker::new() else { return };
+                shell::new_tab(mtm, None);
+            }
+        }
+
+        /// Panes 菜单动作（绑定路径；无焦点面时 no-op）。
+        #[unsafe(method(ninjaActSplitRight:))]
+        fn ninja_act_split_right(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("new_split:right");
+        }
+
+        #[unsafe(method(ninjaActSplitDown:))]
+        fn ninja_act_split_down(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("new_split:down");
+        }
+
+        #[unsafe(method(ninjaActToggleZoom:))]
+        fn ninja_act_toggle_zoom(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("toggle_split_zoom");
+        }
+
+        #[unsafe(method(ninjaActFocusLeft:))]
+        fn ninja_act_focus_left(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("goto_split:left");
+        }
+
+        #[unsafe(method(ninjaActFocusRight:))]
+        fn ninja_act_focus_right(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("goto_split:right");
+        }
+
+        #[unsafe(method(ninjaActFocusUp:))]
+        fn ninja_act_focus_up(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("goto_split:up");
+        }
+
+        #[unsafe(method(ninjaActFocusDown:))]
+        fn ninja_act_focus_down(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("goto_split:down");
+        }
+
+        #[unsafe(method(ninjaActPrevPane:))]
+        fn ninja_act_prev_pane(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("goto_split:previous");
+        }
+
+        #[unsafe(method(ninjaActNextPane:))]
+        fn ninja_act_next_pane(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("goto_split:next");
         }
 
         /// ⌘T / 系统标签栏 +：新标签（NSResponder 动作 newWindowForTab:）。
         #[unsafe(method(newWindowForTab:))]
         fn new_window_for_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+                eprintln!("ninja-embed: newWindowForTab:（系统标签动作/菜单/⌘T）");
+            }
             let Some(mtm) = MainThreadMarker::new() else { return };
             shell::new_tab(mtm, None); // make_window 内 wire_window
         }
 
-        /// ⌘, / App 菜单「Plugins…」：开/复用插件面板（q1 空面板态）。
+        /// ⌘, / App 菜单「Plugins…」：开/复用插件面板（q2 空面板态；
+        /// ⌘, 的键位语义来自宿主层 toggle_visibility 认领）。
         #[unsafe(method(ninjaPlugins:))]
         fn ninja_plugins(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let Some(mtm) = MainThreadMarker::new() else { return };
-            if let Some(p) = self.ivars().panel.borrow().as_ref() {
-                p.show();
-            } else {
-                let p = crate::panel::open(mtm);
-                p.show();
-                *self.ivars().panel.borrow_mut() = Some(p);
-            }
+            toggle_plugins();
+        }
+
+        /// 热重载执行拍（host::schedule_reload 起的 timer 落这里）。
+        #[unsafe(method(ninjaReloadTick:))]
+        fn ninja_reload_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            host::reload_tick();
+        }
+
+        /// 配置文件 mtime 监视拍（0.5s repeating）。
+        #[unsafe(method(ninjaConfigTick:))]
+        fn ninja_config_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            host::watch_tick();
         }
     }
 
@@ -386,46 +571,61 @@ define_class!(
 );
 
 // ---------------------------------------------------------------------------
-// 菜单（v1 默认键位；键位可配置系统是 q2）
+// 菜单：键位全量继承 ghostty（q2）——keyEquivalent 全部由
+// ghostty_config_trigger(action) 推导，菜单点击走 binding_action（同一
+// action 路径）。v1 的 ItemSpec 硬编码键位表已删（平行键位层不复活）。
 // ---------------------------------------------------------------------------
 
-struct ItemSpec {
+/// 菜单项：标题 + selector + ghostty 动作名（None = 快捷键/行为不映射
+/// ghostty 动作的特殊项，本表内无此情况；Close 项 keyEquivalent 取
+/// trigger(close_surface) 但 selector 走 performClose: 裸⌘W 决策）。
+struct MenuSpec {
     title: &'static str,
     selector: &'static str,
-    key: &'static str,
-    cmd: bool,
-    shift: bool,
-    alt: bool,
+    action: &'static str,
 }
 
-const APP_ITEMS: &[ItemSpec] = &[
-    ItemSpec { title: "Plugins…", selector: "ninjaPlugins:", key: ",", cmd: true, shift: false, alt: false },
-    ItemSpec { title: "Quit ninja", selector: "terminate:", key: "q", cmd: true, shift: false, alt: false },
+const APP_ITEMS: &[MenuSpec] = &[
+    // 插件面板 = ninja 特有动作：认领 ghostty 空闲动作 toggle_visibility
+    //（宿主层绑 ⌘,，用户可经 keybind 统一重绑）。
+    MenuSpec { title: "Plugins…", selector: "ninjaPlugins:", action: "toggle_visibility" },
+    MenuSpec { title: "Quit ninja", selector: "terminate:", action: "quit" },
 ];
 
-const FILE_ITEMS: &[ItemSpec] = &[
-    ItemSpec { title: "New Window", selector: "ninjaNewWindow:", key: "n", cmd: true, shift: false, alt: false },
-    ItemSpec { title: "New Tab", selector: "newWindowForTab:", key: "t", cmd: true, shift: false, alt: false },
-    ItemSpec { title: "Close", selector: "performClose:", key: "w", cmd: true, shift: false, alt: false },
+const FILE_ITEMS: &[MenuSpec] = &[
+    MenuSpec { title: "New Window", selector: "ninjaActNewWindow:", action: "new_window" },
+    MenuSpec { title: "New Tab", selector: "ninjaActNewTab:", action: "new_tab" },
+    // 裸⌘W 决策保留（shell.rs：多 pane 只关焦点面、单 pane 放行原生语义，
+    // 非键位绑定层）；keyEquivalent 仍与 ghostty close_surface 绑定同源。
+    MenuSpec { title: "Close", selector: "performClose:", action: "close_surface" },
 ];
 
-const PANE_ITEMS: &[ItemSpec] = &[
-    ItemSpec { title: "Split Right", selector: "ninjaSplitRight:", key: "d", cmd: true, shift: false, alt: false },
-    ItemSpec { title: "Split Down", selector: "ninjaSplitDown:", key: "d", cmd: true, shift: true, alt: false },
-    ItemSpec { title: "Close Pane", selector: "ninjaClosePane:", key: "w", cmd: true, shift: true, alt: false },
-    ItemSpec { title: "Zoom Pane", selector: "ninjaToggleZoom:", key: "\r", cmd: true, shift: true, alt: false },
-    ItemSpec { title: "Focus Pane Left", selector: "ninjaFocusLeft:", key: "\u{F702}", cmd: true, shift: false, alt: true },
-    ItemSpec { title: "Focus Pane Right", selector: "ninjaFocusRight:", key: "\u{F703}", cmd: true, shift: false, alt: true },
-    ItemSpec { title: "Focus Pane Up", selector: "ninjaFocusUp:", key: "\u{F700}", cmd: true, shift: false, alt: true },
-    ItemSpec { title: "Focus Pane Down", selector: "ninjaFocusDown:", key: "\u{F701}", cmd: true, shift: false, alt: true },
-    ItemSpec { title: "Previous Pane", selector: "ninjaPrevPane:", key: "[", cmd: true, shift: false, alt: false },
-    ItemSpec { title: "Next Pane", selector: "ninjaNextPane:", key: "]", cmd: true, shift: false, alt: false },
+const PANES_ITEMS: &[MenuSpec] = &[
+    MenuSpec { title: "Split Right", selector: "ninjaActSplitRight:", action: "new_split:right" },
+    MenuSpec { title: "Split Down", selector: "ninjaActSplitDown:", action: "new_split:down" },
+    MenuSpec { title: "Zoom Pane", selector: "ninjaActToggleZoom:", action: "toggle_split_zoom" },
+    MenuSpec { title: "Focus Pane Left", selector: "ninjaActFocusLeft:", action: "goto_split:left" },
+    MenuSpec { title: "Focus Pane Right", selector: "ninjaActFocusRight:", action: "goto_split:right" },
+    MenuSpec { title: "Focus Pane Up", selector: "ninjaActFocusUp:", action: "goto_split:up" },
+    MenuSpec { title: "Focus Pane Down", selector: "ninjaActFocusDown:", action: "goto_split:down" },
+    MenuSpec { title: "Previous Pane", selector: "ninjaActPrevPane:", action: "goto_split:previous" },
+    MenuSpec { title: "Next Pane", selector: "ninjaActNextPane:", action: "goto_split:next" },
 ];
 
-const EDIT_ITEMS: &[ItemSpec] = &[
-    ItemSpec { title: "Copy", selector: "copy:", key: "c", cmd: true, shift: false, alt: false },
-    ItemSpec { title: "Paste", selector: "paste:", key: "v", cmd: true, shift: false, alt: false },
-    ItemSpec { title: "Select All", selector: "selectAll:", key: "a", cmd: true, shift: false, alt: false },
+const WINDOW_ITEMS: &[MenuSpec] = &[
+    MenuSpec { title: "Next Tab", selector: "selectNextTab:", action: "next_tab" },
+    MenuSpec { title: "Previous Tab", selector: "selectPreviousTab:", action: "previous_tab" },
+];
+
+const EDIT_ITEMS: &[MenuSpec] = &[
+    // selector 落 first responder（SurfaceHostView 实现并转 binding_action）。
+    // 注意：copy/paste 的默认绑定带 performable 旗标——Trigger.Set 不为
+    // performable 绑定建反向映射（getTrigger 返空，Binding.zig putFlags），
+    // 菜单不显示快捷键（⌘C/⌘V 仍由 surface_key → ghostty 运行时判定执行，
+    // 不被菜单拦截——语义正确）；selectAll 无旗标，⌘A 正常镜像。
+    MenuSpec { title: "Copy", selector: "copy:", action: "copy_to_clipboard" },
+    MenuSpec { title: "Paste", selector: "paste:", action: "paste_from_clipboard" },
+    MenuSpec { title: "Select All", selector: "selectAll:", action: "select_all" },
 ];
 
 fn add_submenu(mtm: MainThreadMarker, main_menu: &NSMenu, title: &str) -> Retained<NSMenu> {
@@ -439,32 +639,47 @@ fn add_submenu(mtm: MainThreadMarker, main_menu: &NSMenu, title: &str) -> Retain
     menu
 }
 
-fn add_item(mtm: MainThreadMarker, menu: &NSMenu, spec: &ItemSpec) {
+fn add_item(mtm: MainThreadMarker, menu: &NSMenu, spec: &MenuSpec) {
+    // keyEquivalent 单一来源：生效 ghostty 配置里该动作的当前绑定
+    //（未绑定 → 无快捷键、菜单点击不驱动——菜单镜像键位系统）。
+    let equiv = host::config().and_then(|cfg| {
+        crate::config::action_equivalent(cfg, spec.action)
+    });
     let sel = std::ffi::CString::new(spec.selector).expect("selector cstr");
+    let key = equiv
+        .and_then(|e| char::from_u32(u32::from(e.key)))
+        .map(String::from)
+        .unwrap_or_default();
     // SAFETY: NSMenuItem 指定初始化器；参数平凡。
     let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
             &NSString::from_str(spec.title),
             Some(objc2::runtime::Sel::register(sel.as_c_str())),
-            &NSString::from_str(spec.key),
+            &NSString::from_str(&key),
         )
     };
-    let mut flags = NSEventModifierFlags(0);
-    if spec.cmd {
-        flags |= NSEventModifierFlags::Command;
+    if let Some(e) = equiv {
+        let mut flags = NSEventModifierFlags(0);
+        if e.cmd {
+            flags |= NSEventModifierFlags::Command;
+        }
+        if e.shift {
+            flags |= NSEventModifierFlags::Shift;
+        }
+        if e.alt {
+            flags |= NSEventModifierFlags::Option;
+        }
+        if e.ctrl {
+            flags |= NSEventModifierFlags::Control;
+        }
+        item.setKeyEquivalentModifierMask(flags);
     }
-    if spec.shift {
-        flags |= NSEventModifierFlags::Shift;
-    }
-    if spec.alt {
-        flags |= NSEventModifierFlags::Option;
-    }
-    item.setKeyEquivalentModifierMask(flags);
     menu.addItem(&item);
 }
 
-/// 建菜单栏：App / File / Panes / Window / Edit（v1 布局）。
+/// 建菜单栏：App / File / Panes / Window / Edit（v1 布局；键位自配置）。
+/// 热重载后重调（配置变化 → 键位/菜单同步）。
 fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let main_menu = NSMenu::new(mtm);
 
@@ -483,25 +698,18 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     }
 
     let pane_menu = add_submenu(mtm, &main_menu, "Panes");
-    for (i, spec) in PANE_ITEMS.iter().enumerate() {
-        // 分隔：Zoom Pane（布局态）之后、导航组尾之后（v1 同款）。
-        if i == 4 || i == 8 {
+    // 分隔：Zoom Pane（布局态）之后、导航组尾之后（v1 同款）。
+    for (i, spec) in PANES_ITEMS.iter().enumerate() {
+        if i == 3 || i == 7 {
             pane_menu.addItem(&NSMenuItem::separatorItem(mtm));
         }
         add_item(mtm, &pane_menu, spec);
     }
 
     let window_menu = add_submenu(mtm, &main_menu, "Window");
-    add_item(
-        mtm,
-        &window_menu,
-        &ItemSpec { title: "Next Tab", selector: "selectNextTab:", key: "]", cmd: true, shift: true, alt: false },
-    );
-    add_item(
-        mtm,
-        &window_menu,
-        &ItemSpec { title: "Previous Tab", selector: "selectPreviousTab:", key: "[", cmd: true, shift: true, alt: false },
-    );
+    for spec in WINDOW_ITEMS {
+        add_item(mtm, &window_menu, spec);
+    }
 
     let edit_menu = add_submenu(mtm, &main_menu, "Edit");
     for spec in EDIT_ITEMS {
@@ -563,15 +771,17 @@ impl AppDelegate {
     }
 }
 
-/// 进程入口（q1 交互壳）：ghostty_init → app/config → 菜单/delegate →
-/// runloop。⌘Q / 最后窗关闭 → NSApp.run 返回 → main 统一收尾 free。
+/// 进程入口（q2 配置壳）：ghostty_init → 装载管线（宿主层/ODP 层/用户
+/// 配置/finalize，见 crate::config）→ app → 菜单（键位自配置推导）→
+/// delegate/runloop + 热重载监视。⌘Q / 最后窗关闭 → NSApp.run 返回 →
+/// main 统一收尾 free。
 pub fn run() {
     let mtm = MainThreadMarker::new().expect("ninja-embed must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
 
-    // ghostty 全局初始化 + 配置（默认配置；加载/热重载是 q2——q1 只用
-    // 钉点默认：默认 shell、默认键位、macOS 默认语义）。
+    // ghostty 全局初始化 + q2 全量装载管线（用户既有 ghostty 配置直接
+    // 生效：主题/字体/键位；GHOSTTY_RESOURCES_DIR 在 main 里已就位）。
     unsafe {
         assert_eq!(ghostty_sys::ghostty_init(0, std::ptr::null_mut()), 0, "ghostty_init failed");
         let info = ghostty_sys::ghostty_info();
@@ -581,15 +791,21 @@ pub fn run() {
         ))
         .unwrap()
         .to_string();
-        println!("ninja-embed q1 shell — libghostty {version}");
-        let config = ghostty_sys::ghostty_config_new();
-        ghostty_sys::ghostty_config_load_default_files(config);
-        ghostty_sys::ghostty_config_finalize(config);
-        host::init(ghostty_sys::ghostty_app_new(&host::runtime_config(), config), config);
+        let (config, load_info) = crate::config::load_pipeline();
+        println!(
+            "ninja-embed q2 shell — libghostty {version}；配置：用户 theme={} ODP={} 监视 {} 文件；资源目录 {:?}",
+            load_info.user_theme,
+            load_info.odp_applied,
+            load_info.watched.len(),
+            std::env::var("GHOSTTY_RESOURCES_DIR").unwrap_or_default()
+        );
+        host::init(ghostty_sys::ghostty_app_new(&host::runtime_config(), config), config, load_info);
     }
     ghostty_app_set_focus_compat(true);
 
+    // 菜单（keyEquivalent 从生效配置的 trigger 推导）+ 启动取证 dump。
     build_menu(mtm, &app);
+    host::dump_config_if_requested();
 
     // 两阶段初始化（v1 惯例）：先放 ivars 再走 NSObject 的 init。
     let this = AppDelegate::alloc(mtm).set_ivars(Ivars {
@@ -644,4 +860,47 @@ pub fn run() {
 
 fn ghostty_app_set_focus_compat(focused: bool) {
     host::with_app(|app| unsafe { ghostty_sys::ghostty_app_set_focus(app, focused) });
+}
+
+// ---------------------------------------------------------------------------
+// 菜单/键位共享路径 + 配置应用回调
+// ---------------------------------------------------------------------------
+
+/// 菜单项动作驱动：焦点面经 `ghostty_surface_binding_action`（与该动作
+/// 的键位绑定同一 action 路径——菜单镜像键位系统，无平行层）。
+/// 返回是否驱动成功（false = 无可用 surface，调用方可回退宿主直驱）。
+fn perform_menu_binding(action: &str) -> bool {
+    if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+        eprintln!("ninja-embed: menu→binding_action({action})");
+    }
+    let Some(view) = host::current_surface_view() else {
+        if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+            eprintln!("ninja-embed: menu→binding 无可用 surface，回退/no-op");
+        }
+        return false;
+    };
+    view.binding_action(action);
+    true
+}
+
+/// 开/复用插件面板（菜单 ⌘, 与 TOGGLE_VISIBILITY action 同途）。
+pub fn toggle_plugins() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(d) = delegate() else { return };
+    if let Some(p) = d.ivars().panel.borrow().as_ref() {
+        p.show();
+    } else {
+        let p = crate::panel::open(mtm);
+        p.show();
+        *d.ivars().panel.borrow_mut() = Some(p);
+    }
+}
+
+/// 配置应用后的壳侧刷新（host::reload_tick 调）：菜单键位重建 + 取证
+/// dump。菜单 keyEquivalent 与生效键位同步（用户重绑 → 菜单跟随）。
+pub fn on_config_applied() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    build_menu(mtm, &app);
+    host::dump_config_if_requested();
 }
