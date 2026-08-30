@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# 程序化生成 Ninja 应用图标：scripts/make_icon.swift（CoreGraphics 矢量
-# 绘制，One Dark Pro 深底 + 忍者头：头带/眼缝/双眼）→ 10 个标准尺寸
-# PNG → iconutil 合成 .icns。
+# 从 assets/icon-source.png 生成 Ninja 应用图标：
+#   scripts/icon_from_png.swift（aspect-fill + macOS 圆角 alpha 蒙版，
+#   高质量降采样）→ 10 个标准尺寸 PNG → iconutil 合成 .icns。
+# 源图 2026-08-30 由用户选定（ChatGPT 生成，1254×1254）。
 #
 # 内建回归自检（失败即非零退出，不产出坏图标）：
 #   1) iconset 10 个 PNG 齐且像素尺寸与文件名一致（sips）；
-#   2) 像素级采样（make_icon.swift --sample）：透明圆角、底色、兜帽、
-#      头带、眼缝、双眼、飘带特征色字节保真落位（色彩空间回归）；
-#   3) 32px（Retina 16pt 实际资产）双眼存活性采样；
-#   4) iconutil 出 .icns 后回读 iconset，条目数守恒。
+#   2) 像素采样（icon_from_png.swift --sample）：圆角外透明
+#      （蒙版真的套上了）、中心不透明且非全黑（内容真的画上了），
+#      32px 小尺寸同样验证（Retina 16pt 实际资产）；
+#   3) iconutil 出 .icns 后回读 iconset，条目数守恒。
 #
 # 用法：scripts/make_icon.sh <output.icns>
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
-SWIFT_ICON="$ROOT/scripts/make_icon.swift"
+SWIFT_ICON="$ROOT/scripts/icon_from_png.swift"
+SOURCE="$ROOT/assets/icon-source.png"
 
 OUT="${1:?用法: scripts/make_icon.sh <output.icns>}"
 ICONSET="$ROOT/target/AppIcon.iconset"
@@ -26,10 +28,12 @@ declare -a NAMES=(icon_16x16 icon_16x16@2x icon_32x32 icon_32x32@2x \
                   icon_512x512 icon_512x512@2x)
 declare -a PX=(16 32 32 64 128 256 256 512 512 1024)
 
-echo "==> [1/4] 矢量绘制 iconset（Swift/CoreGraphics）→ $ICONSET"
+[[ -f "$SOURCE" ]] || { echo "错误：源图不存在 $SOURCE" >&2; exit 1; }
+
+echo "==> [1/4] 源图 → iconset（Swift/CoreGraphics）→ $ICONSET"
 rm -rf "$ICONSET"
 mkdir -p "$ICONSET"
-swift "$SWIFT_ICON" "$ICONSET"
+swift "$SWIFT_ICON" "$SOURCE" "$ICONSET"
 
 echo "==> [2/4] 自检：文件数/像素尺寸"
 [[ $(find "$ICONSET" -name '*.png' | wc -l | tr -d ' ') -eq 10 ]] || {
@@ -42,26 +46,28 @@ for i in "${!NAMES[@]}"; do
     echo "错误：${NAMES[$i]}.png 期望 ${want}×${want}，实际 $got" >&2; exit 1; }
 done
 
-echo "==> [3/4] 自检：特征色采样（色彩空间与几何回归）"
-# 1024 图上采样（y 从顶部数）。颜色字节精确——不精确=CGColor 空间陷阱
-# 回归（见 make_icon.swift 头注释）或几何被动过。
-sample() { # <png> <x> <y> <期望 "#RRGGBB a=NNN">
-  local got
-  got="$(swift "$SWIFT_ICON" --sample "$1" "$2" "$3")"
-  [[ "$got" == "$4" ]] || {
-    echo "错误：$1 ($2,$3) 期望 $4，实际 $got" >&2; exit 1; }
-}
+echo "==> [3/4] 自检：圆角蒙版与内容采样"
+# 采样输出 "#RRGGBB a=NNN"（y 从顶部数），内联调用 icon_from_png.swift --sample。
 BIG="$ICONSET/icon_512x512@2x.png"
-sample "$BIG"   6   6 '#000000 a=0'      # 圆角外透明（圆角方形，非满幅方块）
-sample "$BIG" 512  64 '#282C34 a=255'    # 底：ODP 深底
-sample "$BIG" 512 250 '#333842 a=255'    # 兜帽剪影
-sample "$BIG" 512 404 '#E06C75 a=255'    # 头带（ODP 红，在头部上半）
-sample "$BIG" 512 615 '#14161B a=255'    # 眼缝开口（头带之下）
-sample "$BIG" 412 615 '#61AFEF a=255'    # 左眼（ODP 蓝）
-sample "$BIG" 900 374 '#E06C75 a=255'    # 右上飘带
-# 32px（=icon_16x16@2x，Retina 16pt 实际资产）：双眼必须存活。
-# 眼宽 ~3.75px，采样眼中心整像素（1024 空间右眼心 (612,615) → (19,19)）。
-sample "$ICONSET/icon_16x16@2x.png" 19 19 '#61AFEF a=255'
+# 圆角外必须透明
+for pt in "6 6" "1018 6" "6 1018" "1018 1018"; do
+  set -- $pt
+  got="$(swift "$SWIFT_ICON" --sample "$BIG" "$1" "$2")"
+  [[ "$got" == *"a=0" ]] || {
+    echo "错误：1024 图 ($1,$2) 圆角外应透明，实际 $got（蒙版未生效？）" >&2; exit 1; }
+done
+# 中心必须不透明且非全黑（内容画上了）
+got="$(swift "$SWIFT_ICON" --sample "$BIG" 512 512)"
+[[ "$got" == *"a=255" && "$got" != "#000000 a=255" ]] || {
+  echo "错误：1024 图中心内容缺失（$got）" >&2; exit 1; }
+# 32px（=icon_16x16@2x，Retina 16pt 实际资产）：角透明 + 中心有内容
+SMALL="$ICONSET/icon_16x16@2x.png"
+got="$(swift "$SWIFT_ICON" --sample "$SMALL" 1 1)"
+[[ "$got" == *"a=0" ]] || {
+  echo "错误：32px 角不透明（$got）" >&2; exit 1; }
+got="$(swift "$SWIFT_ICON" --sample "$SMALL" 16 16)"
+[[ "$got" == *"a=255" ]] || {
+  echo "错误：32px 中心无内容（$got）" >&2; exit 1; }
 
 echo "==> [4/4] iconutil → ${OUT}；回读自检"
 mkdir -p "$(dirname "$OUT")"
