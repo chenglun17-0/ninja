@@ -60,6 +60,8 @@ objc2-app-kit = { version = "0.3", features = [
     "NSGraphics",
     "NSColor",
     "NSWorkspace",
+    # X2 标题栏主题化：标题文字随底色明暗换 vibrantDark/vibrantLight。
+    "NSAppearance",
     # 面板 v2（2026-08-29 决策）：插件面板的开关/状态标签/行布局。
     "NSButton",
     "NSControl",

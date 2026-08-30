@@ -1234,8 +1234,9 @@ fn unregister_for_theme(view: &TerminalView) {
 
 /// T2 换色板落地入口（plugins.rs 的 theme.set 处置与回退路径调）：
 /// 每个存活 pane 重钉 vt 色板（含强制全量重解码，跳帧不吃）+ 重画 +
-/// 容器 chrome（底色/分隔条/焦点环）刷新。只能在主线程调（插件帧处置
-/// 本就在主线程）。
+/// 容器 chrome（底色/分隔条/焦点环）刷新 + **X2 窗口标题栏重套**
+/// （背景色/标题文字随新色板，标题栏与内容同步换）。只能在主线程调
+/// （插件帧处置本就在主线程）。
 pub fn apply_theme_all() {
     let views = match THEME_VIEWS.lock() {
         Ok(v) => v.clone(),
@@ -1247,6 +1248,10 @@ pub fn apply_theme_all() {
         let view: &TerminalView = unsafe { &*(p as *const TerminalView) };
         view.apply_theme();
     }
+    // X2：标题栏区域不在任何 TerminalView/Metal drawable 里（系统画的
+    // 窗口背景），视图重画盖不到——窗口级重套（换 backgroundColor +
+    // appearance，含标题文字黑白翻转）。
+    crate::shell::apply_theme_chrome_all();
 }
 
 impl TerminalView {

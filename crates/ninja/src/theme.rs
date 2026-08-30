@@ -205,6 +205,15 @@ pub fn revoke_all() -> bool {
     OVERRIDE.lock().map(|mut s| s.take().is_some()).unwrap_or(false)
 }
 
+/// X2 标题栏配色：色亮度判定（标题文字随底色自动黑白的阈值）。加权
+/// 亮度（ITU-R BT.601，与色觉习惯一致）：ODP 背景 #282C34 ≈ 0.17 →
+/// 深；白底 → 1.0 → 浅。窗口 chrome（标题文字/红绿灯件）用它选
+/// vibrantDark/vibrantLight（shell::apply_theme_chrome）。纯函数，可单测。
+pub fn is_dark(c: Rgb) -> bool {
+    let lum = (0.299 * f32::from(c.0) + 0.587 * f32::from(c.1) + 0.114 * f32::from(c.2)) / 255.0;
+    lum < 0.5
+}
+
 /// 协议 `#rrggbb`（恰好 6 位十六进制，大小写均可）→ [`Rgb`]。不收
 /// `#abc` 短写/`0x` 前缀（协议钉死 6 位；宿主解析失败 = 载荷语义坏，
 /// plugins.rs 整条忽略）。
@@ -261,6 +270,22 @@ mod tests {
         assert_eq!(ANSI[15], Rgb(0xE6, 0xE6, 0xE6));
         // 16 色齐全（数组长度即钉死，这里只防未来改形状）。
         assert_eq!(ANSI.len(), 16);
+    }
+
+    /// X2：亮度阈值——ODP/solarized 深底 → 白标题字；白/浅黄底 → 黑
+    /// 标题字（插件可推浅色板，标题栏必须同样适配）。
+    #[test]
+    fn is_dark_pins_titlebar_appearance_threshold() {
+        assert!(is_dark(BACKGROUND), "ODP #282C34 是深底");
+        assert!(is_dark(Rgb(0x00, 0x2B, 0x36)), "solarized base03 是深底");
+        assert!(!is_dark(Rgb(0xFF, 0xFF, 0xFF)), "白底是浅底");
+        assert!(
+            !is_dark(Rgb(0xFD, 0xF6, 0xE3)),
+            "solarized light base3 是浅底"
+        );
+        // 阈值附近钉一个锚点：中灰 #808080 ≈ 0.502 → 浅侧。
+        assert!(!is_dark(Rgb(0x80, 0x80, 0x80)));
+        assert!(is_dark(Rgb(0x7F, 0x7F, 0x7F)));
     }
 
     /// 回归（T-主题）：TermState 建核即 One Dark Pro——默认前景/背景

@@ -30,6 +30,12 @@
 //!   （enabled = []，paths/注释保留）；
 //! - "theme on" → 从零重拉（socket 重现 + 重新推色板 + toml 回
 //!   enabled = ["theme"]）。
+//!
+//! X2 补充：标题栏区域（窗口 chrome，非 Metal drawable）同样采样断言
+//! ——theme.set 生效时 ≈ #002B36，回退时 ≈ #282C34（window_probe 共用
+//! 件 + tools/verify/shot_window.swift 窗口截图探针）。
+
+mod window_probe;
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt as _;
@@ -334,6 +340,19 @@ fn wait_theme_applied(s: &Session, tag: &str) -> u32 {
         "[{tag}] 像素探针未见 solarized 背景 {SOLARIZED_BG:?}（theme.set 未生效/被跳帧吃掉？host_err：{:?}）",
         host_err_of(&s)
     );
+    // X2 标题栏采样：窗口 chrome（标题栏区域）随 theme.set 同步换——
+    // 非 Metal drawable，drawable 探针盖不到（修复前实测白色
+    // (246,242,241)）。面板场景会多一个非终端窗（面板不主题化），取
+    // 任一窗口命中。
+    let titlebar =
+        window_probe::wait_any_titlebar_near(s.host_pid, SOLARIZED_BG, Duration::from_secs(10))
+            .unwrap_or_else(|| {
+                panic!(
+                    "[{tag}] 标题栏未随 theme.set 换 solarized {SOLARIZED_BG:?}（host_err：{:?}）",
+                    host_err_of(&s)
+                )
+            });
+    assert!(window_probe::near(titlebar, SOLARIZED_BG));
     // OSC 10/11：应答换新（vt 默认色被重钉）。
     assert!(
         wait_file_contains(&s.osc10, SOLARIZED_OSC10, Duration::from_secs(10)),
@@ -354,7 +373,7 @@ fn wait_theme_applied(s: &Session, tag: &str) -> u32 {
     plugin_pid
 }
 
-/// 等回 ODP 基线（像素 + OSC 双证据）。
+/// 等回 ODP 基线（像素 + OSC + X2 标题栏三证据）。
 fn wait_baseline_back(s: &Session, tag: &str) {
     assert!(
         wait_until(Duration::from_secs(15), || {
@@ -364,6 +383,17 @@ fn wait_baseline_back(s: &Session, tag: &str) {
         "[{tag}] 回退后像素探针未见 ODP 背景 {ODP_BG:?}（host_err：{:?}）",
         host_err_of(&s)
     );
+    // X2 标题栏采样：回退同样覆盖标题栏（apply_theme_chrome_all 重套；
+    // 面板场景多一个非终端窗，取任一命中）。
+    let titlebar =
+        window_probe::wait_any_titlebar_near(s.host_pid, ODP_BG, Duration::from_secs(10))
+            .unwrap_or_else(|| {
+                panic!(
+                    "[{tag}] 回退后标题栏未回 ODP {ODP_BG:?}（host_err：{:?}）",
+                    host_err_of(&s)
+                )
+            });
+    assert!(window_probe::near(titlebar, ODP_BG));
     assert!(
         wait_file_contains(&s.osc11, ODP_OSC11, Duration::from_secs(10)),
         "[{tag}] OSC 11 应答未回 ODP（got：{:?}）",

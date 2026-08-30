@@ -32,6 +32,19 @@ zig）。macOS 之外或别的机器同理：保证 `zig version` 是 0.15.x 即
 首次 `cargo build/test` 会联网 clone ghostty 钉点并拉 zig 依赖
 （离线场景可用 `GHOSTTY_SOURCE_DIR` / `GHOSTTY_ZIG_SYSTEM_DIR` 预置）。
 
+## verify/ 取证脚本（本地不入库）
+
+`tools/verify/` 在 `.gitignore` 里（同目录惯例：synth_input.swift /
+shot_text.swift 也是本地脚本），但多个 `NINJA_E2E=1` 门控的 E2E 依赖
+`tools/verify/synth_input.swift`（cmdw_surface_close / ctrl_c_interrupts /
+layer_preview / off_is_light）；X2 起标题栏像素回归（titlebar_theme）
+与 theme_switch 的标题栏采样依赖 `tools/verify/shot_window.swift`：
+按 PID 找 CGWindowID → `screencapture -l<wid>` 截整窗（含标题栏）→
+采样相对矩形平均色（标题栏不是 Metal drawable，`NINJA_DUMP_DRAWABLE`
+探不到）。需要运行终端有屏幕录制授权（TCC）。脚本随仓库分发的脚本
+在仓库里没有备份：新机器参照本文件与各测试头部注释重建，或从原机器
+拷贝 `tools/verify/` 目录。
+
 ## D-C 渲染跳帧取证脚本（p6 后定点修复）
 
 三个可复跑的 CPU 取证脚本（修前/修后用同一脚本同一时长对比）：

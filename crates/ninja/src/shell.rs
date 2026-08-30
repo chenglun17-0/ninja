@@ -12,9 +12,10 @@
 use objc2::rc::Retained;
 use objc2::{ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSEventType, NSWindow, NSWindowOrderingMode,
-    NSWindowStyleMask,
+    NSAppearance, NSAppearanceCustomization, NSApplication, NSBackingStoreType, NSEventType,
+    NSTitlebarSeparatorStyle, NSWindow, NSWindowOrderingMode, NSWindowStyleMask,
 };
+use objc2_app_kit::{NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight};
 use objc2_foundation::NSString;
 
 use crate::app::AppDelegate;
@@ -51,6 +52,9 @@ pub fn make_window(
     window.setTitle(&NSString::from_str("ninja"));
     window.setTabbingIdentifier(&NSString::from_str(TABBING_ID));
     window.setContentView(Some(&container));
+    // X2 标题栏主题化：建窗即套（用户实测：窗口顶部标题栏白色、没跟
+    // ODP 深色主题——系统默认标题栏背景是浅色材质，与终端底色割裂）。
+    apply_theme_chrome(&window);
     // 所有权模型（p2）：窗口默认 releasedWhenClosed=YES——close 时窗口
     // 自释放，再加上壳的 registry 强引用就是过释放（实测关窗 SIGSEGV，
     // pc=0xc8 跳已释放对象）。改为 NO：registry 是唯一 owner，close 完成
@@ -61,6 +65,56 @@ pub fn make_window(
     // 防止拆一半时回调进 view。
     window.setDelegate(Some(&objc2::runtime::ProtocolObject::from_ref(delegate)));
     window
+}
+
+/// X2 标题栏主题化：把窗口 chrome（标题栏区域）钉到生效色板，与内容
+/// 统一。四件事：
+///
+/// 1. `titlebarAppearsTransparent`——标题栏不再画系统材质底；
+/// 2. 窗口背景色 = 生效色板 bg——透明标题栏露出的就是它（内容区被
+///    PaneContainer 全盖住，不受影响；终端网格/布局零改动）；
+/// 3. `titlebarSeparatorStyle = None`——不画 titlebar/内容间的系统
+///    hairline（浅色细线会横穿统一底色）；
+/// 4. 标题文字/红绿灯随底色明暗自动黑白：色板 bg 深（theme::is_dark）
+///    → vibrantDark（白字），浅 → vibrantLight（黑字）。不由系统外观
+///    决定——系统浅色外观下终端也是深底，白字才可读。
+///
+/// 幂等：建窗时调一次（make_window）；theme.set 换色板/回退时对全部
+/// 终端窗重调（apply_theme_chrome_all）。换背景色后 invalidateShadow
+/// 兜底重算窗口阴影（透明标题栏下阴影按内容重算，防残留）。
+pub fn apply_theme_chrome(window: &NSWindow) {
+    window.setTitlebarAppearsTransparent(true);
+    window.setTitlebarSeparatorStyle(NSTitlebarSeparatorStyle::None);
+    window.setBackgroundColor(Some(&crate::pane::theme_background_color()));
+    // SAFETY: extern static 读取（链接器保证存在）；NSAppearance 查表安全。
+    let name = unsafe {
+        if crate::theme::is_dark(crate::theme::current().bg) {
+            NSAppearanceNameVibrantDark
+        } else {
+            NSAppearanceNameVibrantLight
+        }
+    };
+    if let Some(a) = NSAppearance::appearanceNamed(name) {
+        window.setAppearance(Some(&a));
+    }
+    window.invalidateShadow();
+}
+
+/// X2：全部终端窗重套 chrome（theme.set 运行时换色板/回退时调，见
+/// view::apply_theme_all）。多窗口/标签一致：NSApp.windows 枚举含 tab
+/// 组里每个 NSWindow（共享标题栏属于当前选中窗，但每窗都重套，选中
+/// 谁都是新色）。只碰 contentView 是 PaneContainer 的窗（插件面板等
+/// 非终端窗不动，避免强改面板明暗）。只能在主线程调。
+pub fn apply_theme_chrome_all() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    for w in app.windows().iter() {
+        if pane_container_of(&w).is_some() {
+            apply_theme_chrome(&w);
+        }
+    }
 }
 
 /// pane 的 shell 退出：把它从所属窗口的 pane 树拆掉；最后剩一个 pane
