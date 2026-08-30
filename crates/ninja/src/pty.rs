@@ -163,6 +163,13 @@ impl Pty {
                     1,
                 );
                 libc::unsetenv(b"TMUX\0".as_ptr().cast());
+                // X4：GUI 进程（Dock/Finder/open 启动）的 cwd 是 /，不 chdir
+                // 的话新 shell 打开就落在根目录。终端惯例：新 pane 默认
+                // 在家目录；HOME 取不到时保持现状 cwd。
+                let home_ptr = libc::getenv(b"HOME\0".as_ptr().cast());
+                if !home_ptr.is_null() {
+                    libc::chdir(home_ptr);
+                }
                 // argv[0] 带 `-` 前缀 = 登录 shell（iTerm/Terminal.app 同款做法）。
                 let argv0 = CString::new(format!("-{}", shell.rsplit('/').next().unwrap_or(&shell)))
                     .unwrap_or_else(|_| CString::new("-bash").unwrap());
@@ -384,6 +391,34 @@ mod tests {
 
         // resize ioctl 不报错（shell 侧效果不在此断言）。
         pty.resize(100, 30, 10, 20);
+    }
+
+    /// X4 回归：新 shell 的 cwd 必须是 $HOME（GUI 进程 cwd=/ 的坑）。
+    #[test]
+    fn spawn_shell_starts_in_home() {
+        let home = std::env::var("HOME").expect("测试环境必须有 HOME");
+        let pty = Pty::spawn(Some("/bin/sh"), 40, 10).unwrap();
+        pty.inner.write(b"pwd\nexit\n".to_vec());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got = Vec::new();
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let (chunks, _) = pty.inner.drain();
+            for chunk in chunks {
+                got.extend_from_slice(&chunk);
+            }
+            if let Ok(text) = std::str::from_utf8(&got) {
+                if text.contains(&home) {
+                    break;
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.contains(&home),
+            "pwd 应输出家目录 {home}，实际：{text}"
+        );
     }
 
     /// D-C 回归：has_pending peek——drain 后为 false，写过去回声到达后
