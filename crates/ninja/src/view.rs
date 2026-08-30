@@ -862,6 +862,35 @@ impl TerminalView {
             .all(|c| matches!(c, crate::link::RowCell::Blank | crate::link::RowCell::Cont))
     }
 
+    /// X3 取证：视口网格尺寸（zoom 状态快照用；主线程只读）。
+    pub fn grid_size(&self) -> (u16, u16) {
+        let st = self.state();
+        (st.term.cols(), st.term.rows())
+    }
+
+    /// X3 取证：视口最下方有字的一行文本（E2E 断言隐藏面数据没丢；
+    /// 主线程只读 vt 网格，自底向上找首个非空白行）。
+    pub fn last_text_line(&self) -> String {
+        let st = self.state();
+        let (cols, rows) = (st.term.cols(), st.term.rows());
+        let mut cbuf = ['\0'; 8];
+        for y in (0..rows).rev() {
+            let mut line = String::new();
+            for x in 0..cols {
+                if let Ok(g) = st.term.grid_ref_viewport(x, y)
+                    && let Ok(n) = g.graphemes(&mut cbuf)
+                    && n > 0
+                {
+                    line.extend(cbuf[..n].iter());
+                }
+            }
+            if !line.trim().is_empty() {
+                return line.trim_end().to_string();
+            }
+        }
+        String::new()
+    }
+
     // ---- 几何 ----
 
     fn point_of_event(&self, event: &NSEvent) -> (f64, f64) {
@@ -1009,6 +1038,12 @@ impl TerminalView {
     }
 
     fn render_now(&self) {
+        // X3：隐藏面（放大的是别的 pane）不出帧——vt 解码在 on_pty_data
+        // 已推进（数据不丢），这里只省掉不可见的 GPU 提交；还原后
+        // relayout 尾部的 setNeedsDisplay → drawRect 补回一帧。
+        if self.isHidden() {
+            return;
+        }
         let mut st = self.state();
         let pane = st.pane_id;
         let layers = layer::draw_list(pane);

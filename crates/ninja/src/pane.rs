@@ -16,8 +16,8 @@ use std::collections::HashMap;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSColor, NSEvent, NSResponder, NSView};
+use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2_app_kit::{NSColor, NSEvent, NSResponder, NSView, NSWindowStyleMask};
 use objc2_core_graphics::CGColor;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::CALayer;
@@ -58,6 +58,30 @@ const RATIO_MIN: f64 = 0.15;
 const RATIO_MAX: f64 = 0.85;
 /// 焦点环边框厚度（points）。
 const RING_BORDER: f64 = 1.5;
+
+/// X3 zoom 决策（纯逻辑，可单测）：⌘⇧Enter（toggle_zoom）按下时的动作。
+/// - 单 pane（无分屏）→ 窗口 zoom（最大化非全屏，NSWindow 原生语义）；
+/// - 有分屏 + 未放大 → 放大焦点 pane（无可用目标 = 无操作）；
+/// - 有分屏 + 已放大 → 还原布局。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ZoomDecision {
+    WindowZoom,
+    ZoomFocused,
+    Restore,
+    None,
+}
+
+pub fn zoom_decision(leaf_count: usize, zoomed: bool, has_target: bool) -> ZoomDecision {
+    if leaf_count <= 1 {
+        ZoomDecision::WindowZoom
+    } else if zoomed {
+        ZoomDecision::Restore
+    } else if has_target {
+        ZoomDecision::ZoomFocused
+    } else {
+        ZoomDecision::None
+    }
+}
 
 /// 分屏方向：Horizontal = 左右排（⌘D 右分），Vertical = 上下排（⌘⇧D 下分）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -163,6 +187,10 @@ pub struct Ivars {
     next_id: Cell<u64>,
     dividers: RefCell<HashMap<u64, Retained<DividerView>>>,
     ring: RefCell<Option<Retained<FocusRingView>>>,
+    /// X3：当前放大的叶子（None = 未放大）。放大态下其余叶子与分隔条
+    /// setHidden 隐藏但**不销毁**：PTY/vt/滚动位置全保留，数据继续喂
+    /// vt（隐藏面不出帧，解码不丢）；还原即重显正确内容。
+    zoomed: RefCell<Option<Retained<TerminalView>>>,
 }
 
 define_class!(
@@ -249,6 +277,13 @@ define_class!(
         fn next_pane(&self, _sender: Option<&AnyObject>) {
             self.cycle_focus(1);
         }
+
+        /// X3 ⌘⇧Enter（菜单 Panes → Zoom Pane）：多 pane 放大焦点面 /
+        /// 再按还原；无分屏 = 窗口 zoom。
+        #[unsafe(method(ninjaToggleZoom:))]
+        fn toggle_zoom_action(&self, _sender: Option<&AnyObject>) {
+            self.toggle_zoom();
+        }
     }
 );
 
@@ -297,6 +332,7 @@ impl PaneContainer {
             next_id: Cell::new(1),
             dividers: RefCell::new(HashMap::new()),
             ring: RefCell::new(Some(ring)),
+            zoomed: RefCell::new(None),
         });
         // SAFETY: super 的 initWithFrame:；ivars 已就位。
         let view: Retained<PaneContainer> =
@@ -343,6 +379,9 @@ impl PaneContainer {
     /// ⌘D/⌘⇧D：在焦点叶子旁插一个新 pane（新 pane 夺焦）。
     pub fn split_focused(&self, dir: Dir) {
         let Some(mtm) = MainThreadMarker::new() else { return };
+        // X3：放大态下再分屏 = 先还原布局，新 split 的几何才有意义
+        //（放大面占满整窗，旁边的插入位不存在）。
+        self.unzoom();
         let target = self
             .focused_leaf()
             .or_else(|| self.leaves().first().cloned());
@@ -386,6 +425,28 @@ impl PaneContainer {
                 w.performClose(None);
             }
             return;
+        }
+        // X3：关的正是放大面（⌘W/EOF）→ 撤销放大态，其余 pane 露回
+        //（先取消隐藏再做焦点转移：makeFirstResponder 目标应可见）。
+        // 关的是隐藏面（EOF）→ 放大态照常保留，无需处理。
+        let closing_zoomed = self
+            .ivars()
+            .zoomed
+            .borrow()
+            .as_ref()
+            .is_some_and(|z| {
+                std::ptr::eq(&**z as *const TerminalView, view as *const TerminalView)
+            });
+        if closing_zoomed {
+            self.ivars().zoomed.borrow_mut().take();
+            for v in self.leaves() {
+                if !std::ptr::eq(&*v as *const TerminalView, view as *const TerminalView) {
+                    v.setHidden(false);
+                }
+            }
+            for d in self.ivars().dividers.borrow().values() {
+                d.setHidden(false);
+            }
         }
         // 先把焦点从待拆 pane 挪走：NSWindow 的 firstResponder 不额外
         // 持引用，先 resign 再释放视图，否则窗口后续事件路径触已释放
@@ -444,6 +505,9 @@ impl PaneContainer {
 
     /// 焦点方向导航：按叶子 frame 找相邻重叠面上最近的那个。
     fn focus_dir(&self, dir: Dir, forward: bool) {
+        // X3：放大态下切焦点 = 先还原布局（隐藏面没有可导航的几何；
+        // Ghostty 同款语义：焦点移出放大区即取消放大）。
+        self.unzoom();
         let Some(from) = self.focused_leaf() else { return };
         let Some((_, from_frame)) = self.leaves_with_frames().into_iter().find(|(v, _)| {
             std::ptr::eq(&**v as *const TerminalView, &*from as *const TerminalView)
@@ -490,6 +554,8 @@ impl PaneContainer {
 
     /// ⌘[ / ⌘]：DFS 顺序循环切 pane。
     fn cycle_focus(&self, step: isize) {
+        // X3：同 focus_dir——循环切焦点先还原放大态。
+        self.unzoom();
         let leaves = self.leaves();
         if leaves.len() < 2 {
             return;
@@ -507,6 +573,140 @@ impl PaneContainer {
         if let Some(w) = self.window() {
             w.makeFirstResponder(Some(as_responder(&leaves[next])));
         }
+    }
+
+    // ---- X3 zoom（⌘⇧Enter：放大焦点 pane / 还原；无分屏 = 窗口 zoom）----
+
+    /// ⌘⇧Enter 入口（菜单动作 / 取证钩子同途）：按当前布局态分派。
+    pub fn toggle_zoom(&self) {
+        let target = self
+            .focused_leaf()
+            .or_else(|| self.leaves().first().cloned());
+        match zoom_decision(self.leaf_count(), self.is_zoomed(), target.is_some()) {
+            ZoomDecision::WindowZoom => {
+                // 无分屏：等价窗口 zoom（最大化非全屏，NSWindow 原生）。
+                if let Some(w) = self.window() {
+                    w.zoom(None);
+                }
+            }
+            ZoomDecision::ZoomFocused => {
+                if let Some(t) = target {
+                    self.zoom_leaf(&t);
+                }
+            }
+            ZoomDecision::Restore => {
+                self.unzoom();
+            }
+            ZoomDecision::None => {}
+        }
+    }
+
+    /// 放大焦点 pane（已是放大态 = 无操作）。取证钩子 "zoom" 同途。
+    pub fn zoom_focused(&self) {
+        if self.ivars().zoomed.borrow().is_some() {
+            return;
+        }
+        let target = self
+            .focused_leaf()
+            .or_else(|| self.leaves().first().cloned());
+        if let Some(t) = target {
+            self.zoom_leaf(&t);
+        }
+    }
+
+    /// 还原布局（未放大 = 无操作）。取证钩子 "unzoom" 同途。布局树/比例
+    /// 原样未动，relayout 即回到分屏几何。
+    pub fn unzoom(&self) {
+        if self.ivars().zoomed.borrow_mut().take().is_some() {
+            for v in self.leaves() {
+                v.setHidden(false);
+            }
+            for d in self.ivars().dividers.borrow().values() {
+                d.setHidden(false);
+            }
+            self.relayout();
+        }
+    }
+
+    pub fn is_zoomed(&self) -> bool {
+        self.ivars().zoomed.borrow().is_some()
+    }
+
+    /// 放大叶子的 pane id（E2E 取证用）。
+    pub fn zoomed_pane_id(&self) -> Option<u32> {
+        self.ivars().zoomed.borrow().as_ref().map(|v| v.pane_id())
+    }
+
+    /// 放大一个叶子：其余叶子 + 分隔条隐藏（不销毁：PTY/vt 常活，数据
+    /// 继续喂 vt 不丢，隐藏面不出帧），布局树/比例不动——放大叶子由
+    /// relayout 按 zoom 态拿整窗 bounds（隐藏叶子不 setFrame：vt/PTY
+    /// 网格尺寸保持分屏态，还原即正确显示，滚动位置不动）。
+    fn zoom_leaf(&self, view: &TerminalView) {
+        for v in self.leaves() {
+            if !std::ptr::eq(&*v as *const TerminalView, view as *const TerminalView) {
+                v.setHidden(true);
+            }
+        }
+        for d in self.ivars().dividers.borrow().values() {
+            d.setHidden(true);
+        }
+        *self.ivars().zoomed.borrow_mut() = Some(view.retain());
+        self.relayout();
+        // 放大面确保持焦（其它面已隐藏，不可夺焦）。
+        if let Some(w) = self.window() {
+            w.makeFirstResponder(Some(as_responder(view)));
+        }
+        self.sync_focus_ring();
+    }
+
+    /// X3 取证：容器 zoom 态 + 各叶子（pane id/隐藏/缓存 frame/网格尺寸/
+    /// 最下文本行）+ 窗口态的 JSON 快照（E2E 断言布局与内容用；手工 JSON
+    /// 与帧统计探针同惯例）。
+    pub fn zoom_state_json(&self) -> String {
+        let zoomed_pane = self.zoomed_pane_id();
+        let mut s = String::from("{\"zoomed\":");
+        s.push_str(if zoomed_pane.is_some() { "true" } else { "false" });
+        match zoomed_pane {
+            Some(p) => s.push_str(&format!(",\"zoomed_pane\":{p}")),
+            None => s.push_str(",\"zoomed_pane\":null"),
+        }
+        s.push_str(",\"leaves\":[");
+        let mut first = true;
+        for (v, f) in self.leaves_with_frames() {
+            if !first {
+                s.push(',');
+            }
+            first = false;
+            let (cols, rows) = v.grid_size();
+            s.push_str(&format!(
+                "{{\"pane\":{},\"hidden\":{},\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"cols\":{},\"rows\":{},\"last\":\"{}\"}}",
+                v.pane_id(),
+                v.isHidden(),
+                f.origin.x,
+                f.origin.y,
+                f.size.width,
+                f.size.height,
+                cols,
+                rows,
+                json_escape(&v.last_text_line()),
+            ));
+        }
+        s.push(']');
+        if let Some(w) = self.window() {
+            let fr = w.frame();
+            let fullscreen = w.styleMask().contains(NSWindowStyleMask::FullScreen);
+            s.push_str(&format!(
+                ",\"window\":{{\"zoomed\":{},\"fullscreen\":{},\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}}}",
+                w.isZoomed(),
+                fullscreen,
+                fr.origin.x,
+                fr.origin.y,
+                fr.size.width,
+                fr.size.height,
+            ));
+        }
+        s.push('}');
+        s
     }
 
     /// 焦点环同步（焦点变化 / 布局变化后调；view 的 become/resign 也经
@@ -558,11 +758,19 @@ impl PaneContainer {
     /// `setNeedsDisplay`，把重画推迟到 AppKit 显示周期（drawRect 路径）。
     fn relayout(&self) {
         let bounds = self.bounds();
+        // X3：放大态下只有放大叶子拿 bounds（setFrame → resize 链）；
+        // 隐藏叶子不 setFrame（vt/PTY 网格保持分屏尺寸，还原即正确）。
+        let zoomed_ptr = self
+            .ivars()
+            .zoomed
+            .borrow()
+            .as_ref()
+            .map(|z| &**z as *const TerminalView);
         let leaves;
         {
             let mut tree = self.ivars().tree.borrow_mut();
             if let Some(node) = tree.as_mut() {
-                layout_node(node, bounds, &self.ivars().dividers);
+                layout_node(node, bounds, &self.ivars().dividers, zoomed_ptr);
             }
             leaves = {
                 let mut v = Vec::new();
@@ -673,9 +881,26 @@ fn set_node_ratio(node: &mut Node, id: u64, ratio: f64) -> bool {
     }
 }
 
-fn layout_node(node: &mut Node, rect: NSRect, dividers: &RefCell<HashMap<u64, Retained<DividerView>>>) {
+fn layout_node(
+    node: &mut Node,
+    rect: NSRect,
+    dividers: &RefCell<HashMap<u64, Retained<DividerView>>>,
+    zoomed: Option<*const TerminalView>,
+) {
     match node {
         Node::Leaf { view, frame } => {
+            if let Some(z) = zoomed {
+                // X3：放大态——只有放大叶子落 bounds；其余叶子隐藏且
+                // 不 setFrame（网格尺寸/滚动位置冻结在分屏态）。缓存
+                // frame 也冻结（还原时 relayout 会重算）。
+                if std::ptr::eq(&**view as *const TerminalView, z) {
+                    if view.frame() != rect {
+                        view.setFrame(rect);
+                    }
+                    *frame = rect;
+                }
+                return;
+            }
             if view.frame() != rect {
                 view.setFrame(rect);
             }
@@ -683,6 +908,14 @@ fn layout_node(node: &mut Node, rect: NSRect, dividers: &RefCell<HashMap<u64, Re
         }
         Node::Split { dir, id, ratio, first, second, frame } => {
             *frame = rect;
+            if zoomed.is_some() {
+                // X3 放大态：不切分——两侧子树都拿整 rect，放大叶子
+                //（匹配者）落到整窗 bounds，隐藏叶子自行跳过；分隔条
+                // 已隐藏，几何冻结在分屏态（还原时重算）。
+                layout_node(first, rect, dividers, zoomed);
+                layout_node(second, rect, dividers, zoomed);
+                return;
+            }
             let (ra, rb, rdiv) = split_rects(rect, *dir, *ratio);
             let divider_view = dividers.borrow().get(id).cloned();
             if let Some(d) = divider_view {
@@ -690,8 +923,8 @@ fn layout_node(node: &mut Node, rect: NSRect, dividers: &RefCell<HashMap<u64, Re
                     d.setFrame(rdiv);
                 }
             }
-            layout_node(first, ra, dividers);
-            layout_node(second, rb, dividers);
+            layout_node(first, ra, dividers, zoomed);
+            layout_node(second, rb, dividers, zoomed);
         }
     }
 }
@@ -779,6 +1012,21 @@ fn remove_leaf(node: Node, target: &TerminalView, dropped: &mut Vec<u64>) -> Opt
             }
         }
     }
+}
+
+/// 手工 JSON 字符串转义（zoom_state_json 的 last 行；tick 行是纯
+/// ASCII，这里只需防意外控制字符/引号破坏结构）。
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1233,31 @@ mod tests {
             origin: NSPoint { x, y },
             size: NSSize { width: w, height: h },
         }
+    }
+
+    #[test]
+    fn zoom_decision_state_machine() {
+        // X3 布局态机（纯逻辑）：
+        // 无分屏（单面/防御性零面）→ 窗口 zoom（最大化非全屏）。
+        assert_eq!(zoom_decision(1, false, true), ZoomDecision::WindowZoom);
+        assert_eq!(zoom_decision(1, true, true), ZoomDecision::WindowZoom);
+        assert_eq!(zoom_decision(0, false, false), ZoomDecision::WindowZoom);
+        // 有分屏 + 未放大 → 放大焦点面。
+        assert_eq!(zoom_decision(2, false, true), ZoomDecision::ZoomFocused);
+        assert_eq!(zoom_decision(3, false, true), ZoomDecision::ZoomFocused);
+        // 有分屏 + 已放大 → 还原（优先于焦点判断：焦点丢了也该还原）。
+        assert_eq!(zoom_decision(2, true, true), ZoomDecision::Restore);
+        assert_eq!(zoom_decision(3, true, false), ZoomDecision::Restore);
+        // 有分屏但无可用目标（异常态）→ 无操作，不碰窗口 zoom。
+        assert_eq!(zoom_decision(2, false, false), ZoomDecision::None);
+    }
+
+    #[test]
+    fn json_escape_minimal() {
+        // tick 行是纯 ASCII；防御：引号/反斜杠/控制字符不破坏 JSON 结构。
+        assert_eq!(json_escape("tick 42"), "tick 42");
+        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(json_escape("\u{1}"), " ");
     }
 
     #[test]

@@ -42,6 +42,11 @@ pub struct Ivars {
     panel_file: RefCell<Option<String>>,
     /// 面板钩子上次已应用的内容（去抖：内容变化才动作）。
     panel_last: RefCell<Option<String>>,
+    /// X3 zoom 取证钩子：NINJA_ZOOM_FILE 轮询的文件路径（E2E 用，
+    /// 与 ⌘⇧Enter 同一条 toggle_zoom 路径；不依赖合成 CGEvent）。
+    zoom_file: RefCell<Option<String>>,
+    /// zoom 钩子上次已应用的内容（去抖：内容变化才动作）。
+    zoom_last: RefCell<Option<String>>,
     /// 本壳持有的窗口强引用。**关键不变量**：窗口在 -[NSWindow close]
     /// 期间必须有人持有（NSApp 的窗口列表引用会在 close 中途摘掉，
     /// 若那是唯一引用，窗口在自己 close 的调用栈里 dealloc，后续
@@ -166,6 +171,27 @@ define_class!(
                         0.5,
                         &target,
                         objc2::sel!(ninjaPanelPluginTick:),
+                        None,
+                        true,
+                    )
+                };
+                std::mem::forget(timer); // 进程生命期常驻
+            }
+
+            // X3 zoom 取证钩子（非产品功能）：NINJA_ZOOM_FILE=<path> 时每
+            // 0.2s 读该文件，内容变化才动作——"toggle"/"zoom"/"unzoom"
+            // 走 key window 的 PaneContainer zoom 路径（与 ⌘⇧Enter 同途，
+            // 编程触发免 CGEvent）；"dump" 把容器/窗口 zoom 态 JSON 写
+            // 到 NINJA_ZOOM_DUMP（布局/隐藏/网格尺寸/内容取证）。E2E 用。
+            if let Ok(f) = std::env::var("NINJA_ZOOM_FILE") {
+                self.ivars().zoom_file.replace(Some(f));
+                // SAFETY: 同上（-self 返回 retain 过的引用）。
+                let target: Retained<objc2::runtime::AnyObject> = unsafe { msg_send![self, self] };
+                let timer = unsafe {
+                    objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                        0.2,
+                        &target,
+                        objc2::sel!(ninjaZoomTick:),
                         None,
                         true,
                     )
@@ -408,7 +434,72 @@ define_class!(
             }
         }
 
-        /// ⌘N：新窗口（独立窗口；nil target 动作最终落到 app delegate）。
+        /// X3 zoom 钩子拍：读 NINJA_ZOOM_FILE，内容变化才动作。"toggle" →
+    /// toggle_zoom（⌘⇧Enter 同途）；"zoom"/"unzoom" → 定向放大/还原；
+    /// "dump" → zoom 态 JSON 写到 NINJA_ZOOM_DUMP。其余内容不动。
+    #[unsafe(method(ninjaZoomTick:))]
+    fn ninja_zoom_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+        let Some(path) = self.ivars().zoom_file.borrow().clone() else {
+            return;
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let content = raw.trim().to_string();
+        if content.is_empty()
+            || self.ivars().zoom_last.borrow().as_deref() == Some(content.as_str())
+        {
+            return; // 去抖：同一内容只动作一次
+        }
+        *self.ivars().zoom_last.borrow_mut() = Some(content.clone());
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        // key/main 窗口在后台/争激活时会短暂为 nil（同 p4 钩子实测），
+        // 退化顺序：keyWindow → mainWindow → 已登记窗口表（确定存在）。
+        let window = app.keyWindow().or_else(|| app.mainWindow()).or_else(|| {
+            self.ivars().windows.borrow().first().cloned()
+        });
+        let content_view = window.and_then(|w| w.contentView());
+        let Some(content_view) = content_view else {
+            eprintln!("ninja: NINJA_ZOOM_FILE 无窗口可 zoom");
+            return;
+        };
+        // SAFETY: isKindOfClass: 任意 NSObject 可查；通过后指针上转
+        //（同 selftest 惯例）。
+        let is_c: bool =
+            unsafe { objc2::msg_send![&*content_view, isKindOfClass: PaneContainer::class()] };
+        if !is_c {
+            eprintln!("ninja: NINJA_ZOOM_FILE 窗口内容不是 PaneContainer");
+            return;
+        }
+        let container: &PaneContainer = unsafe {
+            &*(std::ptr::from_ref(&*content_view) as *const PaneContainer)
+        };
+        match content.as_str() {
+            "toggle" => container.toggle_zoom(),
+            "zoom" => container.zoom_focused(),
+            "unzoom" | "restore" => container.unzoom(),
+            // split：E2E 布置双 pane（selftest 的 split 步在后台宿主上
+            // 因 keyWindow 空而跳过；钩子走窗口表回退，不依赖前台）。
+            "split" => container.split_focused(crate::pane::Dir::Horizontal),
+            // "dump"/"dump2"/… 前缀都算 dump（E2E 轮询时递增后缀绕
+            // 过去抖：同内容不重动作）。
+            s if s.starts_with("dump") => {
+                let Some(out) = std::env::var_os("NINJA_ZOOM_DUMP") else {
+                    eprintln!("ninja: NINJA_ZOOM_FILE=dump 需要 NINJA_ZOOM_DUMP 输出路径");
+                    return;
+                };
+                let _ = std::fs::write(&out, container.zoom_state_json());
+            }
+            other => eprintln!(
+                "ninja: NINJA_ZOOM_FILE 动作 {other:?} 无效（toggle | zoom | unzoom | dump）"
+            ),
+        }
+    }
+
+    /// ⌘N：新窗口（独立窗口；nil target 动作最终落到 app delegate）。
         #[unsafe(method(ninjaNewWindow:))]
         fn ninja_new_window(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             if let Some(mtm) = MainThreadMarker::new() {
@@ -549,6 +640,12 @@ const PANE_ITEMS: &[ItemSpec] = &[
         selector: "ninjaClosePane:",
     },
     ItemSpec {
+        // X3 ⌘⇧Enter：多 pane 放大焦点面/再按还原；无分屏 = 窗口 zoom。
+        action: "toggle_zoom",
+        title: "Zoom Pane",
+        selector: "ninjaToggleZoom:",
+    },
+    ItemSpec {
         action: "focus_left",
         title: "Focus Pane Left",
         selector: "ninjaFocusLeft:",
@@ -654,7 +751,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, config: &Config) {
 
     let pane_menu = add_submenu(mtm, &main_menu, "Panes");
     for (i, spec) in PANE_ITEMS.iter().enumerate() {
-        if i == 3 || i == 7 {
+        // 分隔：Zoom Pane（布局态）之后、Focus Down（导航组尾）之后。
+        if i == 4 || i == 8 {
             pane_menu.addItem(&NSMenuItem::separatorItem(mtm));
         }
         add_item(mtm, &pane_menu, spec, config);
@@ -732,6 +830,8 @@ pub fn run() {
         panel: RefCell::new(None),
         panel_file: RefCell::new(None),
         panel_last: RefCell::new(None),
+        zoom_file: RefCell::new(None),
+        zoom_last: RefCell::new(None),
         windows: RefCell::new(Vec::new()),
         closing: RefCell::new(Vec::new()),
         prune_scheduled: Cell::new(false),

@@ -81,6 +81,9 @@ pub fn parse_binding(s: &str) -> Option<KeyBinding> {
                     "right" => "\u{F703}",
                     "up" => "\u{F700}",
                     "down" => "\u{F701}",
+                    // X3：Return/Enter 主键 = NSCarriageReturnCharacter
+                    //（NSMenuItem keyEquivalent 惯例，⌘⇧Enter 放大 pane）。
+                    "enter" | "return" => "\r",
                     _ => part,
                 };
                 if key.chars().count() != 1 {
@@ -111,6 +114,9 @@ pub const ACTION_NAMES: &[(&str, &str)] = &[
     ("split_right", "cmd+d"),
     ("split_down", "cmd+shift+d"),
     ("close_pane", "cmd+shift+w"),
+    // X3 ⌘⇧Enter：放大焦点 pane 临时占满窗口，再按还原（Ghostty
+    // toggle_split_zoom 语义）；无分屏时等价窗口 zoom（最大化非全屏）。
+    ("toggle_zoom", "cmd+shift+enter"),
     ("focus_left", "cmd+alt+left"),
     ("focus_right", "cmd+alt+right"),
     ("focus_up", "cmd+alt+up"),
@@ -474,7 +480,8 @@ pub fn default_toml() -> String {
     s.push_str("# cursor = \"#528BFF\"\n\n");
     s.push_str("[keys]\n");
     s.push_str("# new_window = \"cmd+n\"\n");
-    s.push_str("# split_right = \"cmd+d\"\n\n");
+    s.push_str("# split_right = \"cmd+d\"\n");
+    s.push_str("# toggle_zoom = \"cmd+shift+enter\"   # ⌘⇧Enter：放大/还原焦点 pane；无分屏 = 窗口 zoom\n\n");
     s.push_str("[plugins]\n");
     s.push_str("# enabled = [\"preview\"]   # 默认空 = 插件关：不建 ADE socket、不拉进程；\n");
     s.push_str("#                              非空 = 启用即拉起（2026-08-29 决策；面板 ⌘, 开关会写回本行）\n");
@@ -501,6 +508,13 @@ mod tests {
         // 修饰别名与大小写。
         assert!(parse_binding("Command+Control+C").unwrap().cmd);
         assert!(parse_binding("option+x").unwrap().alt);
+
+        // X3：enter/return 键名 → "\r"（Return 键的 keyEquivalent 字符）。
+        let z = parse_binding("cmd+shift+enter").unwrap();
+        assert_eq!(z.key, "\r");
+        assert!(z.cmd && z.shift && !z.ctrl && !z.alt);
+        assert_eq!(z.flags(), MASK_CMD | MASK_SHIFT);
+        assert_eq!(parse_binding("cmd+return").unwrap().key, "\r");
 
         // 无键段 / 多键段 / 多字符键 / 空段 → None。
         assert!(parse_binding("cmd").is_none());
@@ -578,6 +592,16 @@ focus_down = "not a key"
         for (name, _) in ACTION_NAMES {
             assert!(c.keys.contains_key(*name), "missing default binding {name}");
         }
+        // X3：toggle_zoom 默认 ⌘⇧Enter 且可重绑。
+        assert_eq!(
+            c.keys[&"toggle_zoom".to_string()],
+            parse_binding("cmd+shift+enter").unwrap()
+        );
+        let c = Config::from_toml_str("[keys]\ntoggle_zoom = \"ctrl+alt+z\"\n");
+        assert_eq!(
+            c.keys[&"toggle_zoom".to_string()],
+            parse_binding("ctrl+alt+z").unwrap()
+        );
     }
 
     #[test]
