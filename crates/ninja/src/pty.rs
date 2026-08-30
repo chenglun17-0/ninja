@@ -146,7 +146,14 @@ impl Pty {
         };
         let mut master: libc::c_int = -1;
         // SAFETY: master/ws out-param 布局正确；fork 后父子各自走安全路径。
-        let pid = unsafe { libc::forkpty(&raw mut master, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut ws) };
+        let pid = unsafe {
+            libc::forkpty(
+                &raw mut master,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut ws,
+            )
+        };
         if pid < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -156,7 +163,11 @@ impl Pty {
             unsafe {
                 libc::setsid();
                 // 让 shell 知道自己是什么终端。
-                libc::setenv(b"TERM\0".as_ptr().cast(), b"xterm-256color\0".as_ptr().cast(), 1);
+                libc::setenv(
+                    b"TERM\0".as_ptr().cast(),
+                    b"xterm-256color\0".as_ptr().cast(),
+                    1,
+                );
                 libc::setenv(
                     b"COLORTERM\0".as_ptr().cast(),
                     b"truecolor\0".as_ptr().cast(),
@@ -171,10 +182,14 @@ impl Pty {
                     libc::chdir(home_ptr);
                 }
                 // argv[0] 带 `-` 前缀 = 登录 shell（iTerm/Terminal.app 同款做法）。
-                let argv0 = CString::new(format!("-{}", shell.rsplit('/').next().unwrap_or(&shell)))
-                    .unwrap_or_else(|_| CString::new("-bash").unwrap());
+                let argv0 =
+                    CString::new(format!("-{}", shell.rsplit('/').next().unwrap_or(&shell)))
+                        .unwrap_or_else(|_| CString::new("-bash").unwrap());
                 let shell_c = CString::new(shell.as_str()).unwrap();
-                libc::execv(shell_c.as_ptr(), [argv0.as_ptr(), std::ptr::null()].as_mut_ptr());
+                libc::execv(
+                    shell_c.as_ptr(),
+                    [argv0.as_ptr(), std::ptr::null()].as_mut_ptr(),
+                );
                 // exec 失败：唯一安全的退出路径。
                 libc::_exit(127);
             }
@@ -202,14 +217,14 @@ impl Pty {
         let reader = std::thread::Builder::new()
             .name("ninja-pty-read".into())
             .spawn(move || reader_loop(r_inner, master))
-            .map_err(|e| std::io::Error::other(e))?;
+            .map_err(std::io::Error::other)?;
 
         // 写线程：condvar 驱动的 write_all。
         let w_inner = Arc::clone(&inner);
         let writer = std::thread::Builder::new()
             .name("ninja-pty-write".into())
             .spawn(move || writer_loop(w_inner, master))
-            .map_err(|e| std::io::Error::other(e))?;
+            .map_err(std::io::Error::other)?;
 
         Ok(Self {
             inner,
@@ -307,7 +322,10 @@ fn writer_loop(inner: Arc<PtyInner>, fd: libc::c_int) {
         while q.is_empty() {
             // 主线程 shutdown 时 to_pty 不再投递，靠 master 关闭后 write 失败退出；
             // shutdown() 也会 notify_all 这里。
-            q = match inner.to_pty_wake.wait_timeout(q, std::time::Duration::from_secs(1)) {
+            q = match inner
+                .to_pty_wake
+                .wait_timeout(q, std::time::Duration::from_secs(1))
+            {
                 Ok((guard, _)) => guard,
                 Err(poisoned) => poisoned.into_inner().0,
             };
@@ -324,13 +342,7 @@ fn writer_loop(inner: Arc<PtyInner>, fd: libc::c_int) {
                 return;
             }
             // SAFETY: chunk 切片有效；fd 属于我们。
-            let n = unsafe {
-                libc::write(
-                    fd,
-                    chunk[off..].as_ptr().cast(),
-                    chunk.len() - off,
-                )
-            };
+            let n = unsafe { libc::write(fd, chunk[off..].as_ptr().cast(), chunk.len() - off) };
             if n >= 0 {
                 off += n as usize;
             } else {
@@ -379,7 +391,10 @@ mod tests {
             for c in chunks {
                 got.extend_from_slice(&c);
             }
-            if got.windows(b"hello-ninja\n".len()).any(|w| w == b"hello-ninja\n") {
+            if got
+                .windows(b"hello-ninja\n".len())
+                .any(|w| w == b"hello-ninja\n")
+            {
                 break;
             }
         }

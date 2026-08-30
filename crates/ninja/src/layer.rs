@@ -150,7 +150,7 @@ pub fn open(geom: &LayerGeom, anchor_row: u32, anchor_col: u32) -> Option<LayerR
             std::ptr::from_ref(&*h_v).cast(),
             std::ptr::from_ref(&*bpe).cast(),
             std::ptr::from_ref(&*fmt).cast(),
-            std::ptr::from_ref(&*global).cast(),
+            std::ptr::from_ref(global).cast(),
         ];
         let mut keys_mut = keys;
         let mut values_mut = values;

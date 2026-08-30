@@ -1,5 +1,13 @@
 # Ninja 技术栈
 
+> **v2 修订（2026-08-30，用户产品决策）**：底层全量转投 **libghostty
+> 嵌入 API**（`include/ghostty.h`，cmux 路线）——引擎/渲染/PTY/配置全套
+> 用 Ghostty，ninja 收敛为 ADE 插件宿主。本文下方原表格中与此冲突的条目
+> （终端核 libghostty-vt、自研 Metal、宿主自管 PTY、禁嵌入 API）由本修订
+> 覆盖；保留不变：ADE 协议进程外 JSON、插件子进程、AppKit 壳、macOS、
+> 分发与开源策略。实施计划见 [PLAN-V2.md](PLAN-V2.md)。原 v1 栈描述
+> 作为历史保留于下。
+
 产品定义见 [PRODUCT.md](PRODUCT.md)。本文锁定实现合同。未列出的库、平台、运行时默认不进仓库。
 
 第一年要做出可分发的 macOS 终端：空载含标签和分屏，ADE 协议可装卸。终端核用 Ghostty 的公开库；协议仍是不可替换的产品面。三项验证通过前，仓库不公开。

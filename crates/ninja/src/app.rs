@@ -341,14 +341,13 @@ define_class!(
             if self.ivars().p4_hit_started.get().is_none() {
                 self.ivars().p4_hit_started.set(Some(Instant::now()));
             }
-            if let Some(t0) = self.ivars().p4_hit_started.get() {
-                if t0.elapsed() > Duration::from_secs(15) {
+            if let Some(t0) = self.ivars().p4_hit_started.get()
+                && t0.elapsed() > Duration::from_secs(15) {
                     eprintln!("ninja: NINJA_P4_HIT 等待行内容超时，放弃");
                     self.ivars().p4_hit.take();
                     self.stop_p4_hit_timer();
                     return;
                 }
-            }
             let Some(mtm) = MainThreadMarker::new() else { return };
             let app = NSApplication::sharedApplication(mtm);
             // key/main 窗口在后台/争激活时会短暂为 nil（并行取证实测），
@@ -357,8 +356,7 @@ define_class!(
                 self.ivars()
                     .windows
                     .borrow()
-                    .first()
-                    .map(|w| w.clone())
+                    .first().cloned()
             });
             let Some(content) = window.and_then(|w| w.contentView()) else {
                 eprintln!("ninja: NINJA_P4_HIT 无窗口可命中");

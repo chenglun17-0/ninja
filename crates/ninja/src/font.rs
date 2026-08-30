@@ -494,9 +494,9 @@ impl Font {
 fn measure(font: &CTFont, size_pt: f64) -> Metrics {
     // SAFETY: font/缓冲参数布局正确，单字形测量。
     let (ascent, descent, leading, advance) = unsafe {
-        let ascent = font.ascent() as f64;
-        let descent = font.descent() as f64;
-        let leading = font.leading() as f64;
+        let ascent = font.ascent();
+        let descent = font.descent();
+        let leading = font.leading();
         let mut chars: [u16; 1] = [b'M' as u16];
         let mut glyphs: [u16; 1] = [0];
         let ok = font.glyphs_for_characters(

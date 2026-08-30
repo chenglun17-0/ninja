@@ -524,7 +524,7 @@ impl PluginHost {
                 let pid = child.map(|c| c.id());
                 let memory_bytes = pid.and_then(footprint_bytes);
                 PluginStatus {
-                    enabled: self.cfg.enabled.iter().any(|n| *n == name),
+                    enabled: self.cfg.enabled.contains(&name),
                     running,
                     pid,
                     memory_bytes: if running { memory_bytes } else { None },
@@ -757,11 +757,10 @@ impl PluginHost {
         ade_debug(&format!("dispatch: claim priority={priority} conn={claim_conn}"));
         // 层握手（p5）：认领方在同一连接上要层。geom 为 None（如取证钩子
         // 无渲染上下文）时跳过——认领仍然成立，只是宿主不处理层。
-        if let Some(geom) = geom {
-            if let Some(idx) = self.conns.iter().position(|c| c.id == claim_conn) {
+        if let Some(geom) = geom
+            && let Some(idx) = self.conns.iter().position(|c| c.id == claim_conn) {
                 self.layer_handshake(idx, geom, LAYER_HANDSHAKE_TIMEOUT);
             }
-        }
         DispatchOutcome::Claimed { priority }
     }
 
@@ -1180,9 +1179,9 @@ fn stop_pump_timer_if_idle() {
     {
         return; // 还有层要合成 / 还有色板覆盖要盯 / 还在等拉起的插件连上
     }
-    if let Ok(mut slot) = PUMP_TIMER.lock() {
-        if let Some(t) = slot.0.take() {
-            if let Some(main) = objc2_core_foundation::CFRunLoop::main() {
+    if let Ok(mut slot) = PUMP_TIMER.lock()
+        && let Some(t) = slot.0.take()
+            && let Some(main) = objc2_core_foundation::CFRunLoop::main() {
                 // SAFETY: t 曾加入主 runloop。
                 unsafe {
                     main.remove_timer(
@@ -1191,8 +1190,6 @@ fn stop_pump_timer_if_idle() {
                     )
                 };
             }
-        }
-    }
 }
 
 /// 泵入口（timer 回调直调；测试可直调）。
@@ -1312,11 +1309,10 @@ pub fn forward_input_key(
 /// `layer.close` + 重画。PRODUCT：「任何插件层都能立刻关掉」。
 pub fn host_close_layers_of_pane(pane: u32) {
     for (handle, conn, _) in layer::close_pane(pane) {
-        if let Some(host) = take_dispatcher() {
-            if let Ok(mut h) = host.lock() {
+        if let Some(host) = take_dispatcher()
+            && let Ok(mut h) = host.lock() {
                 let _ = h.send_to_conn(conn, &Message::LayerClose(LayerClose::new(handle)));
             }
-        }
     }
     stop_pump_timer_if_idle();
 }
@@ -1327,21 +1323,19 @@ pub fn host_close_layers_of_pane(pane: u32) {
 /// socket 尸体不只是 SIGKILL 的产物）。`applicationWillTerminate` 里
 /// 显式调本函数（幂等；与 Drop 同一实现）。
 pub fn host_shutdown() {
-    if let Some(host) = take_dispatcher() {
-        if let Ok(mut h) = host.lock() {
+    if let Some(host) = take_dispatcher()
+        && let Ok(mut h) = host.lock() {
             h.shutdown();
         }
-    }
 }
 
 /// **启用即拉起**的宿主启动半边（app 的 applicationDidFinishLaunching
 /// 调；runloop 就绪后）。空载（无分发器）= 无操作——门禁不变。
 pub fn spawn_startup_plugins() {
-    if let Some(host) = take_dispatcher() {
-        if let Ok(mut h) = host.lock() {
+    if let Some(host) = take_dispatcher()
+        && let Ok(mut h) = host.lock() {
             h.spawn_enabled_now();
         }
-    }
 }
 
 /// 状态接线：全部插件的状态快照（面板与测试用；见
@@ -1369,11 +1363,10 @@ pub fn toggle_plugin(name: &str, on: bool) -> bool {
             }
         } else {
             // host 不在（空载）：从启动快照名单里剔除（下次启动生效）。
-            if let Ok(mut slot) = SESSION_CFG.lock() {
-                if let Some(cfg) = slot.as_mut() {
+            if let Ok(mut slot) = SESSION_CFG.lock()
+                && let Some(cfg) = slot.as_mut() {
                     cfg.enabled.retain(|n| n != name);
                 }
-            }
         }
         return true;
     }

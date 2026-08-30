@@ -90,6 +90,7 @@ fragment float4 layer_fs(
 /// Dark Pro 基线，或插件 theme.set 覆盖——渲染读它而非编译期常量，
 /// 换色板即生效）。选区 alpha 永远来自生效色板（ODP 基线 = 官方
 /// `#abb2bf30` 的 0x30）。
+#[derive(Default)]
 pub struct Theme {
     /// `[theme] selection-bg` 覆盖；None = 生效色板的选区色。
     pub selection_bg: Option<Rgb>,
@@ -105,15 +106,6 @@ pub struct LayerDraw {
     pub rect: (f64, f64, f64, f64),
 }
 
-impl Default for Theme {
-    fn default() -> Self {
-        // 空 = 全跟随生效色板（ODP 基线下的所见 = T1 行为不变）。
-        Self {
-            selection_bg: None,
-            cursor: None,
-        }
-    }
-}
 
 /// 上次已呈现帧的视觉签名（D-C 跳帧判据）。vt 对纯光标移动（`\r`、
 /// CSI 列定位）与 OSC 10/11 颜色变更不标脏（Dirty::Clean 但屏幕要变），

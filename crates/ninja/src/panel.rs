@@ -194,7 +194,7 @@ pub fn known_plugins() -> Vec<String> {
     let cfg = plugins::session_cfg();
     let mut names: std::collections::BTreeSet<String> =
         cfg.enabled.iter().cloned().collect();
-    names.extend(cfg.paths.keys().cloned().filter(|k| !k.is_empty()));
+    names.extend(cfg.paths.keys().filter(|&k| !k.is_empty()).cloned());
     if let Some(dir) = std::env::var_os("NINJA_PLUGIN_DIR") {
         scan_dir_files(std::path::Path::new(&dir), &mut names);
     }
@@ -257,7 +257,7 @@ pub fn open(mtm: MainThreadMarker) -> Retained<PluginPanel> {
     window.setTitle(&NSString::from_str("插件"));
     // SAFETY: 布尔 setter，无别名风险；面板对象是唯一 owner（同 shell 红线）。
     unsafe { window.setReleasedWhenClosed(false) };
-    window.setDelegate(Some(&objc2::runtime::ProtocolObject::from_ref(&*panel)));
+    window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*panel)));
 
     let content = window.contentView().expect("窗口必有 content");
     // 纵向 stack（行序列）+ 底部关闭按钮：frame 布局，不进 autolayout。

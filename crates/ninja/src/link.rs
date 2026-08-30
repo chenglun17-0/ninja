@@ -59,8 +59,8 @@ const REJECT_CHARS: &[char] = &['|', '`'];
 /// `osc8` 点击 cell 的 OSC-8 URI（None/空 = 无链接）。
 pub fn recognize(cells: &[RowCell], click_col: usize, osc8: Option<&str>) -> Option<LinkHit> {
     // 1) OSC-8 优先：有链接就认链接，不做文本猜测。
-    if let Some(uri) = osc8 {
-        if !uri.is_empty() {
+    if let Some(uri) = osc8
+        && !uri.is_empty() {
             let col = click_col.min(u16::MAX as usize) as u16;
             return Some(LinkHit {
                 kind: HitKind::Osc8,
@@ -69,7 +69,6 @@ pub fn recognize(cells: &[RowCell], click_col: usize, osc8: Option<&str>) -> Opt
                 end_col: col.saturating_add(1),
             });
         }
-    }
 
     let n = cells.len();
     if n == 0 || click_col >= n {

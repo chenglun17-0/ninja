@@ -189,7 +189,7 @@ impl TermState {
             all
         } else {
             self.terminal
-                .scroll_viewport(ScrollViewport::Delta(lines as isize));
+                .scroll_viewport(ScrollViewport::Delta(lines));
             Vec::new()
         }
     }

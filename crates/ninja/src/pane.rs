@@ -479,11 +479,10 @@ impl PaneContainer {
         }
         // 焦点可能随 pane 消失：交给第一个叶子。
         let leaves = self.leaves();
-        if self.focused_leaf().is_none() {
-            if let (Some(first), Some(w)) = (leaves.first(), self.window()) {
+        if self.focused_leaf().is_none()
+            && let (Some(first), Some(w)) = (leaves.first(), self.window()) {
                 w.makeFirstResponder(Some(as_responder(first)));
             }
-        }
     }
 
     /// 关窗/退出前收尾全部 pane（幂等；EOF 先到过的叶子再走一遍无害）。
@@ -545,11 +544,10 @@ impl PaneContainer {
                 best = Some((dist, v));
             }
         }
-        if let Some((_, v)) = best {
-            if let Some(w) = self.window() {
+        if let Some((_, v)) = best
+            && let Some(w) = self.window() {
                 w.makeFirstResponder(Some(as_responder(&v)));
             }
-        }
     }
 
     /// ⌘[ / ⌘]：DFS 顺序循环切 pane。
@@ -918,11 +916,10 @@ fn layout_node(
             }
             let (ra, rb, rdiv) = split_rects(rect, *dir, *ratio);
             let divider_view = dividers.borrow().get(id).cloned();
-            if let Some(d) = divider_view {
-                if d.frame() != rdiv {
+            if let Some(d) = divider_view
+                && d.frame() != rdiv {
                     d.setFrame(rdiv);
                 }
-            }
             layout_node(first, ra, dividers, zoomed);
             layout_node(second, rb, dividers, zoomed);
         }

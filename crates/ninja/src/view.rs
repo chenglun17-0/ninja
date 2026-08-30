@@ -344,11 +344,10 @@ define_class!(
                 let mut st = self.state();
                 st.term.scroll(-lines)
             };
-            if !out.is_empty() {
-                if let Some(p) = &self.state().pty {
+            if !out.is_empty()
+                && let Some(p) = &self.state().pty {
                     p.inner.write(out);
                 }
-            }
             self.render_now();
         }
 
@@ -383,11 +382,10 @@ define_class!(
                 let TermState {
                     gesture, terminal, ..
                 } = &mut st.term;
-                if let Ok(g) = terminal.grid_ref(viewport_point(cell.0, cell.1)) {
-                    if let Ok(Some(sel)) = press.apply(gesture, terminal, g) {
+                if let Ok(g) = terminal.grid_ref(viewport_point(cell.0, cell.1))
+                    && let Ok(Some(sel)) = press.apply(gesture, terminal, g) {
                         let _ = terminal.set_selection(Some(&sel));
                     }
-                }
             }
             self.render_now();
         }
@@ -416,11 +414,10 @@ define_class!(
                 let TermState {
                     gesture, terminal, ..
                 } = &mut st.term;
-                if let Ok(g) = terminal.grid_ref(viewport_point(cell.0, cell.1)) {
-                    if let Ok(Some(sel)) = drag.apply(gesture, terminal, g, geometry) {
+                if let Ok(g) = terminal.grid_ref(viewport_point(cell.0, cell.1))
+                    && let Ok(Some(sel)) = drag.apply(gesture, terminal, g, geometry) {
                         let _ = terminal.set_selection(Some(&sel));
                     }
-                }
             }
             self.render_now();
         }
@@ -1009,11 +1006,10 @@ impl TerminalView {
             };
             (eof, new_title, pending)
         };
-        if let Some(title) = new_title {
-            if let Some(w) = self.window() {
+        if let Some(title) = new_title
+            && let Some(w) = self.window() {
                 w.setTitle(&NSString::from_str(&title));
             }
-        }
         if eof {
             // shell 退出（p2）：本 pane 收尾自己，然后请壳把自己从
             // pane 树拆掉；若是窗口最后一个 pane → 关窗（最后一个窗口关
@@ -1135,11 +1131,10 @@ impl TerminalView {
             let mut st = self.state();
             st.term.encode_focus(gained)
         };
-        if let Some(bytes) = bytes {
-            if let Some(p) = &self.state().pty {
+        if let Some(bytes) = bytes
+            && let Some(p) = &self.state().pty {
                 p.inner.write(bytes);
             }
-        }
     }
 
     fn select_all(&self) {
@@ -1180,11 +1175,10 @@ impl TerminalView {
             let st = self.state();
             select::paste_bytes(&st.term.terminal, &text)
         };
-        if !bytes.is_empty() {
-            if let Some(p) = &self.state().pty {
+        if !bytes.is_empty()
+            && let Some(p) = &self.state().pty {
                 p.inner.write(bytes);
             }
-        }
     }
 
     // ---- 收尾 ----

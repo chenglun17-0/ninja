@@ -63,7 +63,7 @@ pub fn make_window(
     unsafe { window.setReleasedWhenClosed(false) };
     // windowWillClose 先收尾 pane（PTY/runloop source/timer），
     // 防止拆一半时回调进 view。
-    window.setDelegate(Some(&objc2::runtime::ProtocolObject::from_ref(delegate)));
+    window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(delegate)));
     window
 }
 
