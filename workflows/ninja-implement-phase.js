@@ -5,7 +5,7 @@ export const meta = {
 };
 
 const REPO = "/Users/jal/my_repos/ninja";
-const PHASE_IDS = ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"];
+const PHASE_IDS = ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "q0", "q1", "q2", "q3", "q4"];
 const PHASES = {
   p0: {
     title: "核与仓库",
@@ -39,14 +39,41 @@ const PHASES = {
     title: "签名分发",
     accept: "可安装的签名 macOS .app，默认零插件。仓库仍不公开。",
   },
+  // ---- v2（PLAN-V2.md）：libghostty 嵌入路线 ----
+  q0: {
+    title: "引擎底座与能力审计",
+    accept:
+      "vendored 钉版 libghostty（含 include/ghostty.h 嵌入 API）+ Rust FFI 链入宿主 + 最小嵌入（AppKit 窗口挂 surface 跑 bash、能输入能渲染）+ 能力审计报告（网格/hyperlink、屏幕快照、surface 之上合成层、配置加载与运行时改、键位拦截——逐项 有API/无/绕法）。hit 数据源无且无绕法 → ok:false 停。",
+  },
+  q1: {
+    title: "壳重接",
+    accept:
+      "surface 的 window/tab/split 上下文回调接现有多窗/标签/分屏布局树；焦点/关闭/resize 全链；面板入口不变。标签分屏日常用法在嵌入引擎上成立，⌘W/⌘⇧Enter 语义保持。",
+  },
+  q2: {
+    title: "配置系统",
+    accept:
+      "加载 Ghostty 配置（含主题、字体、键位）+ 热重载；ninja.toml 收缩为宿主/插件特有；ODP 缺省主题。用户既有 ghostty 配置常用子集直接生效，主题/字体/键位实测。",
+  },
+  q3: {
+    title: "ADE 重接 + 三门禁重跑",
+    accept:
+      "hit（按 q0 审计结论路径）、layer（合成到 surface 上方）、input、theme.set→Ghostty 配置动态改；三插件只走公开协议不动。三大门禁全部重跑通过；空载内存对照 Ghostty 本尊。",
+  },
+  q4: {
+    title: "分发与退役",
+    accept:
+      "打包脚本适配嵌入引擎；DMG 重出；v1 引擎层打 tag v1-engine 后移除；文档同步（STACK/PRODUCT/DISTRIBUTION）。安装即日常可用，仓库描述与实际一致。",
+  },
 };
 
 const phaseId = args && typeof args.phase === "string" ? args.phase : "";
 if (PHASE_IDS.indexOf(phaseId) < 0) {
-  throw new Error("args.phase must be one of p0..p7");
+  throw new Error("args.phase must be one of p0..p7 or q0..q4");
 }
 const spec = PHASES[phaseId];
-const docs = `${REPO}/PRODUCT.md ${REPO}/STACK.md ${REPO}/PLAN.md`;
+const planDoc = phaseId.startsWith("q") ? `${REPO}/PLAN-V2.md` : `${REPO}/PLAN.md`;
+const docs = `${REPO}/PRODUCT.md ${REPO}/STACK.md ${planDoc}`;
 const inventorySchema = {
   type: "object",
   properties: {
@@ -77,12 +104,20 @@ const verifySchema = {
   required: ["pass", "defects", "evidence"],
 };
 
-const rules = [
+const v1Rules = [
   "只做本阶段。不要做 Agent、图片/PDF 预览、插件市场、Linux、内部 include/ghostty.h。",
   "ADE 协议是进程外 JSON；插件不得链宿主内部 API。",
   "空载不得加载插件运行时。",
   "验证必须跑命令或读代码取证，不得相信实施者的 summary。",
-].join(" ");
+];
+const v2Rules = [
+  "只做本阶段。不要做 Agent、图片/PDF 预览、插件市场、Linux。",
+  "嵌入 API pre-1.0：钉 commit（vendor/ghostty），一切破坏性升级显式做；工具链版本随钉点（zig 0.15.2）。",
+  "ADE 协议是进程外 JSON；插件（ninja-preview/ninja-theme）不得链宿主内部 API，协议契约与 golden 不因引擎迁移改动。",
+  "空载不得加载插件运行时；v1 引擎层 q0-q3 期间保留可用（新旧共存直到 q4 退役），新阶段功能必须走 libghostty 嵌入路径。",
+  "验证必须跑命令或读代码取证，不得相信实施者的 summary。",
+];
+const rules = (phaseId.startsWith("q") ? v2Rules : v1Rules).join(" ");
 
 phase("盘点");
 const inventory = await agent(

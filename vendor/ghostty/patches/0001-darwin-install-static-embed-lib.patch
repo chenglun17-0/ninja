@@ -1,0 +1,29 @@
+ninja q0: install the static embed library on Darwin, too
+
+Upstream build.zig skips installing GhosttyLib artifacts on Darwin because
+the official macOS consumer is the xcodebuild-produced xcframework
+(macos/Ghostty.xcodeproj); see the in-tree comment "we don't currently
+build on macOS this way". ninja q0 consumes the static embed archive
+directly from `zig build` (the cmux route: one combined
+libghostty-internal.a statically linked into the Rust host), so this patch
+also installs the static library and the public embed header (ghostty.h)
+on Darwin. Shared-lib install and non-Darwin paths are untouched.
+
+Applied by vendor/ghostty/build.sh (idempotent).
+
+--- a/build.zig
++++ b/build.zig
+@@ -200,6 +200,13 @@
+                 lib_shared.install("ghostty-internal.so");
+                 lib_static.install("ghostty-internal.a");
+             }
++        } else {
++            // ninja q0: install the static embed library + public header on
++            // Darwin. Upstream doesn't install via zig on macOS (official
++            // route is the xcodebuild xcframework); ninja links the combined
++            // static archive straight into the Rust host (cmux route).
++            lib_static.installHeader();
++            lib_static.install("libghostty-internal.a");
+         }
+     }
+ 

@@ -5,6 +5,9 @@ members = [
     "crates/ninja-protocol",
     "crates/ninja-preview",
     "crates/ninja-theme",
+    # q0（v2）：libghostty 全量嵌入路径。v1 引擎层在 crates/ninja 保留到 q4 退役。
+    "crates/ghostty-sys",
+    "crates/ninja-embed",
 ]
 
 [workspace.package]

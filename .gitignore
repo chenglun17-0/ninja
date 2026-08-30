@@ -11,3 +11,8 @@
 !/tools/cpu_pressure_probe.sh
 !/tools/spinner_pressure_probe.sh
 !/tools/idle_cpu_probe.sh
+
+# q0 vendored libghostty（钉 a887df42）：源码与构建产物不入库
+# （fetch.sh 钉 commit + tarball sha256 校验获取；build.sh 出 libghostty-internal.a）。
+vendor/ghostty/src/
+vendor/ghostty/out/

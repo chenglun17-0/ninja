@@ -17,8 +17,11 @@
 ```text
 ninja-preview     示例插件（独立进程，按需拉起）
 ninja-protocol    协议 schema（Rust 类型 + JSON 编解码；其他语言只认 JSON）
-ninja             宿主：AppKit 窗口/标签/分屏 + Metal 视图 + PTY + 插件监督
-libghostty-vt     终端核：VT 解析、网格、滚动、选区、键鼠编码、增量渲染状态
+ninja             v1 宿主（q4 退役）：自研引擎 + 插件监督
+ninja-embed       v2 宿主（q0 起）：libghostty 嵌入路径的验证/宿主 bin
+ghostty-sys       v2 FFI（bindgen include/ghostty.h，静态链 vendored libghostty-internal.a）
+vendor/ghostty    v2 钉 commit 的 Ghostty 全量源与嵌入库构建（a887df42，见 docs/Q0-CAPABILITY-AUDIT.md）
+libghostty-vt     v1 终端核（crates.io 0.2.1，仅 include/ghostty/ 公开 vt API；q4 随 v1 退役）
 ```
 
 空载进程只有 `ninja`（静态链入 `libghostty-vt`）。插件运行时、wasmtime、预览二进制都不进空载路径。
