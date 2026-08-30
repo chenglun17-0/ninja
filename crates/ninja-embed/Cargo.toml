@@ -1,6 +1,6 @@
 [package]
 name = "ninja-embed"
-description = "q0: libghostty 嵌入最小验证——AppKit 窗口挂一个 surface，跑 bash、能输入能渲染，并留能力审计取证"
+description = "q1: libghostty 嵌入壳——多窗/原生标签/分屏布局树接 surface，焦点/关闭/resize 全链；q0 取证模式保留可重跑"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -28,6 +28,8 @@ objc2-foundation = { version = "0.3", features = [
     "NSObjCRuntime",
     "NSPathUtilities",
     "NSThread",
+    "NSRange",
+    "NSAttributedString",
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "AppKitDefines",
@@ -40,6 +42,14 @@ objc2-app-kit = { version = "0.3", features = [
     "NSColor",
     "NSScreen",
     "NSGraphics",
+    # q1 壳：菜单 / NSTextInputClient（IME）/ 追踪区 / 面板控件。
+    "NSMenu",
+    "NSMenuItem",
+    "NSTextInputClient",
+    "NSTrackingArea",
+    "NSButton",
+    "NSControl",
+    "NSTextField",
 ] }
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer"] }
 # 覆盖层取证：NSColor → CGColor 填 CALayer 背景。

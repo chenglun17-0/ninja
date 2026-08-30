@@ -1,0 +1,56 @@
+ninja-embed q1 shell — libghostty 1.3.2-master-+8fc348a
+ninja-embed: action tag=41 has_view=false
+ninja-embed: action tag=25 has_view=true
+ninja-embed: action tag=22 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=41 has_view=false
+ninja-embed: action tag=25 has_view=true
+ninja-embed: action tag=22 has_view=true
+ninja-embed: action tag=25 has_view=true
+ninja-embed: action tag=41 has_view=false
+ninja-embed: action tag=25 has_view=true
+ninja-embed: action tag=22 has_view=true
+ninja-embed: action tag=25 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=32 has_view=true
+ninja-embed: action tag=32 has_view=true
+ninja-embed: action tag=32 has_view=true
+ninja-embed: close-request keyDown mods=0x100000 bare_cmd=true
+ninja-embed: close_leaf_deferred pane=3
+ninja-embed: windowShouldClose -> false
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=41 has_view=false
+ninja-embed: action tag=25 has_view=true
+ninja-embed: action tag=22 has_view=true
+ninja-embed: action tag=25 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=26 has_view=true
+ninja-embed: action tag=32 has_view=true
+ninja-embed: keyDown code=4 flags=0x20000000 chars=Some("h")
+2026-08-31 00:17:21.905 ninja-embed[98543:10331902] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+ninja-embed: action tag=37 has_view=true
+ninja-embed: keyDown code=34 flags=0x20000000 chars=Some("i")
