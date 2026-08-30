@@ -28,13 +28,17 @@
 //! - [`config`]：`~/.config/ninja/ninja.toml`（shell/字体/键位/主题色）
 //! - [`plugins`]：p3 ADE 插件门——[plugins] enabled 非空才绑 Unix
 //!   socket（默认空载不建）；p4 命中分发：Cmd+点击广播 hit，插件
-//!   claim/ignore 仲裁；p5 监督器（首次命中拉插件进程）+ 层握手
+//!   claim/ignore 仲裁；监督器（面板 v2 单一策略 2026-08-29：启用即
+//!   拉起——启动/面板开即拉插件进程）+ 层握手
 //!   （open→ready→present/close）+ 层前台输入路由；T2 theme.set
 //!   处置（换色板全屏重画；拥有者连接死亡/禁用回退 ODP 基线）
 //! - [`layer`]：p5 层原语——IOSurface 分配/注册表/几何（合成在
 //!   renderer 的层 pass）
 //! - [`link`]：p4 命中识别纯函数（路径/URL/OSC-8）
 //! - [`open`]：p4 系统默认打开（无插件认领时的回退；无安装提示）
+//! - [`panel`]：插件面板 v2（2026-08-29 决策）——⌘, 开的极简开关面：
+//!   每行 = 名/开关/运行状态（pid + 内存 MB）；开 = 启用即拉起 + 写回
+//!   ninja.toml；关 = p6 同一条幂等回收路径 + 名单移除 + 写回
 //! - [`app`]：NSApplication 引导、菜单（键位来自配置）、delegate
 //!
 //! 空载路径 = 本 crate + 依赖。没有插件运行时、没有 wasmtime、没有 JS
@@ -56,6 +60,7 @@ pub mod layer;
 pub mod link;
 pub mod open;
 pub mod pane;
+pub mod panel;
 pub mod plugins;
 pub mod pty;
 pub mod renderer;

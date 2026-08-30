@@ -60,6 +60,11 @@ objc2-app-kit = { version = "0.3", features = [
     "NSGraphics",
     "NSColor",
     "NSWorkspace",
+    # 面板 v2（2026-08-29 决策）：插件面板的开关/状态标签/行布局。
+    "NSButton",
+    "NSControl",
+    "NSTextField",
+    "NSStackView",
 ] }
 objc2-quartz-core = { version = "0.3", features = [
     "CALayer",

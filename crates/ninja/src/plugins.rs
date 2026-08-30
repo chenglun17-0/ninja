@@ -1,9 +1,12 @@
 //! p3：宿主侧 ADE 插件门（Unix socket，默认关）；p4：命中分发；
-//! p5：插件监督器（首次命中拉起进程）+ 层状态机（open→ready→present/
-//! close）+ 层前台输入路由；p6：**关掉即轻**——插件死亡收层
-//! （[`layer::close_by_conn`]）、同会话禁用（[`PluginHost::shutdown`]，
-//! [`Drop`] 复用同一实现）、陈旧 socket 清扫（[`sweep_stale_sockets`]）。
-//! 禁用/退出/崩溃之后：无插件进程、无 socket、无层，内存回空载。
+//! p5：插件监督器 + 层状态机（open→ready→present/close）+ 层前台输入
+//! 路由；p6：**关掉即轻**——插件死亡收层（[`layer::close_by_conn`]）、
+//! 同会话禁用（[`PluginHost::shutdown`]，[`Drop`] 复用同一实现）、陈旧
+//! socket 清扫（[`sweep_stale_sockets`]）。禁用/退出/崩溃之后：无插件
+//! 进程、无 socket、无层，内存回空载。面板 v2（2026-08-29 用户产品
+//! 决策）：单一 spawn 策略——**启用即拉起**（宿主启动/面板 on 即时
+//! spawn；面板 off 走 p6 同一条幂等生命周期），状态可见
+//! （[`PluginHost::snapshot`]：名/启用/在跑/pid/内存/最后错误）。
 //!
 //! 空载门禁：`[plugins] enabled` 为空（默认）时**不创建 socket 文件、
 //! 不拉任何插件进程**——[`PluginHost::start`] 直接返回 `None`，宿主
@@ -11,12 +14,14 @@
 //! wasmtime/tokio；默认配置启动后 socket 路径不存在，见
 //! `tests/idle_no_plugins.rs` 的运行时取证）。
 //!
-//! 启用时：绑定 [`socket_path`] 约定的路径并 listen。**启用 ≠ 常驻**
-//! （PRODUCT 规则）：进程拉起发生在**首次命中分发**——按名解析二进制
-//! （`[plugins] paths` → `$NINJA_PLUGIN_DIR/<name>` →
-//! `~/.config/ninja/plugins/<name>`（p7 分发缺省安装位）→ 宿主二进制
-//! 同目录（开发布局回退）），spawn 并以 `NINJA_ADE_SOCK` 告知 socket 路径；
-//! 解析失败/拉不起 = 该插件降级为不存在（stderr 一行警告，绝不弹 UI）。
+//! 启用时：绑定 [`socket_path`] 约定的路径并 listen。**启用即拉起**
+//! （2026-08-29 用户产品决策，覆盖早期「启用≠常驻」条款）：宿主启动
+//! （runloop 就绪后，[`spawn_startup_plugins`]）与面板开关「开」
+//! （[`toggle_plugin`]）都立即按名解析二进制（`[plugins] paths` →
+//! `$NINJA_PLUGIN_DIR/<name>` → `~/.config/ninja/plugins/<name>`（p7
+//! 分发缺省安装位）→ 宿主二进制同目录（开发布局回退）），spawn 并以
+//! `NINJA_ADE_SOCK` 告知 socket 路径；解析失败/拉不起 = 该插件降级为
+//! 不存在（stderr 一行警告，绝不弹 UI）。
 //!
 //! 命中分发（p4）：点击时把 [`Hit`] 广播给已连插件（连接由插件连进来，
 //! 分发时按需非阻塞 accept），收集 `hit.claim` / `hit.ignore` 回执——
@@ -43,7 +48,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ninja_protocol::frame::{FrameDecoder, encode_frame};
@@ -51,15 +56,40 @@ use ninja_protocol::{Hit, InputKey, LayerClose, Message, Modifier, ThemeSet};
 
 use crate::layer::{self, LayerGeom};
 
+/// 插件拉起时机（2026-08-29 用户产品决策修订）：**单一策略，不分
+/// spawn 模式**——enabled 名单里的插件宿主启动即拉起；运行中启用
+/// （面板 on）立即拉起；禁用（面板 off）走 p6 幂等 shutdown（杀进程 +
+/// revoke 主题/层 + 删连接）。「启用≠常驻」旧条款由本决策废止（见
+/// PRODUCT.md）；空载门禁不受影响——默认零插件时依然零 socket 零进程。
+
 /// `[plugins]` 配置（ninja.toml）。默认空 = 插件全关（空载门禁）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginsConfig {
-    /// 启用的插件名列表。空 = 关。首次命中分发时按名拉起（启用≠常驻）。
+    /// 启用的插件名列表。空 = 关。启用即拉起（宿主启动/面板 on 即时
+    /// spawn，见 [`PluginHost::spawn_enabled_now`]）。
     pub enabled: Vec<String>,
-    /// 插件名 → 二进制路径（p5 拉起用）。缺省时按名在
+    /// 插件名 → 二进制路径（拉起用）。缺省时按名在
     /// `$NINJA_PLUGIN_DIR/<name>` / `~/.config/ninja/plugins/<name>` /
     /// 宿主二进制同目录解析。
     pub paths: std::collections::HashMap<String, String>,
+}
+
+/// 一个插件在面板/测试眼里的状态快照（[`PluginHost::snapshot`]）。
+/// 「运行中」按宿主拉起的子进程判（try_wait 未退出）；内存是子进程
+/// 真实物理足迹（`proc_pid_rusage` 的 ri_phys_footprint，与 footprint
+/// 工具同源）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginStatus {
+    pub name: String,
+    /// 在会话 enabled 名单里（面板开关的「开」）。
+    pub enabled: bool,
+    /// 子进程活着。
+    pub running: bool,
+    pub pid: Option<u32>,
+    /// 物理足迹字节；进程不在 → None。
+    pub memory_bytes: Option<u64>,
+    /// 最后一次失败原因（拉起失败/异常退出）；正常在跑 → None。
+    pub last_error: Option<String>,
 }
 
 /// 已绑定的 ADE socket 句柄。Drop = [`PluginHost::shutdown`]（幂等）：
@@ -76,11 +106,15 @@ pub struct PluginHost {
     next_hit_id: u64,
     /// conn id 发号器（层条目回程路由用）。
     next_conn_id: u64,
-    /// p5 监督器：已拉起（或已放弃）的插件名。启用≠常驻：真正的 spawn
-    /// 发生在首次分发（`ensure_spawned`），这里只记「别再试」。
+    /// 监督器：已拉起（或已放弃）的插件名。「别再试」语义——外部
+    /// 死亡/拉起失败不自动重拉（拉不起/挂死的插件不该拖住空转红线）；
+    /// 面板再启用时显式清除重试（[`PluginHost::session_enable`]）。
     spawned: std::collections::BTreeSet<String>,
-    /// 拉起的插件进程（Drop 收割；宿主退出时它们也会因 socket EOF 自退）。
-    children: Vec<std::process::Child>,
+    /// 拉起的插件进程（带名：面板/状态快照按名对应 pid/内存；Drop
+    /// 收割；宿主退出时它们也会因 socket EOF 自退）。
+    children: Vec<(String, std::process::Child)>,
+    /// 拉起失败的最后原因（按名；面板「最后错误」列）。
+    spawn_errors: std::collections::BTreeMap<String, String>,
     /// 配置快照（按名解析二进制用；同会话再启用换新 host 也用它）。
     cfg: PluginsConfig,
     /// 已禁用（同会话禁用钩子/退出路径）。置位后分发/泵/accept 全部
@@ -247,6 +281,38 @@ fn ade_debug(msg: &str) {
     }
 }
 
+/// 子进程真实物理足迹（字节）：`proc_pid_rusage` 的 ri_phys_footprint
+/// （与 footprint 工具同源；libSystem 自带，无新增链接面）。面板内存
+/// 列与快照用。进程不在/拒绝 → None。
+fn footprint_bytes(pid: u32) -> Option<u64> {
+    // rusage_info 公共前缀（SDK sys/resource.h）：uuid[16] + user/system/
+    // idle_wkups/interrupt_wkups/pageins/wired/resident（7×u64），
+    // ri_phys_footprint 是第 9 个字段（偏移 72；v0..v6 同前缀）。内核
+    // 按 flavor 的完整结构体写入（v6 = 16 + 31×u64）——缓冲必须给足，
+    // 短了会被内核写穿（实测 SIGBUS）。
+    const RI_PHYS_FOOTPRINT_OFF: usize = 16 + 7 * 8;
+    // rusage_info_v6（RUSAGE_INFO_CURRENT）：16B uuid + 31×u64。
+    let mut info = [0u8; 16 + 31 * 8];
+    unsafe extern "C" {
+        fn proc_pid_rusage(
+            pid: i32,
+            flavor: i32,
+            buffer: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+    // RUSAGE_INFO_V4 = 4；只读前缀字段，偏移由 ABI 钉死。
+    let r = unsafe {
+        proc_pid_rusage(pid as i32, 4, info.as_mut_ptr() as *mut std::ffi::c_void)
+    };
+    (r == 0).then(|| {
+        u64::from_le_bytes(
+            info[RI_PHYS_FOOTPRINT_OFF..RI_PHYS_FOOTPRINT_OFF + 8]
+                .try_into()
+                .expect("常量切片恰 8 字节"),
+        )
+    })
+}
+
 impl PluginHost {
     /// 唯一入口：按配置决定绑不绑 socket。
     ///
@@ -283,6 +349,7 @@ impl PluginHost {
                     next_conn_id: 0,
                     spawned: std::collections::BTreeSet::new(),
                     children: Vec::new(),
+                    spawn_errors: std::collections::BTreeMap::new(),
                     cfg,
                     disabled: false,
                 })
@@ -310,47 +377,166 @@ impl PluginHost {
     }
 
     // ------------------------------------------------------------------
-    // p5 监督器：首次分发时拉起启用的插件
+    // 监督器（单一策略：启用即拉起；面板 v2 2026-08-29）
     // ------------------------------------------------------------------
 
-    /// 拉起尚未尝试过的启用插件。PRODUCT：启用≠常驻——只在命中分发
-    /// 路径调用（首次点击才 spawn）。已有连接在（如外部自连的测试
-    /// 插件/插件已拉起）时不重复拉：v0 无握手，宿主无法把连接映射回
-    /// 名字，按「有连接就够」处理。
-    fn ensure_spawned(&mut self) {
-        if !self.conns.is_empty() {
+    /// 拉起单个插件（一切拉起都从这里走：解析二进制 → spawn → 登记
+    /// 子进程/错误）。幂等性由调用方（spawned 集）保证。
+    fn spawn_one(&mut self, name: &str) {
+        let Some(bin) = resolve_plugin_binary(name, &self.cfg) else {
+            eprintln!(
+                "ninja: 插件 {name:?} 找不到二进制（[plugins.paths] / NINJA_PLUGIN_DIR / ~/.config/ninja/plugins / 宿主同目录），本次降级为未启用"
+            );
+            self.spawn_errors
+                .insert(name.to_string(), "找不到二进制".into());
+            return;
+        };
+        match std::process::Command::new(&bin)
+            .env("NINJA_ADE_SOCK", &self.path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => {
+                eprintln!(
+                    "ninja: 已拉起插件 {name:?}（pid {}，socket {:?}）",
+                    child.id(),
+                    self.path
+                );
+                self.spawn_errors.remove(name);
+                self.children.push((name.to_string(), child));
+            }
+            Err(e) => {
+                eprintln!("ninja: 插件 {name:?}（{}）拉起失败：{e}", bin.display());
+                self.spawn_errors
+                    .insert(name.to_string(), format!("拉起失败：{e}"));
+            }
+        }
+    }
+
+    /// **启用即拉起**（单一策略，2026-08-29 决策）：拉起全部 enabled
+    /// 且尚未尝试过的插件。宿主启动（runloop 就绪后，app 的
+    /// applicationDidFinishLaunching 调 [`spawn_startup_plugins`]）、p6
+    /// 钩子再启用（[`host_set_enabled`]）、面板开（[
+    /// PluginHost::session_enable`] 走单插件变体）都汇聚到这里。拉起后
+    /// 开一个「等首个连接」窗口（[`SPAWN_CONNECT_WINDOW`]）钉住泵
+    /// timer：插件 connect + 连接即推的 theme.set 靠泵消化（无层无
+    /// 覆盖时泵本会自停）。
+    pub fn spawn_enabled_now(&mut self) {
+        if self.disabled {
             return;
         }
+        let mut spawned_any = false;
         for name in self.cfg.enabled.clone() {
             if !self.spawned.insert(name.clone()) {
-                continue; // 已试过（成功或失败都不重试本次会话）
+                continue; // 已试过（成功或失败都不自动重拉）
             }
-            let Some(bin) = resolve_plugin_binary(&name, &self.cfg) else {
-                eprintln!(
-                    "ninja: 插件 {name:?} 找不到二进制（[plugins.paths] / NINJA_PLUGIN_DIR / ~/.config/ninja/plugins / 宿主同目录），本次降级为未启用"
-                );
-                continue;
-            };
-            match std::process::Command::new(&bin)
-                .env("NINJA_ADE_SOCK", &self.path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::inherit())
-                .spawn()
-            {
-                Ok(child) => {
-                    eprintln!(
-                        "ninja: 已拉起插件 {name:?}（pid {}，socket {:?}）",
-                        child.id(),
-                        self.path
-                    );
-                    self.children.push(child);
-                }
-                Err(e) => {
-                    eprintln!("ninja: 插件 {name:?}（{}）拉起失败：{e}", bin.display());
-                }
+            self.spawn_one(&name);
+            spawned_any = true;
+        }
+        if spawned_any {
+            spawn_pending_arm();
+            ensure_pump_timer();
+        }
+    }
+
+    /// 面板开关「开」的宿主侧半边：名字进会话 enabled 名单 + 立即拉起
+    ///（同一套 spawn 路径；显式清除「别再试」标记 → 之前拉不起/被杀的
+    /// 插件可以重试）。名字卫生同 [`resolve_plugin_binary`]（只收裸名）。
+    /// 返回 false = 已禁用/名字非法（面板回弹开关）。
+    pub fn session_enable(&mut self, name: &str) -> bool {
+        if self.disabled || name.is_empty() || name.contains('/') {
+            return false;
+        }
+        if !self.cfg.enabled.iter().any(|n| n == name) {
+            self.cfg.enabled.push(name.to_string());
+        }
+        self.spawned.remove(name); // 面板显式操作：重置重试标记
+        self.spawn_one(name);
+        spawn_pending_arm();
+        ensure_pump_timer();
+        true
+    }
+
+    /// 面板开关「关」的宿主侧半边：名字出会话 enabled 名单 + 立即杀它
+    /// 名下的子进程 + 排干 EOF（收层/回退色板与 p6 插件死亡同一条通路：
+    /// pump 摄连接 EOF → [`PluginHost::drop_conn`]）。名单清空 = 整个
+    /// 插件面关掉（[`PluginHost::shutdown`]：删 socket，回到空载形态）。
+    pub fn session_disable(&mut self, name: &str) {
+        self.cfg.enabled.retain(|n| n != name);
+        let mut killed = false;
+        let mut i = 0;
+        while i < self.children.len() {
+            if self.children[i].0 == name {
+                let (_, mut c) = self.children.remove(i);
+                let _ = c.kill();
+                let _ = c.wait();
+                killed = true;
+            } else {
+                i += 1;
             }
         }
+        if killed {
+            // 同步排干死亡连接的 EOF：层/色板覆盖当场回收，不等下一拍。
+            self.pump_plugins();
+        }
+        if self.cfg.enabled.is_empty() {
+            self.shutdown(); // 名单空 = 零插件：socket 删除，回空载
+        }
+    }
+
+    /// 状态快照（面板/测试）：enabled 名单 ∪ 有子进程 ∪ 有错误记录的
+    /// 名字，逐名报告 启用/在跑/pid/内存/最后错误。顺带收割已退出的
+    /// 子进程（try_wait）并把异常退出记进 last_error。
+    pub fn snapshot(&mut self) -> Vec<PluginStatus> {
+        // 收割退出者：正常退出（EOF 自退/被禁用杀）不记错，异常退出
+        //（非零码/信号）记「已退出」，面板可见。
+        let mut i = 0;
+        while i < self.children.len() {
+            match self.children[i].1.try_wait() {
+                Ok(Some(st)) => {
+                    let (name, _) = self.children.remove(i);
+                    if !st.success() {
+                        self.spawn_errors
+                            .insert(name, format!("已退出（code {}）", st.code().unwrap_or(-1)));
+                    }
+                }
+                Ok(None) => i += 1,
+                Err(_) => i += 1, // wait 错误：当还活着（下拍再试）
+            }
+        }
+        let mut names: std::collections::BTreeSet<String> =
+            self.cfg.enabled.iter().cloned().collect();
+        for (n, _) in &self.children {
+            names.insert(n.clone());
+        }
+        names.extend(self.spawn_errors.keys().cloned());
+        names
+            .into_iter()
+            .map(|name| {
+                let child = self
+                    .children
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, c)| c);
+                let running = child.is_some();
+                let pid = child.map(|c| c.id());
+                let memory_bytes = pid.and_then(footprint_bytes);
+                PluginStatus {
+                    enabled: self.cfg.enabled.iter().any(|n| *n == name),
+                    running,
+                    pid,
+                    memory_bytes: if running { memory_bytes } else { None },
+                    last_error: if running {
+                        None
+                    } else {
+                        self.spawn_errors.get(&name).cloned()
+                    },
+                    name,
+                }
+            })
+            .collect()
     }
 
     // ------------------------------------------------------------------
@@ -373,7 +559,8 @@ impl PluginHost {
 
     /// 按需非阻塞 accept：把内核 backlog 里排队的插件连接收进来。
     /// 不新增线程；没连接就是空操作。已禁用时不再收新连接（行为同
-    /// 未启用）。
+    /// 未启用）。收到任何连接即关掉「等首个连接」窗口（[
+    /// spawn_pending_disarm]）——泵的存活交回常规规则（层/色板覆盖）。
     fn pump_accept(&mut self) {
         if self.disabled {
             return;
@@ -395,6 +582,9 @@ impl PluginHost {
                 Err(_) => break, // 监听器异常：本轮不再收，下次分发再试
             }
         }
+        if !self.conns.is_empty() {
+            spawn_pending_disarm();
+        }
     }
 
     /// dispatch_hit 的实现核心（超时可注入，单测用短预算）。
@@ -415,10 +605,11 @@ impl PluginHost {
         }
         self.pump_accept();
         if self.conns.is_empty() {
-            // p5 冷启动：首次分发才拉插件；等 connect 的预算独立于回执
-            // 预算（拉起只付一次，回执仍钉 HIT_REPLY_TIMEOUT）。测试注入
-            // 的短 timeout 也约束冷启动等待；全部插件都试过（拉不起/
-            // 已死）就即刻降级，不再等。
+            // 兜底冷启动（常规路径已不依赖：宿主启动/面板开就拉过）；
+            // 只有「启用后从未成功拉起、且未试过」的插件会走到这。等
+            // connect 的预算独立于回执预算（拉起只付一次，回执仍钉
+            // HIT_REPLY_TIMEOUT）；全部插件都试过（拉不起/已死）就即刻
+            // 降级，不再等。
             let can_spawn = self
                 .cfg
                 .enabled
@@ -427,9 +618,13 @@ impl PluginHost {
             if !can_spawn {
                 return DispatchOutcome::NoPlugins;
             }
-            ade_debug("dispatch: 无连接，冷启动拉插件");
+            ade_debug("dispatch: 无连接，冷启动兜底拉插件");
             let t_spawn = Instant::now();
-            self.ensure_spawned();
+            for name in self.cfg.enabled.clone() {
+                if self.spawned.insert(name.clone()) {
+                    self.spawn_one(&name);
+                }
+            }
             let connect_deadline = Instant::now() + COLD_CONNECT_TIMEOUT.min(timeout);
             while self.conns.is_empty() && Instant::now() < connect_deadline {
                 std::thread::sleep(Duration::from_millis(10));
@@ -866,11 +1061,12 @@ impl PluginHost {
         }
         stop_pump_timer_if_idle();
         self.conns.clear();
-        for c in self.children.iter_mut() {
+        for (_name, c) in self.children.iter_mut() {
             let _ = c.kill();
             let _ = c.wait();
         }
         self.children.clear();
+        spawn_pending_disarm();
         let _ = std::fs::remove_file(&self.path);
         eprintln!(
             "ninja: 插件已禁用（层已收、连接已断、子进程已收割、socket {:?} 已删）",
@@ -895,6 +1091,38 @@ struct TimerSlot(Option<objc2_core_foundation::CFRetained<objc2_core_foundation:
 unsafe impl Send for TimerSlot {}
 
 static PUMP_TIMER: Mutex<TimerSlot> = Mutex::new(TimerSlot(None));
+
+/// 拉起后「等首个连接」的窗口（单一策略，2026-08-29 决策）：插件被
+/// 拉起后，它的 connect + 连接即推的 theme.set 要靠泵消化；但此时
+/// 可能既无层也无色板覆盖（泵的常规启停条件都不满足），泵会自停 →
+/// 连接永远没人 accept。窗口内泵不自停；首个连接进来（或窗口过期，
+/// 拉不起/挂死的插件不该拖住空转红线）即恢复常规规则。之后插件推
+/// theme.set 生效 → `override_active()` 接手钉住泵（T2 机制不变）。
+const SPAWN_CONNECT_WINDOW: Duration = Duration::from_secs(5);
+
+static SPAWN_PENDING: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// 开窗（拉起后）。
+fn spawn_pending_arm() {
+    if let Ok(mut s) = SPAWN_PENDING.lock() {
+        *s = Some(Instant::now() + SPAWN_CONNECT_WINDOW);
+    }
+}
+
+/// 关窗（连接已到 / 宿主禁用）。
+fn spawn_pending_disarm() {
+    if let Ok(mut s) = SPAWN_PENDING.lock() {
+        *s = None;
+    }
+}
+
+/// 窗口是否在等（钉住泵不自停）。
+fn spawn_pending_active() -> bool {
+    SPAWN_PENDING
+        .lock()
+        .map(|s| s.map(|dl| Instant::now() < dl).unwrap_or(false))
+        .unwrap_or(false)
+}
 
 /// 泵回调（CFRunLoopTimer callout，主线程）：无分发器 = 宿主在退出，
 /// 停表。
@@ -946,8 +1174,11 @@ fn ensure_pump_timer() {
 
 /// 停泵（幂等）：最后一个层关闭后由 pump/close 路径调用。
 fn stop_pump_timer_if_idle() {
-    if layer::any_layers() || crate::theme::override_active() {
-        return; // 还有层要合成 / 还有色板覆盖要盯（拥有者死亡即回退）
+    if layer::any_layers()
+        || crate::theme::override_active()
+        || spawn_pending_active()
+    {
+        return; // 还有层要合成 / 还有色板覆盖要盯 / 还在等拉起的插件连上
     }
     if let Ok(mut slot) = PUMP_TIMER.lock() {
         if let Some(t) = slot.0.take() {
@@ -966,7 +1197,7 @@ fn stop_pump_timer_if_idle() {
 
 /// 泵入口（timer 回调直调；测试可直调）。
 pub fn pump_now() {
-    if !layer::any_layers() && !crate::theme::override_active() {
+    if !layer::any_layers() && !crate::theme::override_active() && !spawn_pending_active() {
         stop_pump_timer_if_idle();
         return;
     }
@@ -981,29 +1212,59 @@ pub fn pump_now() {
 }
 
 // ---------------------------------------------------------------------------
-// 全局分发器：view（Cmd+点击）→ PluginHost 的通路
+// 全局分发器：view（Cmd+点击）/ 面板 / 取证钩子 → PluginHost 的通路
 // ---------------------------------------------------------------------------
 //
-// PluginHost 本体住在 app::run() 的栈上（生命周期 = 进程，退出时 drop
-// 删 socket 文件）；这里只登记 Weak——宿主退出时栈上的 Arc 先释放，
-// 静态槽里的 Weak 自动失效，Drop 照常跑。只在主线程读写（点击路径
-// 本就主线程），Mutex 只为满足 static 要求。
+// PluginHost 住在本静态槽的 Arc 里（生命周期 = 进程；面板 v2 起
+// 运行中把插件从零拉起需要随时可造新 host，栈上 Option 不再够用）。
+// 退出收口不靠静态槽的 Drop（静态不 drop）：`applicationWillTerminate`
+// → [`host_shutdown`] 显式幂等关（与 [`Drop`] 同一实现）；崩溃/
+// SIGKILL 的 socket 尸体由 [`sweep_stale_sockets`] 清扫（p6）。只在主
+// 线程读写（点击/面板/钩子本就主线程），Mutex 只为满足 static 要求。
 
-static DISPATCHER: Mutex<Option<Weak<Mutex<PluginHost>>>> = Mutex::new(None);
+static DISPATCHER: Mutex<Option<Arc<Mutex<PluginHost>>>> = Mutex::new(None);
 
-/// 登记全局分发器（app::run 启用插件时调一次；空载不调）。
-pub fn install_dispatcher(host: &Arc<Mutex<PluginHost>>) {
+/// 启动配置快照（会话真值的回退源：host 还没进（空 enabled）时，
+/// 面板开关用这里的 paths 解析插件）。app::run 装一次。
+static SESSION_CFG: Mutex<Option<PluginsConfig>> = Mutex::new(None);
+
+/// 登记全局分发器 + 启动配置快照（app::run 调；启用非空时）。
+pub fn install_dispatcher(host: Arc<Mutex<PluginHost>>, startup_cfg: PluginsConfig) {
     if let Ok(mut slot) = DISPATCHER.lock() {
-        *slot = Some(Arc::downgrade(host));
+        *slot = Some(host);
+    }
+    if let Ok(mut slot) = SESSION_CFG.lock() {
+        *slot = Some(startup_cfg);
     }
 }
 
-/// 取当前分发器（没装 / 已随宿主退出失效 → None）。
+/// 只装启动配置快照（空载路径：enabled 空，无 host 可装；面板首次
+/// 开时仍需 paths 来发现/拉起插件）。
+pub fn install_session_cfg(cfg: PluginsConfig) {
+    if let Ok(mut slot) = SESSION_CFG.lock() {
+        *slot = Some(cfg);
+    }
+}
+
+/// 取当前分发器（没装（空载/从未启用）→ None）。
 pub fn take_dispatcher() -> Option<Arc<Mutex<PluginHost>>> {
-    DISPATCHER
-        .lock()
-        .ok()
-        .and_then(|slot| slot.as_ref().and_then(Weak::upgrade))
+    DISPATCHER.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// 会话真值的配置快照：host 在 → 它的 cfg（面板开关已反映进去）；
+/// host 不在（空载）→ 启动快照。面板行发现与写回名单都以它为准。
+pub fn session_cfg() -> PluginsConfig {
+    match take_dispatcher() {
+        Some(host) => host
+            .lock()
+            .map(|h| h.cfg().clone())
+            .unwrap_or_default(),
+        None => SESSION_CFG
+            .lock()
+            .ok()
+            .and_then(|s| s.clone())
+            .unwrap_or_default(),
+    }
 }
 
 /// 点击路径一站式入口：给 hit 发号（无分发器 → 0）。
@@ -1061,10 +1322,10 @@ pub fn host_close_layers_of_pane(pane: u32) {
 }
 
 /// 宿主退出收口（p6）：`NSApplication terminate:` 直接 `exit(0)`，
-/// `app.run()` 不返回、Rust 栈展开不发生——`PluginHost::Drop` 在⌘Q/
-/// 关最后窗的正常退出路径上**不会跑**（E2E 实测：socket 尸体不只是
-/// SIGKILL 的产物）。`applicationWillTerminate` 里显式调本函数（幂
-/// 等；与 Drop 同一实现）。
+/// `app.run()` 不返回、Rust 栈展开不发生——静态槽不 drop，
+/// `PluginHost::Drop` 在⌘Q/关最后窗的正常退出路径上不会跑（E2E 实测：
+/// socket 尸体不只是 SIGKILL 的产物）。`applicationWillTerminate` 里
+/// 显式调本函数（幂等；与 Drop 同一实现）。
 pub fn host_shutdown() {
     if let Some(host) = take_dispatcher() {
         if let Ok(mut h) = host.lock() {
@@ -1073,13 +1334,106 @@ pub fn host_shutdown() {
     }
 }
 
+/// **启用即拉起**的宿主启动半边（app 的 applicationDidFinishLaunching
+/// 调；runloop 就绪后）。空载（无分发器）= 无操作——门禁不变。
+pub fn spawn_startup_plugins() {
+    if let Some(host) = take_dispatcher() {
+        if let Ok(mut h) = host.lock() {
+            h.spawn_enabled_now();
+        }
+    }
+}
+
+/// 状态接线：全部插件的状态快照（面板与测试用；见
+/// [`PluginHost::snapshot`]）。无分发器 → 空表。
+pub fn status_snapshot() -> Vec<PluginStatus> {
+    match take_dispatcher() {
+        Some(host) => host.lock().map(|mut h| h.snapshot()).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// **面板开关的宿主侧入口**（2026-08-29 决策：启用即拉起/禁用即回收；
+/// 与 `NINJA_P6_PLUGIN_FILE` 同一条幂等生命周期路径）。面板 UI 与
+/// E2E 钩子都调这里；写回 ninja.toml 由调用方（`panel::toggle`）做。
+/// - on：名字进会话 enabled 名单 + 立即拉起；host 不在/已禁用时先
+///   重绑（从零拉起用启动快照的 paths）。
+/// - off：名字出名单 + 立即杀进程/收层/断连；名单空 → 整个关掉
+///   （shutdown：删 socket，回空载）。
+/// 返回 false = 开且拉不起 host（绑定失败）；关恒 true。
+pub fn toggle_plugin(name: &str, on: bool) -> bool {
+    if !on {
+        if let Some(host) = take_dispatcher() {
+            if let Ok(mut h) = host.lock() {
+                h.session_disable(name);
+            }
+        } else {
+            // host 不在（空载）：从启动快照名单里剔除（下次启动生效）。
+            if let Ok(mut slot) = SESSION_CFG.lock() {
+                if let Some(cfg) = slot.as_mut() {
+                    cfg.enabled.retain(|n| n != name);
+                }
+            }
+        }
+        return true;
+    }
+    match take_dispatcher() {
+        Some(host) => {
+            let Ok(mut h) = host.lock() else {
+                return false;
+            };
+            if h.disabled {
+                // 整面被 p6 钩子关过：重绑（同 host_set_enabled(true) 的
+                // 再启用路径）。名字先进名单，新 host 一次拉起全部
+                // enabled（含本次要开的）——单一策略不并出「重绑后其它
+                // enabled 插件没人拉」的缺口。
+                let path = h.path().to_path_buf();
+                let mut cfg = h.cfg().clone();
+                if !cfg.enabled.iter().any(|n| n == name) {
+                    cfg.enabled.push(name.to_string());
+                }
+                let Some(nh) = PluginHost::bind(path, cfg) else {
+                    return false;
+                };
+                *h = nh;
+                h.spawn_enabled_now();
+                return true;
+            }
+            h.session_enable(name)
+        }
+        None => {
+            // 空载 → 从零拉起：启动快照 + 名字 → 新 host。
+            let mut cfg = session_cfg();
+            if !cfg.enabled.iter().any(|n| n == name) {
+                cfg.enabled.push(name.to_string());
+            }
+            match PluginHost::start(&cfg) {
+                Some(h) => {
+                    let arc = Arc::new(Mutex::new(h));
+                    if let Ok(mut slot) = DISPATCHER.lock() {
+                        *slot = Some(arc.clone());
+                    }
+                    match arc.lock() {
+                        Ok(mut h) => {
+                            h.spawn_enabled_now();
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                None => false,
+            }
+        }
+    }
+}
+
 /// p6 同会话禁用 / 再启用（取证钩子 `NINJA_P6_PLUGIN_FILE` 驱动；
-/// 产品 UI 归后续阶段）。
+/// 产品面 = 面板逐插件开关，见 [`toggle_plugin`]）。
 /// - 禁用 = 现任 host [`PluginHost::shutdown`]（幂等：收层/断连接/
 ///   收割子进程/删 socket）；
 /// - 再启用 = 新绑一个 host 换进分发器同一槽位——`spawned` 集随新
-///   对象重置（下次分发重新拉起）、socket 重绑，即「禁用→再启用」
-///   的完整语义；旧 host 的 [`Drop`] 是幂等空转。
+///   对象重置，并**立即拉起**全部 enabled（启用即拉起）；旧 host 的
+///   [`Drop`] 是幂等空转。
 /// 返回 false = 无分发器（未启用插件/宿主在退出）/ 再启用绑定失败。
 pub fn host_set_enabled(on: bool) -> bool {
     let Some(host) = take_dispatcher() else {
@@ -1102,7 +1456,10 @@ pub fn host_set_enabled(on: bool) -> bool {
         Some(nh) => {
             let bound = nh.path().to_path_buf();
             *h = nh;
-            eprintln!("ninja: 插件已再启用（socket {bound:?} 已重绑，spawned 集已重置）");
+            eprintln!(
+                "ninja: 插件已再启用（socket {bound:?} 已重绑，enabled 已拉起）"
+            );
+            h.spawn_enabled_now();
             true
         }
         None => false,
@@ -1166,8 +1523,12 @@ mod tests {
     #[test]
     fn enabled_via_start_uses_convention_path() {
         // 走真实 start()（含 env 覆盖逻辑）：启用非空 → 绑生效路径
-        //（NINJA_ADE_SOCK 设置时用它，否则约定路径）。不触发任何 spawn
-        //（拉起只在首次分发；本测试不分发）。
+        //（NINJA_ADE_SOCK 设置时用它，否则约定路径）。start 只绑 socket
+        //不拉进程——拉起由 spawn_enabled_now 显式触发（宿主启动/面板开）。
+        // 与会改 NINJA_ADE_SOCK 的 toggle 测试串行（env 是进程级的）。
+        let _g = DISPATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cfg = PluginsConfig {
             enabled: vec!["preview".into()],
             ..PluginsConfig::default()
@@ -1180,7 +1541,10 @@ mod tests {
             let host = PluginHost::start(&cfg).expect("启用即绑");
             assert_eq!(host.path(), expected.as_path());
             assert!(expected.exists());
-            assert!(host.children.is_empty(), "启用不等于拉起（首次分发才拉）");
+            assert!(
+                host.children.is_empty(),
+                "start 只绑 socket；拉起在 spawn_enabled_now（本测试不调）"
+            );
         }
         if std::env::var_os("NINJA_ADE_SOCK").is_none() {
             assert!(!expected.exists(), "drop 后约定路径应删除");
@@ -1463,25 +1827,36 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_weak_dies_with_host_and_free_entry_works() {
-        // Weak 通路：登记 → 可取；宿主释放 → 自动失效（退出时 drop 删
-        // socket 的生命周期不变量）。分发器槽全局：与其它装槽的测试
-        // 串行（见 DISPATCHER_TEST_LOCK）。
+    fn dispatcher_strong_slot_and_free_entry_works() {
+        // 强槽通路（面板 v2 起静态槽持 Arc）：登记 → 可取 → hit 发号；
+        // host_shutdown 后行为同未启用（NoPlugins）。槽全局：与其它
+        // 装槽的测试串行（见 DISPATCHER_TEST_LOCK）。
         let _g = DISPATCHER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = sandbox("dispwk");
+        let sock = dir.join("a.sock");
         let arc = Arc::new(Mutex::new(
-            PluginHost::bind(dir.join("a.sock"), PluginsConfig::default()).unwrap(),
+            PluginHost::bind(sock.clone(), PluginsConfig::default()).unwrap(),
         ));
-        install_dispatcher(&arc);
+        install_dispatcher(arc, PluginsConfig::default());
         assert!(take_dispatcher().is_some());
+        assert!(sock.exists());
         assert!(next_hit_id() >= 1);
-        drop(arc);
-        assert!(take_dispatcher().is_none());
-        // 失效后走自由函数：NoPlugins（即系统默认），不 panic。
+        // 退出收口：shutdown（幂等；与 applicationWillTerminate 同一
+        // 通路）→ socket 消失，分发 NoPlugins，不 panic。
+        host_shutdown();
+        assert!(!sock.exists(), "shutdown 后 socket 应删除");
         assert_eq!(
             dispatch_hit(&sample_hit(1), None),
+            DispatchOutcome::NoPlugins
+        );
+        // 清槽，不污染后续装槽的测试（生产永不卸槽）。
+        if let Ok(mut slot) = DISPATCHER.lock() {
+            *slot = None;
+        }
+        assert_eq!(
+            dispatch_hit(&sample_hit(2), None),
             DispatchOutcome::NoPlugins
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1673,7 +2048,6 @@ mod tests {
     /// 窗口 view = 空转；vt 链路已由 theme.rs 单测覆盖。）
     #[test]
     fn theme_set_applies_and_reverts_on_conn_death() {
-        use ninja_protocol::ThemeSet;
         let _g = crate::theme::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1757,13 +2131,14 @@ mod tests {
     }
 
     /// 分发器槽是全局的：装它的测试之间串行（含既有
-    /// dispatcher_weak_dies… 测试）。
+    /// dispatcher_strong_slot… 测试）。收尾卸槽，不污染后续。
     static DISPATCHER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn host_set_enabled_disable_reenable_cycle() {
         // p6 钩子通路（NINJA_P6_PLUGIN_FILE → host_set_enabled）：
-        // 禁用 → socket 消失；再启用 → 同路径重绑（换新 host）。
+        // 禁用 → socket 消失；再启用 → 同路径重绑（换新 host，启用即
+        // 拉起——ghost 无二进制，拉起尝试降级但不影响重绑语义）。
         let _g = DISPATCHER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1776,7 +2151,7 @@ mod tests {
         let arc = Arc::new(Mutex::new(
             PluginHost::bind(sock.clone(), cfg).expect("bind"),
         ));
-        install_dispatcher(&arc);
+        install_dispatcher(arc, PluginsConfig::default());
         assert!(sock.exists());
 
         assert!(host_set_enabled(false));
@@ -1785,10 +2160,211 @@ mod tests {
         assert!(host_set_enabled(true));
         assert!(sock.exists(), "再启用应重绑同一路径");
 
-        // 再关一次 + 宿主退出路径（drop Arc → Drop → 幂等空转）。
+        // 再关一次 + 收尾（生产槽不卸；这里清槽防污染后续测试）。
         assert!(host_set_enabled(false));
-        drop(arc);
-        assert!(take_dispatcher().is_none());
+        if let Ok(mut slot) = DISPATCHER.lock() {
+            *slot = None;
+        }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // 面板 v2（单一策略：启用即拉起）
+    // ------------------------------------------------------------------
+
+    /// 伪造插件脚本：挂住等宿主杀（真实插件的常驻形态）；x 位可执行。
+    fn fake_plugin(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(
+            &p,
+            "#!/bin/sh\nwhile :; do sleep 0.2; done\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        p
+    }
+
+    #[test]
+    fn toggle_plugin_single_strategy_lifecycle() {
+        // 面板开关全链（与 NINJA_P6_PLUGIN_FILE 同一条幂等生命周期）：
+        // 空 enabled（无 host）→ toggle on = 从零拉起（socket 出现、
+        // 子进程在跑、快照报告内存）→ toggle off = 杀进程 + 名单空 →
+        // shutdown（socket 消失，回空载形态）。
+        let _g = DISPATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = sandbox("toggle");
+        let bin = fake_plugin(&dir, "fakeplug");
+        let sock = dir.join("ade.sock");
+        // SAFETY: 单线程测试内的 env 覆盖（Rust 2024 起 unsafe）。
+        unsafe { std::env::set_var("NINJA_ADE_SOCK", &sock) };
+        // 起点：空载（enabled 空，无 host）——面板仍可用（靠启动快照）。
+        let cfg = PluginsConfig {
+            paths: std::collections::HashMap::from([(
+                "fakeplug".to_string(),
+                bin.to_string_lossy().into_owned(),
+            )]),
+            ..PluginsConfig::default()
+        };
+        install_session_cfg(cfg.clone());
+        assert!(take_dispatcher().is_none(), "空载：无 host");
+
+        // —— 开：从零拉起。
+        assert!(toggle_plugin("fakeplug", true));
+        assert!(sock.exists(), "面板开后 socket 应出现");
+        let snap = status_snapshot();
+        let st = snap.iter().find(|s| s.name == "fakeplug").unwrap();
+        assert!(st.enabled && st.running, "启用即拉起：进程应在跑（{st:?}）");
+        let pid = st.pid.unwrap();
+        assert!(st.memory_bytes.unwrap_or(0) > 0, "真实子进程足迹应 > 0");
+
+        // —— 关：杀进程 + 名单空 → 整面关。
+        assert!(toggle_plugin("fakeplug", false));
+        assert!(!sock.exists(), "最后一个插件关掉 → socket 删除（空载）");
+        let snap = status_snapshot();
+        let st = snap.iter().find(|s| s.name == "fakeplug");
+        assert!(
+            st.is_none() || !st.unwrap().running,
+            "关后不应在跑（{st:?}）"
+        );
+        // 进程真的死了（kill+wait 已收尸：kill(pid,0) 应 ESRCH）。
+        let alive = unsafe { libc::kill(pid as i32, 0) == 0 }
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        assert!(!alive, "子进程应被收割（pid {pid} 仍在）");
+
+        // —— 再开再关（幂等往返）。
+        assert!(toggle_plugin("fakeplug", true));
+        assert!(sock.exists());
+        assert!(toggle_plugin("fakeplug", false));
+        assert!(!sock.exists());
+
+        // SAFETY: 同上。
+        unsafe { std::env::remove_var("NINJA_ADE_SOCK") };
+        if let Ok(mut slot) = DISPATCHER.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = SESSION_CFG.lock() {
+            *slot = None;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_enable_off_missing_binary_reports_error() {
+        // 拉不起的二进制：开 = 记入 last_error、不在跑；名单空不绑 socket
+        // 之外的任何东西；开关往返不炸。
+        let _g = DISPATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = sandbox("nobin");
+        let sock = dir.join("ade.sock");
+        // SAFETY: 单线程测试内的 env 覆盖。
+        unsafe { std::env::set_var("NINJA_ADE_SOCK", &sock) };
+        install_session_cfg(PluginsConfig::default());
+        assert!(toggle_plugin("ghostplug", true));
+        assert!(sock.exists(), "host 仍应绑定（名单非空）");
+        let snap = status_snapshot();
+        let st = snap.iter().find(|s| s.name == "ghostplug").unwrap();
+        assert!(st.enabled && !st.running, "拉不起：不在跑但在名单");
+        assert!(st.last_error.is_some(), "应有错误说明（{st:?}）");
+        assert!(toggle_plugin("ghostplug", false));
+        assert!(!sock.exists(), "关完回空载");
+        // SAFETY: 同上。
+        unsafe { std::env::remove_var("NINJA_ADE_SOCK") };
+        if let Ok(mut slot) = DISPATCHER.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = SESSION_CFG.lock() {
+            *slot = None;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggle_on_over_disabled_host_respawns_all_enabled() {
+        // p6 整面关掉后（host disabled）再从面板开单个插件：重绑 + **全部
+        // enabled 一起拉起**（不只本次开关的那个——「重绑后其它 enabled
+        // 插件没人拉」的缺口回归钉）。
+        let _g = DISPATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = sandbox("rebind");
+        let b1 = fake_plugin(&dir, "plug_a");
+        let b2 = fake_plugin(&dir, "plug_b");
+        let sock = dir.join("ade.sock");
+        // SAFETY: 单线程测试内的 env 覆盖。
+        unsafe { std::env::set_var("NINJA_ADE_SOCK", &sock) };
+        let cfg = PluginsConfig {
+            enabled: vec!["plug_a".into()],
+            paths: std::collections::HashMap::from([
+                ("plug_a".to_string(), b1.to_string_lossy().into_owned()),
+                ("plug_b".to_string(), b2.to_string_lossy().into_owned()),
+            ]),
+            ..PluginsConfig::default()
+        };
+        let arc = Arc::new(Mutex::new(
+            PluginHost::bind(sock.clone(), cfg.clone()).expect("bind"),
+        ));
+        install_dispatcher(arc.clone(), cfg);
+        arc.lock().unwrap().spawn_enabled_now();
+        assert!(sock.exists());
+
+        // p6 整面关（等同 NINJA_P6_PLUGIN_FILE=off）。
+        assert!(host_set_enabled(false));
+        assert!(!sock.exists());
+
+        // 面板开 plug_b：重绑 → plug_a（还在 enabled 名单里）与 plug_b
+        // 一起拉起。
+        assert!(toggle_plugin("plug_b", true));
+        assert!(sock.exists(), "重绑后 socket 应回来");
+        let snap = status_snapshot();
+        let a = snap.iter().find(|s| s.name == "plug_a").unwrap();
+        let b = snap.iter().find(|s| s.name == "plug_b").unwrap();
+        assert!(a.enabled && a.running, "重绑后既有 enabled 也要拉起：{a:?}");
+        assert!(b.enabled && b.running, "本次开关的插件在跑：{b:?}");
+
+        // 收尾。
+        assert!(toggle_plugin("plug_a", false));
+        assert!(toggle_plugin("plug_b", false));
+        assert!(!sock.exists(), "名单空 → socket 删");
+        // SAFETY: 同上。
+        unsafe { std::env::remove_var("NINJA_ADE_SOCK") };
+        if let Ok(mut slot) = DISPATCHER.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = SESSION_CFG.lock() {
+            *slot = None;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_pending_window_pins_pump() {
+        // 拉起后的「等首个连接」窗口：开窗 → 泵不许自停（无层无覆盖也
+        // 不停）；关窗/过期 → 恢复常规。纯静态槽直测（先起泵再验停不停）。
+        assert!(!spawn_pending_active());
+        ensure_pump_timer();
+        assert!(
+            PUMP_TIMER.lock().map(|s| s.0.is_some()).unwrap_or(false),
+            "前置：泵已挂起"
+        );
+        spawn_pending_arm();
+        assert!(spawn_pending_active());
+        stop_pump_timer_if_idle(); // 窗口内不得真停
+        assert!(
+            PUMP_TIMER.lock().map(|s| s.0.is_some()).unwrap_or(false),
+            "窗口内泵应保持挂起（未移除）"
+        );
+        spawn_pending_disarm();
+        assert!(!spawn_pending_active());
+        stop_pump_timer_if_idle(); // 常规规则：无层无覆盖 → 真停
+        assert!(
+            PUMP_TIMER.lock().map(|s| s.0.is_none()).unwrap_or(true),
+            "关窗后无层无覆盖 → 泵应自停"
+        );
     }
 }

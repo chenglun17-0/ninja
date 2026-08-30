@@ -589,3 +589,85 @@ atlas 槽位改 字形+字体槽 双维度（`HashMap<槽位, HashMap<文本, Gl
   图管线，第一年不做）；
 - 全字体集合扫描只在「cascade 返回 LastResort」时触发且按码点缓存，
   首个 PUA 码点约 20ms（一次），命中后零成本。
+
+# 插件面板 v2：单一 spawn 策略「启用即拉起」（2026-08-29 用户产品决策修订）
+
+## 决策与范围
+
+2026-08-29 用户产品决策修订（覆盖此前任何 spawn 模式设计）：**不做
+enable/hit 两类，就一类**——enabled 名单里的插件宿主启动即拉起；面板
+开关 on = 立即拉起、off = 立即杀 + 回收。preview 也一样（idle 语义改为
+「进程在跑、socket 在、等 hit」）。旧的「启用≠常驻」（PRODUCT.md
+「不用不加载」句）由本决策废止，改写为「启用即拉起，禁用即退出回收」；
+空载门禁不受影响——默认零插件时依然零进程零 socket。实施时工作区里
+已有半成品的 `[plugins.spawn] name = "enable"|"hit"` 两模式实现
+（config.rs 解析 + plugins.rs `SpawnMode`），按「不留死配置面」原则
+整体删除简化为单一策略；旧配置若带 spawn 段 → deny_unknown_fields
+整体降级默认（与其它未知字段同语义，启动不炸，config 单测钉死）。
+
+## 改动落点
+
+- `plugins.rs`：单一策略核心——`spawn_enabled_now()`（宿主启动 /
+  p6 再启用 / 面板开共用的拉起口）；`session_enable/session_disable`
+  （单插件面板开关的宿主半边：off = 杀名下子进程 + pump 同步排干 EOF
+  → 收层/回退色板（与 p6 插件死亡同一条 drop_conn 通路）；名单空 =
+  整面 shutdown 删 socket）；`snapshot()`（名/启用/在跑/pid/内存/
+  最后错误，内存 = proc_pid_rusage ri_phys_footprint）；分发器槽改
+  **强 Arc**（运行中从零拉起插件需要可造新 host，栈上 Option 不再
+  够用；退出收口仍走 applicationWillTerminate → host_shutdown 幂等，
+  崩溃/SIGKILL 尸体照旧由 sweep 清扫）；拉起后开 5s「等首个连接」
+  窗口（SPAWN_PENDING）钉住泵 timer——连接即推的 theme.set 靠泵消化
+  （无层无覆盖时泵本会自停），首个连接 accept 到即关窗，过期也关窗
+  （拉不起/挂死的插件不拖住空转红线）。
+- `panel.rs`（新）：极简面板窗（⌘, / App 菜单「Plugins…」）——每行
+  checkbox 开关 + 名 + 状态（运行中 pid · x.x MB | 已停止(原因) |
+  已停用），1s 刷新、关窗即停；行发现 = enabled ∪ paths 键 ∪ 插件
+  目录文件。开关动作与 NINJA_PANEL_PLUGIN_FILE 钩子同走
+  `panel::toggle` → `plugins::toggle_plugin` + `config::
+  save_plugins_enabled`（同一套幂等生命周期 + 同一处写回）。
+- `config.rs`：删 spawn 段解析（连同 PluginsToml 字段与测试）；
+  `rewrite_plugins_enabled` 保留（面板写回：只换 enabled 数组字面量，
+  缩进/尾注释/其它节全保留——不用 serde 重序列化）。
+- `app.rs`：菜单 App 区加「Plugins…」（⌘,，ACTION_NAMES 可重绑）；
+  applicationDidFinishLaunching → spawn_startup_plugins（runloop
+  就绪后拉起）；NINJA_PANEL_PLUGIN_FILE 钩子（"open" 开面板窗口 /
+  "<name> on|off" 走 toggle——E2E 编程触发，免合成 CGEvent）。
+
+## 实测踩坑（复跑必读）
+
+- **proc_pid_rusage 缓冲必须给足**：内核按 flavor 的完整结构体写
+  （v6 = 16B uuid + 31×u64）；按 v2 头文件的前缀结构（16+5×u64）开
+  缓冲会被内核**写穿栈**（实测 SIGBUS）。偏移也要对 SDK 头：
+  ri_phys_footprint 在 uuid + 7×u64 之后（偏移 72；老版头文件的
+  energy_wkups 布局是错的），与 `footprint` 工具实测同值（macOS
+  26.6 arm64）。
+- objc2 `define_class!` 方法体里写复杂链式 `let-else` + 闭包会触发
+  宏展开的类型推断怪错（Option<str> 之类），把实现挪到宏外普通
+  `impl` 方法（selector 只做转发）即好——同 app.rs 的既有惯例。
+- NSStackView `initWithFrame`/`checkboxWithTitle_target_action`/
+  `buttonWithTitle_target_action` 都是安全构造器（unsafe 块反而
+  warn）；target 传 `as_super().as_super()` 上转的 &AnyObject。
+
+## 验收取证（复跑）
+
+- 单测：`cargo test --workspace`（96 lib + 各集成/协议全绿；含
+  `toggle_plugin_single_strategy_lifecycle`（空载→on 从零拉起→
+  snapshot 报 pid/内存→off 杀进程+socket 删）、
+  `session_enable_off_missing_binary_reports_error`（拉不起 →
+  last_error）、`spawn_pending_window_pins_pump`（泵钉住窗口）、
+  config 的 `no_spawn_section_is_accepted`/`rewrite_*`）。
+- E2E（NINJA_E2E=1，先 cargo build -p ninja-theme -p ninja-preview）：
+  - `theme_switch` 3/3：**零点击**启用即拉起（像素 #002B36 + OSC 10/11
+    双证据，open_probe 恒空）→ 杀插件回 ODP 不复活；p6 钩子 off 回
+    ODP + socket 删；**面板钩子** off → 回 ODP + socket 删 +
+    ninja.toml 写回 `enabled = []`（paths/注释保留）→ on → 重绑 +
+    色板重新生效 + toml 回 `["theme"]`（含 "open" 先真开面板窗口）。
+  - `off_is_light` 3/3：用一次→Esc→禁用 → footprint 回 p2 基线
+    （36+4MB 容差）；**再启用 → preview 立即重拉**（启用即拉起，断言
+    已更新）；SIGKILL 尸体清扫；正常退出无残留。
+  - `layer_preview` 2/2（启动即拉起后首击即认领）；`idle_no_plugins`
+    1/1（默认零插件零 socket 零进程——门禁不回归）；`hit_dispatch`
+    3/3；`one_dark_startup` 1/1；`ctrl_c`/`dirty_frame_skip`/
+    `fast_shell_first_frame`/`vt_smoke` 全绿。
+  - `cmdw_surface_close` 4 例在干净 HEAD 上同样失败（本机 CGEvent
+    投递环境问题，非本变更回归；stash 复跑取证）。

@@ -67,7 +67,10 @@ cp target/release/ninja-preview ~/.config/ninja/plugins/preview
 #   enabled = ["preview"]
 ```
 
-启用 ≠ 常驻：首次 Cmd+点击路径时才拉起进程（PRODUCT 规则，p5 起即如此）。
+**启用即拉起（2026-08-29 用户产品决策修订，覆盖旧的「首次命中才拉起」
+条款）**：enabled 名单非空时宿主一启动就拉起对应插件进程——主题这类
+配置推送型插件零点击生效；preview 这类命中驱动型插件则是「进程在跑、
+socket 在、等命中」。空载门禁不变：默认零插件 = 零进程、零 socket。
 
 **主题插件同理**（T2 官方示例 ninja-theme，亦不随 .app 分发；换主题 =
 装插件，PRODUCT「颜色」原语）：
@@ -79,8 +82,29 @@ cp target/release/ninja-theme ~/.config/ninja/plugins/theme
 # solarized-dark | solarized-light，缺省 solarized-dark）
 ```
 
+装好后宿主启动即拉起它、连接后即推色板换全屏配色（无需任何点击；
+OSC 10/11 应答同步换新）。不需要 `[plugins.spawn]` 之类的模式段——
+单一策略，没有 spawn 配置面。
+
 插件换色期间杀掉/禁用插件，宿主自动回退内置 One Dark Pro 基线（与 p6
 收层同语义）；分发物本身永远零插件。
+
+## 插件面板（⌘,）
+
+菜单栏 App 区「Plugins…」（默认 ⌘,，`[keys] plugins = "..."` 可重绑）
+开极简面板：每行 = 插件名 / 启用开关 / 运行状态（运行中 pid + 内存 MB
+——子进程真实物理足迹，与 footprint 工具同源；或「已停止（原因）」/
+「已停用」）。
+
+- **开**：名字进 enabled 名单 + 当场拉起进程；
+- **关**：立即走 p6 幂等回收（杀进程、收层、断连接；最后一个插件
+  关掉时连 socket 一起删，回空载形态）+ 名单移除；
+- 两种操作都把新名单写回 `ninja.toml` 的 `enabled = [...]`（只改
+  数组内容，其它字段与注释原样保留）；
+- 面板开着 1s 刷新一次状态，关窗即停（零后台开销）。
+
+面板行发现 = enabled 名单 + `[plugins.paths]` 键 + `NINJA_PLUGIN_DIR` /
+`~/.config/ninja/plugins` 目录里的可执行文件——装新插件后重开面板即可见。
 
 **卸载**：
 
@@ -104,7 +128,8 @@ spctl -a -vv dist/Ninja.app                            # 预期不通过（非 D
 - `open` 启动 /Applications 与 dist 两处副本 → GUI 在；默认配置启动后
   `$TMPDIR` 无 `ninja-ade-*.sock`、无 `ninja-preview` 进程（默认零插件）；
 - `HOME=<临时目录>` 启动 → 正常（配置路径机器无关）；
-- `~/.config/ninja/plugins/preview` + `enabled=["preview"]` → 首击拉起（`NINJA_P4_HIT`
-  钩子触发）；禁用（p6 钩子 `NINJA_P6_PLUGIN_FILE`）+ 删文件 → 无进程/无 socket 残留；
+- `~/.config/ninja/plugins/preview` + `enabled=["preview"]` → 启动即拉起
+  （面板 v2 单一策略；2026-08-29 决策）；禁用（p6 钩子
+  `NINJA_P6_PLUGIN_FILE` / 面板开关）+ 删文件 → 无进程/无 socket 残留；
 - bundle 与 DMG 内均无 `ninja-preview`/`ninja-theme`（`Contents/` 只有 `MacOS/ninja` +
   `Info.plist`；T2 后复跑仍零插件）。

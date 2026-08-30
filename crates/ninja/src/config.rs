@@ -101,7 +101,9 @@ pub fn parse_binding(s: &str) -> Option<KeyBinding> {
 // 动作表（菜单/快捷键的名字 → 默认绑定；菜单标题与 selector 在 app.rs）
 // ---------------------------------------------------------------------------
 
-/// 可在 `[keys]` 里重绑的动作。顺序即默认表顺序。
+/// 可在 `[keys]` 里重绑的动作。顺序即默认表顺序。`plugins`（面板）
+/// 默认 ⌘,：App 菜单区「Plugins…」项（2026-08-29 用户产品决策：
+/// 启用即拉起 + 可见的设置面）。
 pub const ACTION_NAMES: &[(&str, &str)] = &[
     ("new_window", "cmd+n"),
     ("new_tab", "cmd+t"),
@@ -118,6 +120,7 @@ pub const ACTION_NAMES: &[(&str, &str)] = &[
     ("copy", "cmd+c"),
     ("paste", "cmd+v"),
     ("select_all", "cmd+a"),
+    ("plugins", "cmd+,"),
     ("quit", "cmd+q"),
 ];
 
@@ -201,11 +204,11 @@ struct ThemeToml {
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct PluginsToml {
-    /// 启用的插件名。缺省/空 = 插件全关（空载门禁）。
+    /// 启用的插件名。缺省/空 = 插件全关（空载门禁）。启用即拉起
+    /// （宿主启动/面板 on；2026-08-29 决策修订，无 spawn 模式段）。
     enabled: Option<Vec<String>>,
-    /// 插件名 → 二进制路径（p5：首次命中分发时按名拉起）。缺省时
-    /// 按名字在 NINJA_PLUGIN_DIR / ~/.config/ninja/plugins / 宿主二进制
-    /// 同目录解析。
+    /// 插件名 → 二进制路径（拉起用）。缺省时按名字在
+    /// NINJA_PLUGIN_DIR / ~/.config/ninja/plugins / 宿主二进制同目录解析。
     paths: Option<HashMap<String, String>>,
 }
 
@@ -296,7 +299,7 @@ impl Config {
                 })
                 .collect();
             if !names.is_empty() {
-                eprintln!("ninja: 插件已启用 {names:?}（首次命中时拉起进程）");
+                eprintln!("ninja: 插件已启用 {names:?}（宿主启动即拉起）");
             }
             cfg.plugins = PluginsConfig {
                 enabled: names,
@@ -345,6 +348,118 @@ pub fn config_path() -> PathBuf {
     home.join(".config/ninja/ninja.toml")
 }
 
+// ---------------------------------------------------------------------------
+// 面板写回（2026-08-29 决策）：只改 [plugins] enabled 数组，其余字节
+// （含注释/字段/顺序）不动——不用 serde 重序列化（那会抹掉注释）。
+// ---------------------------------------------------------------------------
+
+/// 名单 → TOML 数组字面量（名字里的引号删除：字符串注入防御）。
+fn render_enabled_array(enabled: &[String]) -> String {
+    format!(
+        "[{}]",
+        enabled
+            .iter()
+            .map(|n| format!("\"{}\"", n.replace('\"', "")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// 在配置文本里重写 `[plugins]` 的 `enabled` 数组（纯函数，单测直测）。
+/// 保留其它一切字节：
+/// - 有 `enabled = [...]` 行：只替换 `[` 到 `]` 之间的内容（缩进/行内尾注释保留）；
+/// - 有 `[plugins]` 节但无 enabled 行：紧跟节头插入一行；
+/// - 无 `[plugins]` 节：文件末尾追加节；
+/// - `[plugins.paths]` 等子节不算节头（只有裸 `[plugins]` 算）。
+pub fn rewrite_plugins_enabled(text: &str, enabled: &[String]) -> String {
+    let array = render_enabled_array(enabled);
+    // split_inclusive：每片含结尾换行，重拼零丢失。
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    // 裸节头判定：`[plugins]` 或 `[plugins] # 注释`；`[plugins.x]` 子节不算。
+    let is_bare_header = |l: &str| {
+        let t = l.trim();
+        (t == "[plugins]" || t.starts_with("[plugins]")) && !t.starts_with("[plugins.")
+    };
+    let Some(header_idx) = lines.iter().position(|l| is_bare_header(l)) else {
+        // 无节：末尾追加（保留原文件末尾换行形状）。
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("\n[plugins]\nenabled = {array}\n"));
+        return out;
+    };
+    // 节内找 enabled 行（到下一个任何节头为止）。
+    let mut end = lines.len();
+    for (i, l) in lines.iter().enumerate().skip(header_idx + 1) {
+        if l.trim_start().starts_with('[') {
+            end = i;
+            break;
+        }
+    }
+    let mut replace: Option<(usize, String)> = None; // (行下标, 新行内容)
+    let mut insert_after: Option<usize> = None;
+    for (i, l) in lines.iter().enumerate().take(end).skip(header_idx + 1) {
+        let t = l.trim_start();
+        if let Some(rest) = t.strip_prefix("enabled")
+            && rest.trim_start().starts_with('=')
+        {
+            let eq = l.find('=').unwrap();
+            match l[eq..].find('[').map(|p| eq + p) {
+                Some(open) => {
+                    if let Some(close) = l[open..].find(']').map(|p| open + p) {
+                        // 只换数组字面量：缩进、`enabled =`、行尾注释都保留。
+                        replace = Some((
+                            i,
+                            format!("{}{array}{}", &l[..open], &l[close + 1..]),
+                        ));
+                    } else {
+                        // 数组跨行（罕见形态）：整行重写为渲染结果。
+                        replace = Some((i, format!("enabled = {array}\n")));
+                    }
+                }
+                None => {
+                    replace = Some((i, format!("enabled = {array}\n")));
+                }
+            }
+            break;
+        }
+    }
+    if replace.is_none() {
+        insert_after = Some(header_idx);
+    }
+    let mut out = String::with_capacity(text.len() + array.len() + 16);
+    for (i, l) in lines.iter().enumerate() {
+        if let Some((idx, newline)) = replace.as_ref()
+            && *idx == i
+        {
+            out.push_str(newline);
+        } else {
+            out.push_str(l);
+        }
+        if insert_after == Some(i) {
+            out.push_str(&format!("enabled = {array}\n"));
+        }
+    }
+    out
+}
+
+/// 把新的 enabled 名单写回配置文件（面板开关语义的落盘半边）。
+/// 文件不存在 = 用最小节起一份。失败 → false（调用方警告；会话内
+/// 状态已生效，落盘失败不让开关回弹）。
+pub fn save_plugins_enabled(enabled: &[String]) -> bool {
+    let path = config_path();
+    let base = std::fs::read_to_string(&path).unwrap_or_default();
+    let out = rewrite_plugins_enabled(&base, enabled);
+    match std::fs::write(&path, out) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("ninja: 写回配置 {path:?} 失败（{e}）：会话内已生效，重启后不保留");
+            false
+        }
+    }
+}
+
 /// 默认配置的 TOML 文本（文档/测试基线）。
 pub fn default_toml() -> String {
     let mut s = String::new();
@@ -361,7 +476,8 @@ pub fn default_toml() -> String {
     s.push_str("# new_window = \"cmd+n\"\n");
     s.push_str("# split_right = \"cmd+d\"\n\n");
     s.push_str("[plugins]\n");
-    s.push_str("# enabled = [\"preview\"]   # 默认空 = 插件关：不建 ADE socket、不拉进程\n");
+    s.push_str("# enabled = [\"preview\"]   # 默认空 = 插件关：不建 ADE socket、不拉进程；\n");
+    s.push_str("#                              非空 = 启用即拉起（2026-08-29 决策；面板 ⌘, 开关会写回本行）\n");
     s.push_str("# [plugins.paths]\n");
     s.push_str("# preview = \"/usr/local/bin/ninja-preview\"   # 缺省按名在 NINJA_PLUGIN_DIR / ~/.config/ninja/plugins / 宿主同目录找\n");
     s
@@ -513,5 +629,76 @@ enabled = [" preview ", "preview", "doc"]"#,
         // 未知 [plugins] 字段：整体降级默认（同其他节的行为）。
         let c = Config::from_toml_str("[plugins]\nwat = 1");
         assert_eq!(c, Config::default());
+    }
+
+    // ------------------------------------------------------------------
+    // 面板写回（2026-08-29 决策：单一策略，无 spawn 段）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn no_spawn_section_is_accepted() {
+        // 单一策略（2026-08-29 决策修订）：没有 [plugins.spawn] 模式段；
+        // 旧配置若带 spawn 段 → deny_unknown_fields 整体降级默认（与其
+        // 它未知字段同语义，不炸启动）。
+        let c = Config::from_toml_str(
+            "[plugins]\nenabled = [\"theme\", \"preview\"]\n\n[plugins.paths]\ntheme = \"/x\"\n",
+        );
+        assert_eq!(
+            c.plugins.enabled,
+            vec!["theme".to_string(), "preview".to_string()]
+        );
+        assert_eq!(c.plugins.paths.get("theme").map(String::as_str), Some("/x"));
+
+        let c = Config::from_toml_str(
+            "[plugins]\nenabled = [\"theme\"]\n\n[plugins.spawn]\ntheme = \"enable\"\n",
+        );
+        assert_eq!(
+            c,
+            Config::default(),
+            "旧 spawn 段 = 未知字段：整体降级默认（启动不炸）"
+        );
+    }
+
+    #[test]
+    fn rewrite_enabled_preserves_everything_else() {
+        // 1) 有 enabled 行：只换数组，缩进/尾注释/其它行全保留。
+        let src = "# 我的配置，勿动\nshell = \"/bin/zsh\"\n\n[plugins]\n  enabled = [\"theme\"]  # 启用的插件\n\n[plugins.paths]\ntheme = \"/x\"\n";
+        let out = rewrite_plugins_enabled(src, &["preview".into(), "theme".into()]);
+        let expect = "# 我的配置，勿动\nshell = \"/bin/zsh\"\n\n[plugins]\n  enabled = [\"preview\", \"theme\"]  # 启用的插件\n\n[plugins.paths]\ntheme = \"/x\"\n";
+        assert_eq!(out, expect);
+
+        // 语义回读：写回后重解析的 enabled 就是新名单。
+        assert_eq!(
+            Config::from_toml_str(&out).plugins.enabled,
+            vec!["preview".to_string(), "theme".to_string()]
+        );
+
+        // 2) 清空：enabled = []。
+        let out = rewrite_plugins_enabled(src, &[]);
+        assert!(out.contains("  enabled = []  # 启用的插件"), "清空后仍是合法数组（保留尾注释）");
+        assert!(Config::from_toml_str(&out).plugins.enabled.is_empty());
+    }
+
+    #[test]
+    fn rewrite_enabled_inserts_or_appends() {
+        // [plugins] 节在但无 enabled 行：紧跟节头插入。
+        let src = "[plugins]\n# 注释保留\n[plugins.paths]\npreview = \"/x\"\n";
+        let out = rewrite_plugins_enabled(src, &["preview".into()]);
+        let expect = "[plugins]\nenabled = [\"preview\"]\n# 注释保留\n[plugins.paths]\npreview = \"/x\"\n";
+        assert_eq!(out, expect);
+
+        // 完全无 [plugins] 节：末尾追加。
+        let src = "shell = \"/bin/zsh\"\n";
+        let out = rewrite_plugins_enabled(src, &["theme".into()]);
+        assert_eq!(out, "shell = \"/bin/zsh\"\n\n[plugins]\nenabled = [\"theme\"]\n");
+
+        // 空文本（文件不存在时）：从零起节。
+        let out = rewrite_plugins_enabled("", &["theme".into()]);
+        assert_eq!(out, "\n[plugins]\nenabled = [\"theme\"]\n");
+
+        // enabled 前有注释/数组跨行等罕见形态：整行重写，不炸。
+        let src = "[plugins]\nenabled = [\n  \"theme\",\n]\n";
+        let out = rewrite_plugins_enabled(src, &[]);
+        assert!(out.contains("enabled = []"));
     }
 }

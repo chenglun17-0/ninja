@@ -5,7 +5,6 @@
 
 #![allow(non_snake_case)] // ObjC selector 方法名
 use std::cell::{Cell, RefCell};
-use std::sync::{Arc, Mutex};
 
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
@@ -36,6 +35,13 @@ pub struct Ivars {
     p6_file: RefCell<Option<String>>,
     /// p6 钩子已应用的目标态（去抖：只在变化时动作）。
     p6_state: Cell<Option<bool>>,
+    /// 插件面板控制器（ninjaPlugins: 创建/复用；关窗只藏不毁）。
+    pub panel: RefCell<Option<Retained<crate::panel::PluginPanel>>>,
+    /// 面板取证钩子：NINJA_PANEL_PLUGIN_FILE 轮询的文件路径（E2E 用，
+    /// 与面板开关同一条 toggle 路径；不依赖合成 CGEvent）。
+    panel_file: RefCell<Option<String>>,
+    /// 面板钩子上次已应用的内容（去抖：内容变化才动作）。
+    panel_last: RefCell<Option<String>>,
     /// 本壳持有的窗口强引用。**关键不变量**：窗口在 -[NSWindow close]
     /// 期间必须有人持有（NSApp 的窗口列表引用会在 close 中途摘掉，
     /// 若那是唯一引用，窗口在自己 close 的调用栈里 dealloc，后续
@@ -67,6 +73,12 @@ define_class!(
             window.center();
             window.makeKeyAndOrderFront(None);
             self.register_window(window);
+
+            // 面板 v2 单一策略（2026-08-29 决策）：**启用即拉起**——
+            // runloop 就绪后立即拉起全部 enabled 插件（空载 = 无操作，
+            // 门禁不变）。拉起后 SPAWN 窗口钉住泵 timer 直到插件连上
+            //（连接即推的 theme.set 靠泵消化，见 plugins.rs）。
+            plugins::spawn_startup_plugins();
 
             // 拉起就激活（无 user gesture 的冷启动也拉前台）。deprecated 但
             // 行为稳定（macOS 14 上 activate() 有无手势拉前台失败的坑）。
@@ -138,6 +150,27 @@ define_class!(
                     )
                 };
                 std::mem::forget(timer); // 进程生命期常驻（同 selftest 惯例）
+            }
+
+            // 面板取证钩子（非产品功能）：NINJA_PANEL_PLUGIN_FILE=<path>
+            // 时每 0.5s 读该文件，内容变化才动作——"open" = 打开面板窗口
+            //（编程触发，免 CGEvent）；"<name> on|off" = 走面板开关的
+            // 同一条 toggle 路径（panel::toggle：会话生命周期 + 写回
+            // ninja.toml）。E2E 用。
+            if let Ok(f) = std::env::var("NINJA_PANEL_PLUGIN_FILE") {
+                self.ivars().panel_file.replace(Some(f));
+                // SAFETY: 同上（-self 返回 retain 过的引用）。
+                let target: Retained<objc2::runtime::AnyObject> = unsafe { msg_send![self, self] };
+                let timer = unsafe {
+                    objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                        0.5,
+                        &target,
+                        objc2::sel!(ninjaPanelPluginTick:),
+                        None,
+                        true,
+                    )
+                };
+                std::mem::forget(timer); // 进程生命期常驻
             }
         }
 
@@ -390,6 +423,66 @@ define_class!(
                 shell::new_tab(mtm, &self.ivars().config, self);
             }
         }
+
+        /// ⌘, / App 菜单「Plugins…」：开/复用插件面板（panel.rs；2026-08-29
+        /// 决策：启用即拉起 + 可见的设置面）。可直接编程调用（面板 E2E
+        /// 的 "open" 钩子同途）。
+        #[unsafe(method(ninjaPlugins:))]
+        fn ninja_plugins(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let Some(mtm) = MainThreadMarker::new() else { return };
+            if let Some(p) = self.ivars().panel.borrow().as_ref() {
+                p.show();
+            } else {
+                let p = crate::panel::open(mtm);
+                p.show();
+                *self.ivars().panel.borrow_mut() = Some(p);
+            }
+        }
+
+        /// 面板钩子拍：读 NINJA_PANEL_PLUGIN_FILE，内容变化才动作。
+        /// "open"/"panel" → 开面板；"<name> on|off|1|0|enable|disable"
+        /// → 面板开关同一条 toggle 路径（panel::toggle）。
+        #[unsafe(method(ninjaPanelPluginTick:))]
+        fn ninja_panel_plugin_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            let Some(path) = self.ivars().panel_file.borrow().clone() else {
+                return;
+            };
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let content = content.trim().to_string();
+            if content.is_empty()
+                || self.ivars().panel_last.borrow().as_deref() == Some(content.as_str())
+            {
+                return; // 去抖：同一内容只动作一次
+            }
+            match content.as_str() {
+                "open" | "panel" => self.ninja_plugins(objc2::sel!(ninjaPlugins:), None),
+                _ => {
+                    let Some((name, want)) = content
+                        .rsplit_once(' ')
+                        .map(|(n, w)| (n.trim().to_string(), w.trim()))
+                    else {
+                        eprintln!(
+                            "ninja: NINJA_PANEL_PLUGIN_FILE 需为 \"open\" 或 \"<name> on|off\"，得到 {content:?}"
+                        );
+                        return;
+                    };
+                    let on = match want {
+                        "on" | "1" | "enable" => true,
+                        "off" | "0" | "disable" => false,
+                        other => {
+                            eprintln!(
+                                "ninja: NINJA_PANEL_PLUGIN_FILE 动作 {other:?} 无效（on | off）"
+                            );
+                            return;
+                        }
+                    };
+                    crate::panel::toggle(&name, on);
+                }
+            }
+            *self.ivars().panel_last.borrow_mut() = Some(content);
+        }
     }
 
     unsafe impl NSObjectProtocol for AppDelegate {}
@@ -408,11 +501,18 @@ struct ItemSpec {
     selector: &'static str,
 }
 
-const APP_ITEMS: &[ItemSpec] = &[ItemSpec {
-    action: "quit",
-    title: "Quit ninja",
-    selector: "terminate:",
-}];
+const APP_ITEMS: &[ItemSpec] = &[
+    ItemSpec {
+        action: "plugins",
+        title: "Plugins…",
+        selector: "ninjaPlugins:",
+    },
+    ItemSpec {
+        action: "quit",
+        title: "Quit ninja",
+        selector: "terminate:",
+    },
+];
 
 const FILE_ITEMS: &[ItemSpec] = &[
     ItemSpec {
@@ -539,7 +639,11 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, config: &Config) {
     let main_menu = NSMenu::new(mtm);
 
     let app_menu = add_submenu(mtm, &main_menu, "__app__");
-    for spec in APP_ITEMS {
+    for (i, spec) in APP_ITEMS.iter().enumerate() {
+        // 面板项与退出项之间加分隔线（macOS 菜单惯例）。
+        if i == APP_ITEMS.len() - 1 {
+            app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
         add_item(mtm, &app_menu, spec, config);
     }
 
@@ -601,16 +705,20 @@ pub fn run() {
     build_menu(mtm, &app, &config);
 
     // p3 ADE 插件门：默认（enabled 空）不建 socket、不拉任何插件进程
-    //（空载门禁）。启用时绑 Unix socket；拉起在 p5。
-    // p4：装全局命中分发器（view 的 Cmd+点击经它到达 PluginHost）；
-    // 生命周期不变——Arc 在本栈上，退出时 drop 删 socket 文件（分发器
-    // 槽里只存 Weak，随宿主退出自动失效）。
-    let plugin_host = plugins::PluginHost::start(&config.plugins).map(|h| {
-        let arc = Arc::new(Mutex::new(h));
-        plugins::install_dispatcher(&arc);
-        arc
-    });
-    let _plugin_host = plugin_host;
+    //（空载门禁）。启用时绑 Unix socket；拉起在 runloop 就绪后
+    //（applicationDidFinishLaunching → spawn_startup_plugins，2026-08-29
+    // 决策：启用即拉起）。面板 v2：分发器静态槽持 Arc（运行中从零拉起
+    // 插件需要可造新 host）；退出收口 = applicationWillTerminate →
+    // host_shutdown（幂等，与 Drop 同一实现）。
+    match plugins::PluginHost::start(&config.plugins) {
+        Some(h) => {
+            plugins::install_dispatcher(
+                std::sync::Arc::new(std::sync::Mutex::new(h)),
+                config.plugins.clone(),
+            );
+        }
+        None => plugins::install_session_cfg(config.plugins.clone()),
+    }
 
     // 两阶段初始化（同 view）：先放 ivars 再走 NSObject 的 init。
     let this = AppDelegate::alloc(mtm).set_ivars(Ivars {
@@ -621,6 +729,9 @@ pub fn run() {
         p4_hit_started: Cell::new(None),
         p6_file: RefCell::new(None),
         p6_state: Cell::new(None),
+        panel: RefCell::new(None),
+        panel_file: RefCell::new(None),
+        panel_last: RefCell::new(None),
         windows: RefCell::new(Vec::new()),
         closing: RefCell::new(Vec::new()),
         prune_scheduled: Cell::new(false),

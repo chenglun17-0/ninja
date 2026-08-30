@@ -5,20 +5,31 @@
 //! 前提：先 `cargo build -p ninja-theme`（宿主 bin 同目录解析插件二进制，
 //! 同 off_is_light 的 ninja-preview 惯例）。
 //!
-//! 场景 1（`e2e_theme_plugin_switches_colors_and_reverts_on_kill`）：
-//! 1. 启用 ninja-theme（`NINJA_THEME=solarized-dark`，经
-//!    `[plugins.paths]` 指到 target/ninja-theme）+ `NINJA_P4_HIT` 触发
-//!    首次命中分发 → 宿主冷启动拉起插件 → 插件连接后即推 `theme.set`；
-//! 2. **像素探针**（`NINJA_DUMP_DRAWABLE`）看到背景 #282C34 →
+//! 面板 v2 单一策略（2026-08-29 决策：启用即拉起）：
+//!
+//! 场景 1（`e2e_theme_zero_click_switch_and_revert_on_kill`）：启用
+//! ninja-theme（`NINJA_THEME=solarized-dark`，经 `[plugins.paths]` 指到
+//! target/ninja-theme）→ **零点击**：宿主启动即拉起插件（runloop 就绪
+//! 后）→ 插件连接后即推 `theme.set` →
+//! 1. **像素探针**（`NINJA_DUMP_DRAWABLE`）看到背景 #282C34 →
 //!    **#002B36**（solarized-dark base03）——全屏换色没被跳帧吃掉；
-//! 3. **OSC 10/11 变化**：fakesh（python）轮询发 OSC 10/11 颜色查询，
+//! 2. **OSC 10/11 变化**：fakesh（python）轮询发 OSC 10/11 颜色查询，
 //!    应答落盘——前景 rgb:8383/9494/a6a6、背景 rgb:0000/2b2b/3636；
+//! 3. **无命中**：open_probe 恒空（一次点击都没发；主题不需命中事件）；
 //! 4. **杀插件** → 宿主泵摘连接 → 回 ODP 基线：背景像素回 #282C34、
 //!    OSC 11 应答回 rgb:2828/2c2c/3434（p6 收层同语义的色板版）。
 //!
 //! 场景 2（`e2e_theme_disable_hook_reverts_to_baseline`）：生效后用
 //! p6 禁用钩子（`NINJA_P6_PLUGIN_FILE` 写 "off"）→ 同样回 ODP +
 //! socket 消失（禁用 = 全链回收：连接、进程、色板覆盖）。
+//!
+//! 场景 3（`e2e_panel_toggle_writes_back_toml_and_recycles`）：面板
+//! 开关（`NINJA_PANEL_PLUGIN_FILE` 编程触发，与面板 checkbox 同一条
+//! toggle 路径；"open" 先真实开一次面板窗口）：
+//! - "theme off" → 回 ODP + socket 消失 + **ninja.toml 写回正确**
+//!   （enabled = []，paths/注释保留）；
+//! - "theme on" → 从零重拉（socket 重现 + 重新推色板 + toml 回
+//!   enabled = ["theme"]）。
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt as _;
@@ -139,40 +150,52 @@ struct Session {
     probe_dir: PathBuf,
     osc10: PathBuf,
     osc11: PathBuf,
+    open_probe: PathBuf,
     host_err: PathBuf,
     #[allow(dead_code)]
     dir: PathBuf,
 }
 
-/// 起一个「启用 ninja-theme + 首击拉起」的宿主会话。
-fn launch_theme_host(reaper: &mut Reaper, tag: &str, state_file: Option<&Path>) -> Session {
+/// 起一个「启用 ninja-theme（启动即拉起，零点击）」的宿主会话。
+/// `p6_file`/`panel_file`：取证钩子（禁用/面板开关）文件路径。
+/// 起一个「启用 ninja-theme（启动即拉起，零点击）」的宿主会话。
+/// `p6_file`/`panel_file`：取证钩子（p6 禁用/面板开关）文件路径。
+/// `cfg_path`：写真实配置文件（面板开关会写回它；场景 3 验内容）。
+fn launch_theme_host(
+    reaper: &mut Reaper,
+    tag: &str,
+    p6_file: Option<&Path>,
+    panel_file: Option<&Path>,
+    cfg_path: &Path,
+) -> Session {
     let dir = sandbox(tag);
     let probe_dir = dir.join("drawable");
     std::fs::create_dir_all(&probe_dir).unwrap();
     let sock = short_sock(tag);
-    let cfg = dir.join("cfg.toml");
     std::fs::write(
-        &cfg,
+        cfg_path,
         format!(
-            "[plugins]\nenabled = [\"theme\"]\n\n[plugins.paths]\ntheme = {:?}\n",
+            "# e2e 配置（面板写回取证）\n[plugins]\nenabled = [\"theme\"]\n\n[plugins.paths]\ntheme = {:?}\n",
             theme_bin()
         ),
     )
     .unwrap();
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ninja"));
-    cmd.env("NINJA_CONFIG", &cfg)
+    cmd.env("NINJA_CONFIG", cfg_path)
         .env("SHELL", fakesh(&dir))
         .env("NINJA_DUMP_DRAWABLE", &probe_dir)
         .env("NINJA_OPEN_PROBE", dir.join("open_probe.txt"))
-        .env("NINJA_P4_HIT", "2,0")
         .env("NINJA_ADE_SOCK", &sock)
         .env("NINJA_THEME", "solarized-dark")
         .process_group(0) // 收割时 killpg 连插件一起收
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(dir.join("host_err.txt")).unwrap());
-    if let Some(p) = state_file {
+    if let Some(p) = p6_file {
         cmd.env("NINJA_P6_PLUGIN_FILE", p);
+    }
+    if let Some(p) = panel_file {
+        cmd.env("NINJA_PANEL_PLUGIN_FILE", p);
     }
     let host = cmd.spawn().expect("spawn ninja binary");
     let host_pid = host.id();
@@ -183,6 +206,7 @@ fn launch_theme_host(reaper: &mut Reaper, tag: &str, state_file: Option<&Path>) 
         probe_dir,
         osc10: dir.join("osc10.txt"),
         osc11: dir.join("osc11.txt"),
+        open_probe: dir.join("open_probe.txt"),
         host_err: dir.join("host_err.txt"),
         dir,
     }
@@ -281,22 +305,27 @@ fn host_err_of(s: &Session) -> String {
     std::fs::read_to_string(&s.host_err).unwrap_or_default()
 }
 
+fn read(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // 场景
 // ---------------------------------------------------------------------------
 
-/// 起会话 → 首击拉起插件 → 等 theme.set 生效（像素 + OSC 双证据）。
-/// 返回插件 pid（供杀/禁用后的断言）。
+/// 起会话 → 启动即拉起（零点击）→ 等 theme.set 生效（像素 + OSC 双
+/// 证据）。返回插件 pid（供杀/禁用后的断言）。
 fn wait_theme_applied(s: &Session, tag: &str) -> u32 {
+    // 启用即拉起：宿主一启动插件进程就在（不是首击才出现）。
     let plugin_pid =
         wait_child(s.host_pid, "ninja-theme", Duration::from_secs(20)).unwrap_or_else(|| {
             panic!(
-                "[{tag}] 首击后 ninja-theme 未被宿主拉起（host_err：{:?}）",
+                "[{tag}] 宿主启动后 ninja-theme 未被拉起（host_err：{:?}）",
                 host_err_of(&s)
             )
         });
-    // 像素：cyclic 3 槽位出现 solarized 背景帧（冷启动 spawn+connect+
-    // theme.set + 全屏重画；留 20s 余量给首跑 debug 构建）。
+    // 像素：cyclic 3 槽位出现 solarized 背景帧（拉起+connect+theme.set+
+    // 全屏重画；留 20s 余量给首跑 debug 构建）。
     assert!(
         wait_until(Duration::from_secs(20), || {
             any_frame_with_bg(&s.probe_dir, SOLARIZED_BG).then_some(true)
@@ -315,6 +344,12 @@ fn wait_theme_applied(s: &Session, tag: &str) -> u32 {
         wait_file_contains(&s.osc11, SOLARIZED_OSC11, Duration::from_secs(10)),
         "[{tag}] OSC 11 应答未变 solarized 背景（got：{:?}）",
         std::fs::read_to_string(&s.osc11).unwrap_or_default()
+    );
+    // 零点击取证：全程无命中分发（open_probe 恒空 = 系统默认从未触发）。
+    assert!(
+        !s.open_probe.exists() || read(&s.open_probe).is_empty(),
+        "[{tag}] 启用即拉起不应需要任何点击/命中（open_probe：{:?}）",
+        read(&s.open_probe)
     );
     plugin_pid
 }
@@ -336,16 +371,31 @@ fn wait_baseline_back(s: &Session, tag: &str) {
     );
 }
 
+/// 插件进程不在（收割完成）。
+fn wait_theme_gone(s: &Session, plugin_pid: u32, tag: &str) {
+    let gone = wait_until(Duration::from_secs(10), || {
+        let out = Command::new("pgrep")
+            .args(["-P", &s.host_pid.to_string(), "-x", "ninja-theme"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        (!text.contains(&plugin_pid.to_string())).then_some(true)
+    })
+    .unwrap_or(false);
+    assert!(gone, "[{tag}] 插件进程未退出");
+}
+
 #[test]
-fn e2e_theme_plugin_switches_colors_and_reverts_on_kill() {
+fn e2e_theme_zero_click_switch_and_revert_on_kill() {
     if std::env::var_os("NINJA_E2E").is_none() {
         eprintln!("skip: 拉真实窗口进程，设 NINJA_E2E=1 启用");
         return;
     }
     let mut reaper = Reaper(Vec::new());
-    let s = launch_theme_host(&mut reaper, "kill", None);
+    let dir = sandbox("kill");
+    let cfg = dir.join("cfg.toml");
+    let s = launch_theme_host(&mut reaper, "kill", None, None, &cfg);
 
-    // 启用后冷启动基线先在（ODP 背景帧必然出现过——首帧即 ODP）。
     let plugin_pid = wait_theme_applied(&s, "kill");
 
     // 杀插件进程（SIGKILL = 连接死亡）：宿主泵摘连接 → 色板回 ODP。
@@ -353,7 +403,7 @@ fn e2e_theme_plugin_switches_colors_and_reverts_on_kill() {
         libc::kill(plugin_pid as i32, libc::SIGKILL);
     }
     wait_baseline_back(&s, "kill");
-    // 插件死了不复活（spawned 集「别再试」语义）。
+    // 插件死了不复活（spawned 集「别再试」语义；面板重开才重试）。
     std::thread::sleep(Duration::from_millis(800));
     let out = Command::new("pgrep")
         .args(["-P", &s.host_pid.to_string(), "-x", "ninja-theme"])
@@ -363,6 +413,10 @@ fn e2e_theme_plugin_switches_colors_and_reverts_on_kill() {
         String::from_utf8_lossy(&out.stdout).trim().is_empty(),
         "插件死后不应被重新拉起"
     );
+    // 杀插件 ≠ 禁用插件面：enabled 仍含 theme，socket 应仍在（面板/钩子
+    // 的整面关闭语义在场景 2/3 盖）。
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(s.sock.exists(), "杀插件后 socket 不应消失（那是禁用的语义）");
 }
 
 #[test]
@@ -374,7 +428,8 @@ fn e2e_theme_disable_hook_reverts_to_baseline() {
     let mut reaper = Reaper(Vec::new());
     let dir = sandbox("off");
     let state = dir.join("plugin_state");
-    let s = launch_theme_host(&mut reaper, "off", Some(&state));
+    let cfg = dir.join("cfg.toml");
+    let s = launch_theme_host(&mut reaper, "off", Some(&state), None, &cfg);
 
     let plugin_pid = wait_theme_applied(&s, "off");
 
@@ -391,16 +446,97 @@ fn e2e_theme_disable_hook_reverts_to_baseline() {
         host_err_of(&s)
     );
     wait_baseline_back(&s, "off");
-    // 插件进程被收割（EOF 自退 + kill/wait 兜底）。
-    let gone = wait_until(Duration::from_secs(10), || {
-        let out = Command::new("pgrep")
-            .args(["-P", &s.host_pid.to_string(), "-x", "ninja-theme"])
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        (!text.contains(&plugin_pid.to_string())).then_some(true)
+    wait_theme_gone(&s, plugin_pid, "off");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 面板开关全链（编程触发，同 checkbox 的 toggle 路径；不依赖合成
+/// CGEvent）：
+/// 1. "open" 真开一次面板窗口（构建/显示路径不炸，宿主仍活）；
+/// 2. "theme off" → 杀进程 + 回 ODP + socket 消失 + ninja.toml 写回
+///    enabled = []（paths 段与首行注释保留）；
+/// 3. "theme on" → 从零重拉：socket 重现、色板重新生效、toml 回
+///    enabled = ["theme"]。
+#[test]
+fn e2e_panel_toggle_writes_back_toml_and_recycles() {
+    if std::env::var_os("NINJA_E2E").is_none() {
+        eprintln!("skip: 拉真实窗口进程，设 NINJA_E2E=1 启用");
+        return;
+    }
+    let mut reaper = Reaper(Vec::new());
+    let dir = sandbox("panel");
+    let state = dir.join("panel_cmds");
+    let cfg = dir.join("cfg.toml");
+    let s = launch_theme_host(&mut reaper, "panel", None, Some(&state), &cfg);
+
+    let plugin_pid = wait_theme_applied(&s, "panel");
+    let theme_path = theme_bin();
+
+    // —— 面板窗口先真开一次（窗口构建/1s 刷新 timer 不炸）。钩子去抖：
+    //    每写一条等宿主消化一拍以上。
+    std::fs::write(&state, "open\n").unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        unsafe { libc::kill(s.host_pid as i32, 0) == 0 },
+        "面板打开后宿主不应崩溃"
+    );
+
+    // —— 面板 off：立即杀 + 回收 + 写回 toml。
+    std::fs::write(&state, "theme off\n").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            (!s.sock.exists()).then_some(true)
+        })
+        .unwrap_or(false),
+        "[panel] 面板 off 后 socket 未消失（host_err：{:?}）",
+        host_err_of(&s)
+    );
+    wait_baseline_back(&s, "panel");
+    wait_theme_gone(&s, plugin_pid, "panel");
+    // ninja.toml 写回：enabled = []，其余字节（注释/paths）保留。
+    let toml = wait_until(Duration::from_secs(5), || {
+        let t = read(&cfg);
+        t.contains("enabled = []").then_some(t)
     })
-    .unwrap_or(false);
-    assert!(gone, "[off] 禁用后插件进程未退出");
+    .unwrap_or_else(|| read(&cfg));
+    assert!(
+        toml.contains("enabled = []"),
+        "[panel] toml 应写回 enabled = []，得到：{toml:?}"
+    );
+    assert!(
+        toml.contains(&format!("theme = {theme_path:?}")),
+        "[panel] 写回不得丢 paths 段：{toml:?}"
+    );
+    assert!(
+        toml.contains("# e2e 配置"),
+        "[panel] 写回不得抹掉注释：{toml:?}"
+    );
+
+    // —— 面板 on：从零重拉（socket 重现 + 色板重新生效 + toml 回写）。
+    std::fs::write(&state, "theme on\n").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            s.sock.exists().then_some(true)
+        })
+        .unwrap_or(false),
+        "[panel] 面板 on 后 socket 应重绑出现"
+    );
+    // 色板重新生效（新的插件进程重新推 theme.set）。
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            any_frame_with_bg(&s.probe_dir, SOLARIZED_BG).then_some(true)
+        })
+        .unwrap_or(false),
+        "[panel] 面板 on 后色板应重新生效（像素探针未见 solarized）"
+    );
+    let toml = wait_until(Duration::from_secs(5), || {
+        let t = read(&cfg);
+        t.contains("enabled = [\"theme\"]").then_some(t)
+    })
+    .unwrap_or_else(|| read(&cfg));
+    assert!(
+        toml.contains("enabled = [\"theme\"]"),
+        "[panel] toml 应写回 enabled = [\"theme\"]，得到：{toml:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

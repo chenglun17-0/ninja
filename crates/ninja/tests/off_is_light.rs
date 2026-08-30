@@ -3,16 +3,17 @@
 //! 宿主必须回到 p2 空载形态——**无插件进程、无 socket、无层、内存回
 //! p2 基线**。失败说明插件泄漏进了宿主（PLAN p6「过」的定义）。
 //!
-//! 三个场景：
+//! 三个场景（面板 v2 单一策略：启用即拉起——启动即拉起 preview，
+//! idle 语义 = 进程在跑、socket 在、等命中）：
 //! 1. **用一次→Esc→禁用钩子**（`NINJA_P6_PLUGIN_FILE` 文件触发，同
 //!    NINJA_* 惯例）：socket 消失、pgrep 插件空、层探针目录空、
 //!    footprint 回 p2 单窗基线（36MB，NOTES.md）+ 容差；随后
-//!    **再启用→重绑 socket→再禁用**（同会话禁用/再启用语义）。
+//!    **再启用→重绑 socket→立即重拉进程→再禁用**（启用即拉起语义）。
 //! 2. **SIGKILL 宿主**：preview 因 socket EOF 自退（无残留）；SIGKILL
 //!    不跑 Drop → 约定路径留下 socket 尸体 → **下一个启用插件的宿主
 //!    启动时清扫**（`sweep_stale_sockets`，pid 已死才删）。
 //! 3. **正常退出**（钩子 "quit" → terminate:）：层关过、插件连着的
-//!    状态下退出 → 宿主退出、插件无残留、socket 文件被 Drop 清掉。
+//!    状态下退出 → 宿主退出、插件无残留、socket 文件被清掉。
 //!    （CGEventPostToPid 的 ⌘Q 到不了后台应用的菜单系统，实证；
 //!    钩子驱动的是同一条产品退出路径。）
 //!
@@ -376,9 +377,10 @@ fn esc_close_layer(host_pid: u32, ppm: &Path, total: Duration) -> bool {
 // 场景
 // ---------------------------------------------------------------------------
 
-/// 场景 1（门禁核心）：启用 preview → 真实用一次 → Esc 关层 → 同会话
-/// 禁用钩子 → 无插件进程 / socket 消失 / 层探针目录空 / footprint 回
-/// p2 基线；再启用→重绑→再禁用（同会话语义）。
+/// 场景 1（门禁核心）：启用 preview（宿主启动即拉起，idle = 进程在
+/// 跑、socket 在、等命中）→ 真实用一次 → Esc 关层 → 同会话禁用钩子
+/// → 无插件进程 / socket 消失 / 层探针目录空 / footprint 回 p2 基线；
+/// 再启用→重绑→立即重拉→再禁用（启用即拉起语义）。
 #[test]
 fn e2e_use_then_disable_no_residue_and_footprint_back_to_p2() {
     if std::env::var_os("NINJA_E2E").is_none() {
@@ -447,19 +449,17 @@ fn e2e_use_then_disable_no_residue_and_footprint_back_to_p2() {
         P2_BASELINE_MB + P2_TOLERANCE_MB
     );
 
-    // —— 再启用 → 同路径重绑（同会话禁用/再启用语义：spawned 集重置）。
+    // —— 再启用 → 同路径重绑 + **立即重拉进程**（面板 v2 单一策略：
+    //    启用即拉起——p6 钩子的再启用与面板开关同语义）。
     std::fs::write(state, "on\n").unwrap();
     assert!(
         wait_exists(&s.sock, Duration::from_secs(10)),
         "再启用后 socket 应重绑出现"
     );
     assert!(read(&s.host_err).contains("已再启用"), "应有再启用日志");
-    // 再启用≠常驻：没有新分发就不拉进程。
     assert!(
-        !child_lines(s.host_pid)
-            .iter()
-            .any(|c| c.contains("preview")),
-        "再启用后无分发不应拉起插件进程"
+        wait_child(s.host_pid, "ninja-preview", Duration::from_secs(10)).is_some(),
+        "再启用即拉起：preview 进程应立即重新出现（启用即拉起，2026-08-29 决策）"
     );
     // —— 再关一次（往返完整性）。
     std::fs::write(state, "off\n").unwrap();

@@ -1,7 +1,8 @@
 //! ninja-preview：官方示例插件（p5）——文本/代码 pager，独立进程。
 //!
 //! 产品定位（PRODUCT.md）：只预览文本和代码；第一次点击才被宿主拉起
-//! （宿主在首次 hit 分发时 spawn 本进程）；官方不特权——与社区插件
+//! （宿主启动/面板开即 spawn 本进程——2026-08-29 决策「启用即拉起」；
+//! 本进程等 hit 认领）；官方不特权——与社区插件
 //! 走同一套 ADE 协议，只经 Unix socket 交换 JSON 帧（ninja-protocol），
 //! 永不链宿主内部 API（`cargo tree -p ninja-preview` 无宿主 crate）。
 //!

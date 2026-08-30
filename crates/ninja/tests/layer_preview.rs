@@ -4,9 +4,10 @@
 //! 关层」。
 //!
 //! 场景：
-//! 1. **绝对路径冷启动**：启用 preview、不预拉进程（PRODUCT：启用≠
-//!    常驻）→ `NINJA_P4_HIT` 触发点击路径 → 宿主首次分发时才拉起
-//!    ninja-preview → claim（open_probe 必须为空：系统默认不触发）→
+//! 1. **绝对路径**：启用 preview（宿主启动即拉起——面板 v2 单一策略
+//!    2026-08-29；idle = 进程在跑、socket 在、等命中）→ `NINJA_P4_HIT`
+//!    触发点击路径 → 插件 claim（open_probe 必须为空：系统默认不
+//!    触发）→
 //!    `layer.open/ready/present` → 层内容探针（`NINJA_LAYER_PROBE`：
 //!    渲染器把层纹理读回落盘 PPM）出现且有文本墨迹 → 真实 Esc
 //!    （tools/verify/synth_input.swift 合成 CGEvent）→ 层关（探针
@@ -158,7 +159,8 @@ fn wait_gone(p: &Path, total: Duration) -> bool {
     false
 }
 
-/// 场景骨架：起宿主（enabled preview + 路径表）→ 触发 NINJA_P4_HIT →
+/// 场景骨架：起宿主（enabled preview + 路径表；启动即拉起——面板 v2
+/// 单一策略，idle = 进程在跑、socket 在、等命中）→ 触发 NINJA_P4_HIT →
 /// 等层探针出现。`relative`：true = OSC-7 pwd + 相对路径 rel.txt:2；
 /// false = 绝对路径 target.rs:7:1。返回（探针文件, open_probe, 探针目录,
 /// host_err 路径）。
@@ -280,11 +282,12 @@ fn e2e_absolute_path_cold_spawn_layer_present_and_esc_close() {
         read(&open_probe)
     );
 
-    // 冷启动取证：宿主在首次分发时才拉起插件（stderr 有拉起日志）。
+    // 拉起取证：宿主启动即拉起插件（stderr 有拉起日志；零点击路径的
+    // 像素级取证见 theme_switch——那里不设 NINJA_P4_HIT）。
     let host_err = read(&host_err_path);
     assert!(
         host_err.contains("已拉起插件"),
-        "应有首次分发拉起插件的日志：{host_err}"
+        "应有启动拉起插件的日志：{host_err}"
     );
 
     // Esc 关层（定向 CGEvent → keyDown → 宿主兜底关层 + 删探针文件）。
