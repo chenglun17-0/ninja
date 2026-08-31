@@ -144,10 +144,15 @@ pub fn dump_config_if_requested() {
 
 /// 容器/分隔条底色（NSColor；pane.rs drawRect 用）。
 pub fn bg_color() -> Retained<objc2_app_kit::NSColor> {
-    let Some(h) = host_opt() else {
-        return gray(0x16, 0x16, 0x1e);
-    };
-    gray(h.bg.0, h.bg.1, h.bg.2)
+    let (r, g, b) = bg_rgb();
+    gray(r, g, b)
+}
+
+/// 生效背景 RGB（标题栏外观明暗、chrome 涂色）。缺宿主时兑底 ODP。
+pub fn bg_rgb() -> (u8, u8, u8) {
+    host_opt()
+        .map(|h| h.bg)
+        .unwrap_or(crate::config::ODP_BACKGROUND)
 }
 
 /// 焦点环 RGB（pane.rs 焦点环 layer 边框用；cursor-color → foreground 链）。
@@ -462,7 +467,7 @@ pub fn read_text(surface: ghostty_surface_t, x0: u32, y0: u32, x1: u32, y1: u32)
 // ghostty runtime 回调
 // ---------------------------------------------------------------------------
 
-pub unsafe extern "C" fn wakeup_cb(_userdata: *mut c_void) {
+pub extern "C" fn wakeup_cb(_userdata: *mut c_void) {
     // 可能从 IO/渲染线程调用：只唤醒主 RunLoop，主线程 timer 里 app_tick
     //（CFRunLoop 唤醒线程安全）。
     objc2_core_foundation::CFRunLoop::main().unwrap().wake_up();

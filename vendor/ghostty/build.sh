@@ -48,18 +48,20 @@ fi
 
 ./fetch.sh
 
-# Apply vendor patches (idempotent: reverse-apply first if already applied).
-# 0001: static embed lib on darwin (q0); 0002: bundled themes for named
-# `theme =` resolution (q2).
-for PATCH_FILE in \
-  "${PWD}/patches/0001-darwin-install-static-embed-lib.patch" \
-  "${PWD}/patches/0002-install-themes-on-embed-route.patch"
-do
-  if ! patch -R -s -N -p1 -d src --input "${PATCH_FILE}" >/dev/null 2>&1; then
-    :
+# Apply vendor patches once. Reverse-apply-then-forward used to duplicate
+# the Darwin `else` (21 copies → zig parse error). Marker in build.zig is
+# the idempotency check.
+apply_once() {
+  local patch_file="$1" marker="$2"
+  if grep -q "$marker" src/build.zig; then
+    return 0
   fi
-  patch -s -N -p1 -d src --input "${PATCH_FILE}"
-done
+  patch -s -N -p1 -d src --input "$patch_file"
+}
+apply_once "${PWD}/patches/0001-darwin-install-static-embed-lib.patch" \
+  "ninja q0: install the static embed library"
+apply_once "${PWD}/patches/0002-install-themes-on-embed-route.patch" \
+  "ninja q2: also install the bundled themes"
 
 mkdir -p out
 ( cd src && zig build \

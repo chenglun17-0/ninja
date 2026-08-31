@@ -256,6 +256,7 @@ impl PaneContainer {
         let first = SurfaceHostView::new(mtm);
         let frame = first.frame();
         let ring = FocusRingView::new(mtm);
+        ring.setHidden(true);
 
         let this = PaneContainer::alloc(mtm).set_ivars(Ivars {
             tree: RefCell::new(None),
@@ -658,24 +659,12 @@ impl PaneContainer {
         s
     }
 
-    /// 焦点环同步（焦点变化 / 布局变化后调；叶子 become/resign 经
-    /// sync_focus_ring_of 走到这里）。
+    /// 焦点环同步。Ghostty 单面/分屏都不画盒子，只靠分隔条；环保留对象
+    /// 但不显示（避免终端被方框框住）。
     pub fn sync_focus_ring(&self) {
-        let Some(ring) = self.ivars().ring.borrow().clone() else {
-            return;
-        };
-        // 环必须在最上层（新加的 pane 子视图会盖住它）。
-        ring.removeFromSuperview();
-        self.addSubview(&ring);
-        let frame = self
-            .focused_leaf()
-            .and_then(|v| {
-                let tree = self.ivars().tree.borrow();
-                node_leaf_frame(tree.as_ref(), &v)
-            })
-            .unwrap_or(NSRect::ZERO);
-        ring.setFrame(frame);
-        ring.setHidden(frame.size.width <= 0.0 || frame.size.height <= 0.0);
+        if let Some(ring) = self.ivars().ring.borrow().as_ref() {
+            ring.setHidden(true);
+        }
     }
 
     // ---- 内部 ----
@@ -849,6 +838,7 @@ fn node_contains(node: Option<&Node>, view: &SurfaceHostView) -> bool {
     }
 }
 
+#[allow(dead_code)] // 焦点环关掉后布局 dump 仍可能用
 fn node_leaf_frame(node: Option<&Node>, view: &SurfaceHostView) -> Option<NSRect> {
     match node {
         Some(Node::Leaf { view: v, frame }) => {

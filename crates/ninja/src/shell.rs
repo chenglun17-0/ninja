@@ -14,8 +14,9 @@
 use objc2::rc::Retained;
 use objc2::{msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSEventType, NSScreen, NSWindow, NSWindowOrderingMode,
-    NSWindowStyleMask,
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
+    NSApplication, NSBackingStoreType, NSEventType, NSScreen, NSView, NSWindow,
+    NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSSize, NSString};
 
@@ -157,13 +158,86 @@ fn default_initial_pt(
     ))
 }
 
-/// 窗口 chrome 跟终端底色统一（v1 X2 经验）：标题栏透明 + 背景同色，
-/// 免白色标题栏割裂。主题系统在 q2，这里只钉 q1 的静态同色。
+/// Ghostty 默认 `macos-titlebar-style = transparent`：标题栏透明、底色 =
+/// 终端背景、标题文字随背景明暗（darkAqua/aqua）。插件 theme.set / 用户
+/// ghostty `theme=` 改背景后热重载会再走这里。
 pub fn apply_chrome(window: &NSWindow) {
     window.setTitlebarAppearsTransparent(true);
     window.setTitlebarSeparatorStyle(objc2_app_kit::NSTitlebarSeparatorStyle::None);
+    let (r, g, b) = host::bg_rgb();
     window.setBackgroundColor(Some(&host::bg_color()));
+    // SAFETY: NSAppearanceName* 是框架提供的常量字符串。
+    let name = unsafe {
+        if bg_is_light(r, g, b) {
+            NSAppearanceNameAqua
+        } else {
+            NSAppearanceNameDarkAqua
+        }
+    };
+    window.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
+    paint_titlebar(window, r, g, b);
     window.invalidateShadow();
+}
+
+/// Rec. 601 亮度（与 Ghostty `OSColor.luminance` 同款）。
+fn bg_is_light(r: u8, g: u8, b: u8) -> bool {
+    let r = f64::from(r) / 255.0;
+    let g = f64::from(g) / 255.0;
+    let b = f64::from(b) / 255.0;
+    0.299 * r + 0.587 * g + 0.114 * b > 0.5
+}
+
+/// Tahoe 标题栏会另铺 NSTitlebarBackgroundView；涂成终端底并藏起材质层，
+/// 否则标题栏像一块浅色方板、深色底上标题字看不见。
+fn paint_titlebar(window: &NSWindow, r: u8, g: u8, b: u8) {
+    let Some(cv) = window.contentView() else {
+        return;
+    };
+    // SAFETY: 读 superview 仅取标题栏所在的 theme frame，不跨线程持有。
+    let Some(root) = (unsafe { cv.superview() }) else {
+        return;
+    };
+    let color = {
+        let Some(space) = objc2_core_graphics::CGColorSpace::new_device_rgb() else {
+            return;
+        };
+        let comps = [
+            f64::from(r) / 255.0,
+            f64::from(g) / 255.0,
+            f64::from(b) / 255.0,
+            1.0,
+        ];
+        // SAFETY: sRGB 四分量、色彩空间有效。
+        unsafe { objc2_core_graphics::CGColor::new(Some(&space), comps.as_ptr()) }
+    };
+    let Some(color) = color else {
+        return;
+    };
+    walk_views(&root, &mut |v| {
+        let name = class_name(v);
+        if name == "NSTitlebarBackgroundView" {
+            v.setHidden(true);
+            return;
+        }
+        if name == "NSTitlebarView" {
+            v.setWantsLayer(true);
+            if let Some(layer) = v.layer() {
+                layer.setBackgroundColor(Some(color.as_ref()));
+            }
+        }
+    });
+}
+
+fn class_name(v: &NSView) -> String {
+    let s: objc2::rc::Retained<NSString> = unsafe { objc2::msg_send![v, className] };
+    s.to_string()
+}
+
+fn walk_views(v: &NSView, f: &mut impl FnMut(&NSView)) {
+    f(v);
+    for sub in v.subviews() {
+        walk_views(&sub, f);
+    }
 }
 
 /// ghostty close_surface（⌘W 默认绑定）/ EOF（close_surface_cb）的宿主侧
@@ -469,6 +543,13 @@ mod tests {
         // 单 pane：放行 → 关当前 tab/窗，最后一个才关窗。
         assert!(should_close_whole_window(1, true));
         assert!(should_close_whole_window(0, true)); // 防御：无叶子视为单面
+    }
+
+    #[test]
+    fn odp_background_is_dark_so_title_uses_dark_aqua() {
+        // ODP #282c34；浅色外观会让标题字变成黑字叠在深色底上（看不见）。
+        assert!(!super::bg_is_light(0x28, 0x2c, 0x34));
+        assert!(super::bg_is_light(0xf5, 0xf5, 0xf5));
     }
 
     #[test]
