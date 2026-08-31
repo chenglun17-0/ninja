@@ -15,9 +15,7 @@ use std::cell::RefCell;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSButtonType, NSWindow, NSWindowStyleMask,
-};
+use objc2_app_kit::{NSBackingStoreType, NSButton, NSButtonType, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 /// 一行 = 一个插件。
@@ -70,11 +68,7 @@ define_class!(
             self.refresh();
         }
 
-        /// 打开 Ghostty 配置文件（系统默认文本编辑器）。
-        #[unsafe(method(ninjaOpenGhosttyConfig:))]
-        fn ninja_open_ghostty_config(&self, _sender: Option<&AnyObject>) {
-            crate::config::open_ghostty_config();
-        }
+
     }
 
     unsafe impl NSObjectProtocol for PluginPanel {}
@@ -91,7 +85,10 @@ fn panel() -> Option<&'static PluginPanel> {
 /// 开关的一条路（UI checkbox / E2E 钩子共用）：宿主生命周期 + 写回
 /// ninja.toml + 面板刷新。
 fn apply_toggle(name: &str, on: bool) {
-    eprintln!("ninja: 面板开关 {name:?} → {}", if on { "on" } else { "off" });
+    eprintln!(
+        "ninja: 面板开关 {name:?} → {}",
+        if on { "on" } else { "off" }
+    );
     let ok = crate::plugins::toggle_plugin(name, on);
     if !ok && on {
         eprintln!("ninja: 插件 {name:?} 拉起失败（面板开关回弹）");
@@ -108,9 +105,13 @@ fn apply_toggle(name: &str, on: bool) {
 
 /// toggle_visibility（⌘,/菜单）的入口：显示（建/刷新）或隐藏。
 pub fn toggle_visibility() {
-    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
     let p = ensure_panel(mtm);
-    let Some(w) = p.ivars().window.borrow().clone() else { return };
+    let Some(w) = p.ivars().window.borrow().clone() else {
+        return;
+    };
     if w.isVisible() {
         w.orderOut(None);
         return;
@@ -145,9 +146,8 @@ fn ensure_panel(mtm: MainThreadMarker) -> &'static PluginPanel {
     PANEL.store(raw, std::sync::atomic::Ordering::Release);
 
     // 窗口（无极小化；面板随用随显隐）。
-    let style = NSWindowStyleMask::Titled
-        | NSWindowStyleMask::Closable
-        | NSWindowStyleMask::Resizable;
+    let style =
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable;
     let frame = NSRect::new(NSPoint::new(120.0, 480.0), NSSize::new(460.0, 240.0));
     // SAFETY: NSWindow 指定初始化器；参数平凡。
     let window = unsafe {
@@ -194,7 +194,10 @@ impl PluginPanel {
                 check.setTarget(Some(self));
                 check.setAction(Some(objc2::sel!(ninjaToggle:)));
             }
-            check.setFrame(NSRect::new(NSPoint::new(12.0, y + 2.0), NSSize::new(20.0, 18.0)));
+            check.setFrame(NSRect::new(
+                NSPoint::new(12.0, y + 2.0),
+                NSSize::new(20.0, 18.0),
+            ));
 
             let name = label(mtm, &st.name, 40.0, y, 150.0, 18.0);
             let status = label(mtm, "", 196.0, y, 240.0, 18.0);
@@ -211,24 +214,19 @@ impl PluginPanel {
             y += 26.0;
         }
         if rows.is_empty() {
-            let hint = label(mtm, "无插件（ninja.toml [plugins] enabled 配置）", 16.0, y, 420.0, 18.0);
+            let hint = label(
+                mtm,
+                "无插件（ninja.toml [plugins] enabled 配置）",
+                16.0,
+                y,
+                420.0,
+                18.0,
+            );
             hint.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
             content.addSubview(&hint);
-            y += 26.0;
         }
-        y += 8.0;
-        let cfg_btn = NSButton::new(mtm);
-        cfg_btn.setButtonType(NSButtonType::MomentaryPushIn);
-        cfg_btn.setTitle(&NSString::from_str("编辑 Ghostty 配置"));
-        unsafe {
-            cfg_btn.setTarget(Some(self));
-            cfg_btn.setAction(Some(objc2::sel!(ninjaOpenGhosttyConfig:)));
-        }
-        cfg_btn.setFrame(NSRect::new(NSPoint::new(12.0, y), NSSize::new(200.0, 24.0)));
-        content.addSubview(&cfg_btn);
-        y += 28.0;
         // 按行数收窗高（空面板不占屏）。
-        let height = (y + 16.0).max(110.0);
+        let height = (y + 16.0).max(90.0);
         let f = window.frame();
         window.setFrame_display(
             NSRect::new(f.origin, NSSize::new(f.size.width, height)),

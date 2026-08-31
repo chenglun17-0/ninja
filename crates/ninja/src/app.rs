@@ -30,8 +30,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSMenu, NSMenuItem,
-    NSEventModifierFlags, NSWindow, NSWindowDelegate,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSEventModifierFlags,
+    NSMenu, NSMenuItem, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{NSNotification, NSObject, NSString};
 
@@ -590,6 +590,12 @@ define_class!(
             perform_menu_binding("toggle_visibility");
         }
 
+        /// App 菜单「Edit Ghostty Config…」：与 Plugins 同级，打开默认文本编辑器。
+        #[unsafe(method(ninjaOpenGhosttyConfig:))]
+        fn ninja_open_ghostty_config(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            crate::config::open_ghostty_config();
+        }
+
         /// 热重载执行拍（host::schedule_reload 起的 timer 落这里）。
         #[unsafe(method(ninjaReloadTick:))]
         fn ninja_reload_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
@@ -657,33 +663,102 @@ const APP_ITEMS: &[MenuSpec] = &[
     // 插件面板 = ninja 特有动作：认领 ghostty 空闲动作 toggle_visibility
     //（宿主层绑 ⌘,，用户可经 keybind 统一重绑；面板 UI 是 q3 交付，
     // q2 点击/按键驱动 dispatch 记日志）。
-    MenuSpec { title: "Plugins…", selector: "ninjaPlugins:", action: "toggle_visibility" },
-    MenuSpec { title: "Quit ninja", selector: "terminate:", action: "quit" },
+    MenuSpec {
+        title: "Plugins…",
+        selector: "ninjaPlugins:",
+        action: "toggle_visibility",
+    },
+    MenuSpec {
+        title: "Edit Ghostty Config…",
+        selector: "ninjaOpenGhosttyConfig:",
+        action: "open_config",
+    },
+    MenuSpec {
+        title: "Quit ninja",
+        selector: "terminate:",
+        action: "quit",
+    },
 ];
 
 const FILE_ITEMS: &[MenuSpec] = &[
-    MenuSpec { title: "New Window", selector: "ninjaActNewWindow:", action: "new_window" },
-    MenuSpec { title: "New Tab", selector: "ninjaActNewTab:", action: "new_tab" },
+    MenuSpec {
+        title: "New Window",
+        selector: "ninjaActNewWindow:",
+        action: "new_window",
+    },
+    MenuSpec {
+        title: "New Tab",
+        selector: "ninjaActNewTab:",
+        action: "new_tab",
+    },
     // 裸⌘W 决策保留（shell.rs：多 pane 只关焦点面、单 pane 放行原生语义，
     // 非键位绑定层）；keyEquivalent 仍与 ghostty close_surface 绑定同源。
-    MenuSpec { title: "Close", selector: "performClose:", action: "close_surface" },
+    MenuSpec {
+        title: "Close",
+        selector: "performClose:",
+        action: "close_surface",
+    },
 ];
 
 const PANES_ITEMS: &[MenuSpec] = &[
-    MenuSpec { title: "Split Right", selector: "ninjaActSplitRight:", action: "new_split:right" },
-    MenuSpec { title: "Split Down", selector: "ninjaActSplitDown:", action: "new_split:down" },
-    MenuSpec { title: "Zoom Pane", selector: "ninjaActToggleZoom:", action: "toggle_split_zoom" },
-    MenuSpec { title: "Focus Pane Left", selector: "ninjaActFocusLeft:", action: "goto_split:left" },
-    MenuSpec { title: "Focus Pane Right", selector: "ninjaActFocusRight:", action: "goto_split:right" },
-    MenuSpec { title: "Focus Pane Up", selector: "ninjaActFocusUp:", action: "goto_split:up" },
-    MenuSpec { title: "Focus Pane Down", selector: "ninjaActFocusDown:", action: "goto_split:down" },
-    MenuSpec { title: "Previous Pane", selector: "ninjaActPrevPane:", action: "goto_split:previous" },
-    MenuSpec { title: "Next Pane", selector: "ninjaActNextPane:", action: "goto_split:next" },
+    MenuSpec {
+        title: "Split Right",
+        selector: "ninjaActSplitRight:",
+        action: "new_split:right",
+    },
+    MenuSpec {
+        title: "Split Down",
+        selector: "ninjaActSplitDown:",
+        action: "new_split:down",
+    },
+    MenuSpec {
+        title: "Zoom Pane",
+        selector: "ninjaActToggleZoom:",
+        action: "toggle_split_zoom",
+    },
+    MenuSpec {
+        title: "Focus Pane Left",
+        selector: "ninjaActFocusLeft:",
+        action: "goto_split:left",
+    },
+    MenuSpec {
+        title: "Focus Pane Right",
+        selector: "ninjaActFocusRight:",
+        action: "goto_split:right",
+    },
+    MenuSpec {
+        title: "Focus Pane Up",
+        selector: "ninjaActFocusUp:",
+        action: "goto_split:up",
+    },
+    MenuSpec {
+        title: "Focus Pane Down",
+        selector: "ninjaActFocusDown:",
+        action: "goto_split:down",
+    },
+    MenuSpec {
+        title: "Previous Pane",
+        selector: "ninjaActPrevPane:",
+        action: "goto_split:previous",
+    },
+    MenuSpec {
+        title: "Next Pane",
+        selector: "ninjaActNextPane:",
+        action: "goto_split:next",
+    },
 ];
 
 const WINDOW_ITEMS: &[MenuSpec] = &[
-    MenuSpec { title: "Next Tab", selector: "selectNextTab:", action: "next_tab" },
-    MenuSpec { title: "Previous Tab", selector: "selectPreviousTab:", action: "previous_tab" },
+    MenuSpec {
+        title: "Next Tab",
+        selector: "selectNextTab:",
+        action: "next_tab",
+    },
+    MenuSpec {
+        title: "Previous Tab",
+        selector: "selectPreviousTab:",
+        action: "previous_tab",
+    },
 ];
 
 const EDIT_ITEMS: &[MenuSpec] = &[
@@ -692,9 +767,21 @@ const EDIT_ITEMS: &[MenuSpec] = &[
     // performable 绑定建反向映射（getTrigger 返空，Binding.zig putFlags），
     // 菜单不显示快捷键（⌘C/⌘V 仍由 surface_key → ghostty 运行时判定执行，
     // 不被菜单拦截——语义正确，已知语义）；selectAll 无旗标，⌘A 正常镜像。
-    MenuSpec { title: "Copy", selector: "copy:", action: "copy_to_clipboard" },
-    MenuSpec { title: "Paste", selector: "paste:", action: "paste_from_clipboard" },
-    MenuSpec { title: "Select All", selector: "selectAll:", action: "select_all" },
+    MenuSpec {
+        title: "Copy",
+        selector: "copy:",
+        action: "copy_to_clipboard",
+    },
+    MenuSpec {
+        title: "Paste",
+        selector: "paste:",
+        action: "paste_from_clipboard",
+    },
+    MenuSpec {
+        title: "Select All",
+        selector: "selectAll:",
+        action: "select_all",
+    },
 ];
 
 fn add_submenu(mtm: MainThreadMarker, main_menu: &NSMenu, title: &str) -> Retained<NSMenu> {
@@ -802,9 +889,7 @@ pub fn wire_window(w: &NSWindow) {
     if let Some(d) = delegate() {
         // SAFETY: 协议对象包装（NSWindowDelegate 弱引用 delegate）。
         w.setDelegate(Some(ProtocolObject::from_ref(d)));
-        let r = unsafe {
-            Retained::retain(std::ptr::from_ref(w) as *mut NSWindow).unwrap()
-        };
+        let r = unsafe { Retained::retain(std::ptr::from_ref(w) as *mut NSWindow).unwrap() };
         d.register_window(r);
     }
 }
@@ -850,7 +935,11 @@ pub fn run() {
     // ghostty 全局初始化 + q2 全量装载管线（用户既有 ghostty 配置直接
     // 生效：主题/字体/键位；GHOSTTY_RESOURCES_DIR 在 main 里已就位）。
     unsafe {
-        assert_eq!(ghostty_sys::ghostty_init(0, std::ptr::null_mut()), 0, "ghostty_init failed");
+        assert_eq!(
+            ghostty_sys::ghostty_init(0, std::ptr::null_mut()),
+            0,
+            "ghostty_init failed"
+        );
         let info = ghostty_sys::ghostty_info();
         let version = std::str::from_utf8(std::slice::from_raw_parts(
             info.version as *const u8,
@@ -892,7 +981,10 @@ pub fn run() {
     // SAFETY: super 的 init；ivars 已就位。
     let delegate: Retained<AppDelegate> = unsafe { msg_send![super(this), init] };
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    DELEGATE.store(&*delegate as *const AppDelegate as *mut AppDelegate, Ordering::Release);
+    DELEGATE.store(
+        &*delegate as *const AppDelegate as *mut AppDelegate,
+        Ordering::Release,
+    );
 
     // 主 RunLoop tick（16ms）：app_tick 驱动 action/邮箱（渲染线程自画）。
     {
@@ -958,7 +1050,9 @@ fn perform_menu_binding(action: &str) -> bool {
 /// 配置应用后的壳侧刷新（host::reload_tick 调）：菜单键位重建 + 取证
 /// dump。菜单 keyEquivalent 与生效键位同步（用户重绑 → 菜单跟随）。
 pub fn on_config_applied() {
-    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
     let app = NSApplication::sharedApplication(mtm);
     build_menu(mtm, &app);
     host::dump_config_if_requested();
