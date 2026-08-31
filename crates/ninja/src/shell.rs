@@ -34,13 +34,11 @@ const QUIT_KEEPS_WINDOWS_KEY: &str = "NSQuitAlwaysKeepsWindows";
 /// Ghostty `TerminalController.lastCascadePoint`：新窗错开，不叠在上一扇上。
 static LAST_CASCADE: Mutex<NSPoint> = Mutex::new(NSPoint { x: 0.0, y: 0.0 });
 
-/// Ghostty 开窗尺寸优先级（showWindow + defaultSize）。
+/// 开窗尺寸：`window-width/height` 都 >0 用格子；否则铺满当前屏可见区域。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SizeChoice {
     Maximize,
     InitialSize,
-    Restored,
-    Default800x600,
 }
 
 /// Ghostty 开窗原点：配置坐标 → 上次位置 → 居中；多窗再 cascade。
@@ -51,16 +49,11 @@ pub enum OriginChoice {
     Center,
 }
 
-/// `maximize` > `window-width`+`window-height`（INITIAL_SIZE）> 上次尺寸 > 800×600。
-pub fn choose_size(maximize: bool, has_initial_size: bool, has_restored_size: bool) -> SizeChoice {
-    if maximize {
-        SizeChoice::Maximize
-    } else if has_initial_size {
+pub fn choose_size(has_initial_size: bool) -> SizeChoice {
+    if has_initial_size {
         SizeChoice::InitialSize
-    } else if has_restored_size {
-        SizeChoice::Restored
     } else {
-        SizeChoice::Default800x600
+        SizeChoice::Maximize
     }
 }
 
@@ -114,38 +107,21 @@ pub fn make_window(
     // SAFETY: 布尔 setter，无别名风险。
     unsafe { window.setReleasedWhenClosed(false) };
 
-    // E2E 虚拟屏落位在**建面之前**：建面首推 push_size 读窗口所在屏的
-    // backingScaleFactor——先落位保证首推就用目标屏的 scale（先建面再
-    // 移屏会留下 2x→1x 的记账错位：渲染挤压 + 底部暗带，q3 hit 的行
-    // 读取/像素换算全漂移，实测踩过；app.rs 的居中只对非 E2E 路径）。
-    let on_e2e_screen = std::env::var_os("NINJA_E2E_SCREEN").is_some();
-    if on_e2e_screen {
-        place_on_e2e_screen(&window);
-    }
+    // 虚拟屏先落位再建面，scale 才对。
+    place_on_e2e_screen(&window);
 
-    // 首叶 surface（建面统一走 inherited_config 传 context）。
     let first = container.first_leaf();
     let parent = parent.filter(|p| p.surface_opt().is_some());
     host::attach_surface(&first, context, parent);
-    // INITIAL_SIZE action（surface_new 期间已到）：window-width/height 都
-    // >0 才发（Ghostty 同款）。缺省时回 CELL_SIZE × 80×24 默认窗（q3 语义）。
-    // 注：曾试 800×600（对齐 AppKit SurfaceView 观感），但 Tahoe 下
-    // NSTitlebarView 上色层（apply_chrome/paint_titlebar）令 CA 的窗口级
-    // 色彩 drawable（Whippet A008→RGhA）随窗口面积线性变——800×600 时
-    // theme.set 一轮就 +7MiB，把 q3 门禁三「关掉即轻」的 8MiB 容差打穿
-    //（docs/q3-evidence/run-e2e.sh C14，vmmap 实测 IOSurface 13M→20M）。
-    // 回到格子默认窗＝回到门禁校准基线；观感差异用户可用
-    // window-width/height 配置。
+    // Ghostty：window-width/height 都 >0 才发 INITIAL_SIZE；否则 800×600。
     if !window.isVisible() {
-        let size = first
+        let (w, h) = first
             .ivars()
             .initial_pt
             .get()
             .filter(|(w, h)| *w > 0 && *h > 0)
-            .or_else(|| default_initial_pt(&window, &first));
-        if let Some((w, h)) = size {
-            window.setContentSize(objc2_foundation::NSSize::new(w as f64, h as f64));
-        }
+            .unwrap_or((800, 600));
+        window.setContentSize(objc2_foundation::NSSize::new(w as f64, h as f64));
     }
     place_on_e2e_screen(&window);
     window
@@ -164,9 +140,6 @@ pub fn present_window(window: &NSWindow) {
 
 fn apply_open_policy(window: &NSWindow) {
     let cfg = host::config();
-    let maximize = cfg
-        .and_then(|c| crate::config::get_bool(c, "maximize"))
-        .unwrap_or(false);
     let pos = match (
         cfg.and_then(|c| crate::config::get_i16(c, "window-position-x")),
         cfg.and_then(|c| crate::config::get_i16(c, "window-position-y")),
@@ -176,40 +149,40 @@ fn apply_open_policy(window: &NSWindow) {
     };
     let has_initial = window_has_initial_size(window);
     let saved = load_last_frame();
-    let size = choose_size(maximize, has_initial, saved.is_some());
-    match size {
+    match choose_size(has_initial) {
+        SizeChoice::InitialSize => {
+            let origin = choose_origin(pos.is_some(), saved.is_some());
+            match origin {
+                OriginChoice::ConfigPos => {
+                    if let Some((x, y)) = pos {
+                        apply_config_position(window, x, y);
+                    }
+                }
+                OriginChoice::Restored => {
+                    if let Some(saved) = saved {
+                        let mut f = window.frame();
+                        f.origin = saved.origin;
+                        clamp_to_visible(window, &mut f);
+                        window.setFrame_display(f, true);
+                    }
+                }
+                OriginChoice::Center => window.center(),
+            }
+            apply_cascade(window, pos.is_some());
+        }
         SizeChoice::Maximize => {
             if let Some(screen) = window.screen().or_else(fallback_screen) {
                 window.setFrame_display(screen.visibleFrame(), true);
             }
-        }
-        SizeChoice::InitialSize | SizeChoice::Default800x600 => {}
-        SizeChoice::Restored => {
-            if let Some(saved) = saved {
-                let mut f = window.frame();
-                f.size = saved.size;
-                window.setFrame_display(f, true);
+            if pos.is_some() {
+                if let Some((x, y)) = pos {
+                    apply_config_position(window, x, y);
+                }
+            } else {
+                apply_cascade(window, false);
             }
         }
     }
-    let origin = choose_origin(pos.is_some(), saved.is_some());
-    match origin {
-        OriginChoice::ConfigPos => {
-            if let Some((x, y)) = pos {
-                apply_config_position(window, x, y);
-            }
-        }
-        OriginChoice::Restored => {
-            if let Some(saved) = saved {
-                let mut f = window.frame();
-                f.origin = saved.origin;
-                clamp_to_visible(window, &mut f);
-                window.setFrame_display(f, true);
-            }
-        }
-        OriginChoice::Center => window.center(),
-    }
-    apply_cascade(window, pos.is_some());
     apply_restorable(window);
 }
 
@@ -395,19 +368,6 @@ fn place_on_e2e_screen(window: &NSWindow) {
         }
     }
     println!("screen: NINJA_E2E_SCREEN={target}（虚拟屏取证）");
-}
-
-/// CELL_SIZE(px) × (80, 24) → 内容 points（INITIAL_SIZE 缺省时；q3 基线）。
-fn default_initial_pt(
-    window: &objc2_app_kit::NSWindow,
-    first: &crate::surface::SurfaceHostView,
-) -> Option<(u32, u32)> {
-    let (cw, ch) = first.ivars().cell_px.get()?;
-    let scale = window.backingScaleFactor().max(1.0);
-    Some((
-        (f64::from(cw) * 80.0 / scale).ceil() as u32,
-        (f64::from(ch) * 24.0 / scale).ceil() as u32,
-    ))
 }
 
 /// Ghostty 默认 `macos-titlebar-style = transparent`：标题栏透明、底色 =
@@ -805,10 +765,8 @@ mod tests {
     #[test]
     fn window_size_priority_matches_ghostty() {
         use super::{choose_size, SizeChoice};
-        assert_eq!(choose_size(true, true, true), SizeChoice::Maximize);
-        assert_eq!(choose_size(false, true, true), SizeChoice::InitialSize);
-        assert_eq!(choose_size(false, false, true), SizeChoice::Restored);
-        assert_eq!(choose_size(false, false, false), SizeChoice::Default800x600);
+        assert_eq!(choose_size(true), SizeChoice::InitialSize);
+        assert_eq!(choose_size(false), SizeChoice::Maximize);
     }
 
     #[test]

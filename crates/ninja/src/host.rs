@@ -1,7 +1,7 @@
 //! q1 宿主单例：ghostty app/config 句柄、运行时回调（wakeup/action/
 //! clipboard/close_surface）、surface 生命周期（建/拆）与 action 全分发。
 //!
-//! q2 起：配置系统接入——生效配置的派生态（bg/焦点环/分隔条）随
+//! q2 起：配置系统接入——生效配置的派生态（bg/分隔条）随
 //! [`reload_config`] 刷新；RELOAD_CONFIG/CONFIG_CHANGE/TOGGLE_VISIBILITY
 //! 等配置动作进 dispatch（装载管线见 [`crate::config`]）。
 //!
@@ -24,11 +24,6 @@ use crate::pane;
 use crate::shell;
 use crate::surface::SurfaceHostView;
 
-/// 焦点环颜色源链：cursor-color → foreground → ODP 光标蓝（末位兑底仍是
-/// ODP 钉值）。注：cursor-color 是 ?TerminalColor 联合、无 cval——C API
-/// app 级句柄读不出（config_get 恒 false，与 link-previews 回读怪象同类），
-/// 实际链生效段是 foreground → 钉值。
-pub const RING_FALLBACK: (u8, u8, u8) = (0x52, 0x8b, 0xff);
 /// 分隔条线色（bg 提亮 ~25%）。
 const DIVIDER_LIFT: f64 = 0.25;
 
@@ -53,8 +48,6 @@ struct Host {
     free_scheduled: bool,
     /// ghostty config 的 background 色（容器/分隔条/窗口 chrome 同源）。
     bg: (u8, u8, u8),
-    /// 焦点环色（cursor-color → foreground 链，见 [RING_FALLBACK]）。
-    ring: (u8, u8, u8),
 }
 
 static HOST: AtomicPtr<Host> = AtomicPtr::new(std::ptr::null_mut());
@@ -100,7 +93,6 @@ pub fn init(app: ghostty_app_t, config: ghostty_config_t, load_info: crate::conf
         pending_free: Vec::new(),
         free_scheduled: false,
         bg: (0x16, 0x16, 0x1e),
-        ring: RING_FALLBACK,
     });
     refresh_derived(&mut host);
     HOST.store(Box::into_raw(host), Ordering::Release);
@@ -155,11 +147,6 @@ pub fn bg_rgb() -> (u8, u8, u8) {
         .unwrap_or(crate::config::ODP_BACKGROUND)
 }
 
-/// 焦点环 RGB（pane.rs 焦点环 layer 边框用；cursor-color → foreground 链）。
-pub fn ring_rgb() -> (u8, u8, u8) {
-    host_opt().map(|h| h.ring).unwrap_or(RING_FALLBACK)
-}
-
 /// 分隔条 1px 线色（bg 提亮）。
 pub fn divider_color() -> Retained<objc2_app_kit::NSColor> {
     let Some(h) = host_opt() else {
@@ -183,20 +170,15 @@ fn gray(r: u8, g: u8, b: u8) -> Retained<objc2_app_kit::NSColor> {
 // 热重载（q2）：管线重跑 + ghostty_app_update_config + 派生态刷新
 // ---------------------------------------------------------------------------
 
-/// 从生效配置重读派生态（bg/焦点环）并刷新全部窗口 chrome/重绘。
+/// 从生效配置重读派生态（bg）并刷新全部窗口 chrome/重绘。
 fn refresh_derived(h: &mut Host) {
     h.bg = crate::config::get_color(h.config, "background").unwrap_or((0x16, 0x16, 0x1e));
-    h.ring = crate::config::get_color(h.config, "cursor-color")
-        .or_else(|| crate::config::get_color(h.config, "foreground"))
-        .unwrap_or(RING_FALLBACK);
     crate::shell::sync_save_state();
-    // 全部窗口：背景色/阴影跟随 + 重绘（分隔条/容器底色随 drawRect 重读）。
     let Some(mtm) = MainThreadMarker::new() else { return };
     let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
     for w in app.windows().iter() {
-        if let Some(container) = pane::container_of(&w) {
+        if pane::container_of(&w).is_some() {
             shell::apply_chrome(&w);
-            container.refresh_ring();
             if let Some(cv) = w.contentView() {
                 cv.setNeedsDisplay(true);
                 for sub in cv.subviews() {

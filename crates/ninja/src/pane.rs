@@ -4,7 +4,7 @@
 //! 叶子从自研 TerminalView 换成 libghostty surface：
 //! - 布局：`relayout` 递归按 ratio 切 bounds，叶子 `setFrame` →
 //!   `setFrameSize` → surface_set_size（resize 全链）；
-//! - 分隔条：子 NSView（可拖调 ratio）；焦点环：CALayer 边框叠最上层；
+//! - 分隔条：子 NSView（可拖调 ratio）；
 //! - zoom（⌘⇧Enter）：放大叶占满、其余隐藏**不销毁**
 //!   （surface 数据继续喂不丢、隐藏面 set_occlusion(false) 停画，
 //!   网格冻结在分屏尺寸——还原即正确显示；等价 v1 语义）；
@@ -20,10 +20,8 @@ use std::collections::HashMap;
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSEvent, NSResponder, NSView, NSWindowStyleMask};
-use objc2_core_graphics::CGColor;
+use objc2_app_kit::{NSEvent, NSFocusRingType, NSResponder, NSView, NSWindowStyleMask};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use objc2_quartz_core::CALayer;
 
 use crate::surface::{as_responder, SurfaceHostView};
 
@@ -32,8 +30,6 @@ pub const DIVIDER: f64 = 5.0;
 /// ratio 夹取范围：两侧叶子各保最小占比。
 const RATIO_MIN: f64 = 0.15;
 const RATIO_MAX: f64 = 0.85;
-/// 焦点环边框厚度（points）。
-const RING_BORDER: f64 = 1.5;
 
 /// ⌘⇧Enter 决策（纯逻辑，可单测；v1 X3 原样）：
 /// - 单 pane（无分屏）→ 窗口 zoom（最大化非全屏）；
@@ -161,7 +157,6 @@ pub struct Ivars {
     tree: RefCell<Option<Node>>,
     next_id: Cell<u64>,
     dividers: RefCell<HashMap<u64, Retained<DividerView>>>,
-    ring: RefCell<Option<Retained<FocusRingView>>>,
     /// 当前放大的叶子（None = 未放大）。放大态下其余叶子与分隔条
     /// setHidden 隐藏但**不销毁**：surface 数据继续喂不丢（隐藏面不出帧，
     /// occlusion=false 停画），还原即重显正确内容。
@@ -186,8 +181,16 @@ define_class!(
 
         #[unsafe(method(acceptsFirstResponder))]
         fn accepts_first_responder(&self) -> bool {
-            false // 焦点在叶子终端面，不在容器
+            false
         }
+
+        #[unsafe(method(focusRingType))]
+        fn focus_ring_type(&self) -> NSFocusRingType {
+            NSFocusRingType::None
+        }
+
+        #[unsafe(method(drawFocusRingMask))]
+        fn draw_focus_ring_mask(&self) {}
 
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, size: NSSize) {
@@ -213,16 +216,6 @@ define_class!(
 // ---------------------------------------------------------------------------
 // Rust 接口
 // ---------------------------------------------------------------------------
-
-/// 叶子焦点变化（surface become/resign）→ 同步该容器的焦点环。
-pub fn sync_focus_ring_of(leaf: &SurfaceHostView) {
-    // SAFETY: superview 仅读引用（视图层级在主线程稳定）。
-    if let Some(superview) = unsafe { leaf.superview() }
-        && is_container(&superview)
-    {
-        downcast_container(&superview).sync_focus_ring();
-    }
-}
 
 /// NSView 是否 PaneContainer（isKindOfClass 包装）。
 pub fn is_container(v: &NSView) -> bool {
@@ -255,19 +248,16 @@ impl PaneContainer {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let first = SurfaceHostView::new(mtm);
         let frame = first.frame();
-        let ring = FocusRingView::new(mtm);
-        ring.setHidden(true);
-
         let this = PaneContainer::alloc(mtm).set_ivars(Ivars {
             tree: RefCell::new(None),
             next_id: Cell::new(1),
             dividers: RefCell::new(HashMap::new()),
-            ring: RefCell::new(Some(ring)),
             zoomed: RefCell::new(None),
         });
         // SAFETY: super 的 initWithFrame:；ivars 已就位。
         let view: Retained<PaneContainer> =
             unsafe { msg_send![super(this), initWithFrame: frame] };
+        view.setFocusRingType(NSFocusRingType::None);
         view.addSubview(&first);
         *view.ivars().tree.borrow_mut() = Some(Node::Leaf {
             view: first,
@@ -305,13 +295,6 @@ impl PaneContainer {
 
     pub fn leaf_count(&self) -> usize {
         self.leaves().len()
-    }
-
-    /// 焦点环颜色刷新（q2 热重载：生效配置变化后由 host::refresh_derived 调）。
-    pub fn refresh_ring(&self) {
-        if let Some(r) = self.ivars().ring.borrow().as_ref() {
-            r.update_color();
-        }
     }
 
     /// ⌘D/⌘⇧D（ghostty NEW_SPLIT）：在目标叶子旁插一个新 pane
@@ -448,9 +431,6 @@ impl PaneContainer {
     pub fn shutdown_all(&self) {
         for v in self.leaves() {
             crate::host::close_leaf_deferred(&v);
-        }
-        if let Some(ring) = self.ivars().ring.borrow().clone() {
-            ring.setHidden(true);
         }
     }
 
@@ -607,7 +587,6 @@ impl PaneContainer {
         if let Some(w) = self.window() {
             w.makeFirstResponder(Some(as_responder(view)));
         }
-        self.sync_focus_ring();
     }
 
     /// 取证：容器 zoom 态 + 各叶子（pane id/隐藏/缓存 frame/网格尺寸/
@@ -659,14 +638,6 @@ impl PaneContainer {
         s
     }
 
-    /// 焦点环同步。Ghostty 单面/分屏都不画盒子，只靠分隔条；环保留对象
-    /// 但不显示（避免终端被方框框住）。
-    pub fn sync_focus_ring(&self) {
-        if let Some(ring) = self.ivars().ring.borrow().as_ref() {
-            ring.setHidden(true);
-        }
-    }
-
     // ---- 内部 ----
 
     fn contains(&self, view: &SurfaceHostView) -> bool {
@@ -709,7 +680,6 @@ impl PaneContainer {
                 layout_node(node, bounds, &self.ivars().dividers, zoomed_ptr);
             }
         }
-        self.sync_focus_ring();
     }
 
     /// 拖拽回调（DividerView → 容器）：更新 split ratio 并重排。
@@ -1192,82 +1162,6 @@ impl DividerView {
             (p.y - f.origin.y) / f.size.height.max(1.0)
         };
         container.set_ratio(self.ivars().split_id, ratio);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FocusRingView：焦点 pane 的边框指示（最上层、不挡鼠标）
-// ---------------------------------------------------------------------------
-
-pub struct RingIvars;
-
-define_class!(
-    // SAFETY: NSView 子类化无强约束方法；hitTest 返回 nil 不参与命中。
-    #[unsafe(super(NSView))]
-    #[thread_kind = MainThreadOnly]
-    #[ivars = RingIvars]
-    pub struct FocusRingView;
-
-    impl FocusRingView {
-        #[unsafe(method(isFlipped))]
-        fn is_flipped(&self) -> bool {
-            true
-        }
-
-        /// 不挡鼠标：命中测试永远失败。
-        #[unsafe(method_id(hitTest:))]
-        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> {
-            None
-        }
-    }
-);
-
-impl FocusRingView {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let frame = NSRect::ZERO;
-        let this = FocusRingView::alloc(mtm).set_ivars(RingIvars);
-        // SAFETY: super 的 initWithFrame:；ivars 已就位。
-        let view: Retained<FocusRingView> = unsafe { msg_send![super(this), initWithFrame: frame] };
-        view.setWantsLayer(true);
-        let layer = CALayer::new();
-        layer.setBorderWidth(RING_BORDER);
-        // SAFETY: 组件数组布局正确（CGColorCreate，sRGB 空间）。
-        unsafe {
-            if let Some(space) = objc2_core_graphics::CGColorSpace::new_device_rgb() {
-                let ring = crate::host::ring_rgb();
-                let comps: [f64; 4] = [
-                    f64::from(ring.0) / 255.0,
-                    f64::from(ring.1) / 255.0,
-                    f64::from(ring.2) / 255.0,
-                    0.9,
-                ];
-                if let Some(c) = CGColor::new(Some(&*space), comps.as_ptr()) {
-                    layer.setBorderColor(Some(c.as_ref()));
-                }
-            }
-        }
-        view.setLayer(Some(&layer));
-        view
-    }
-
-    /// 边框色重读生效配置（q2 热重载）。
-    fn update_color(&self) {
-        let Some(layer) = self.layer() else { return };
-        // SAFETY: 同 new()（CGColorCreate，sRGB 空间）。
-        unsafe {
-            if let Some(space) = objc2_core_graphics::CGColorSpace::new_device_rgb() {
-                let ring = crate::host::ring_rgb();
-                let comps: [f64; 4] = [
-                    f64::from(ring.0) / 255.0,
-                    f64::from(ring.1) / 255.0,
-                    f64::from(ring.2) / 255.0,
-                    0.9,
-                ];
-                if let Some(c) = CGColor::new(Some(&*space), comps.as_ptr()) {
-                    layer.setBorderColor(Some(c.as_ref()));
-                }
-            }
-        }
     }
 }
 

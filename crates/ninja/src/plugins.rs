@@ -396,11 +396,10 @@ pub fn file_url_to_fs_path(s: &str) -> Option<String> {
     let rest = s.strip_prefix("file://")?;
     let path = if rest.starts_with('/') {
         rest
-    } else if let Some(slash) = rest.find('/') {
+    } else {
+        let slash = rest.find('/')?;
         // file://localhost/tmp 或 file://hostname/tmp
         &rest[slash..]
-    } else {
-        return None;
     };
     Some(percent_decode(path))
 }
@@ -426,8 +425,8 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(
+        if b[i] == b'%' && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(
                 std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""),
                 16,
             ) {
@@ -435,7 +434,6 @@ fn percent_decode(s: &str) -> String {
                 i += 3;
                 continue;
             }
-        }
         out.push(b[i]);
         i += 1;
     }

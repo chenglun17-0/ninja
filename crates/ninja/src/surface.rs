@@ -25,7 +25,8 @@ use objc2::rc::{Allocated, Retained};
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSEvent, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSEvent, NSFocusRingType, NSResponder, NSTextInputClient, NSTrackingArea,
+    NSTrackingAreaOptions, NSView,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSRect, NSSize, NSString,
@@ -88,6 +89,14 @@ define_class!(
             true
         }
 
+        #[unsafe(method(focusRingType))]
+        fn focus_ring_type(&self) -> NSFocusRingType {
+            NSFocusRingType::None
+        }
+
+        #[unsafe(method(drawFocusRingMask))]
+        fn draw_focus_ring_mask(&self) {}
+
         #[unsafe(method(becomeFirstResponder))]
         fn become_first_responder(&self) -> bool {
             // SAFETY: 标准 super 调用。
@@ -96,7 +105,6 @@ define_class!(
             if !s.is_null() {
                 unsafe { ghostty_surface_set_focus(s, true) };
             }
-            crate::pane::sync_focus_ring_of(self);
             ok
         }
 
@@ -108,7 +116,6 @@ define_class!(
             if !s.is_null() {
                 unsafe { ghostty_surface_set_focus(s, false) };
             }
-            crate::pane::sync_focus_ring_of(self);
             ok
         }
 
@@ -591,7 +598,9 @@ impl SurfaceHostView {
             NSSize::new(800.0, 600.0),
         );
         // SAFETY: super 的 initWithFrame:；ivars 已就位。
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        view.setFocusRingType(NSFocusRingType::None);
+        view
     }
 
     pub fn surface_opt(&self) -> Option<ghostty_surface_t> {
