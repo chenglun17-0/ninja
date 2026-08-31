@@ -75,7 +75,7 @@ ninja/
 
 - q0 嵌入底座 ✅ 2026-08-31（审计 docs/Q0-CAPABILITY-AUDIT.md，overall PASS；hit 两数据源均有 API；取证跑虚拟屏）
 - q1 壳 ✅ 2026-08-31（取证 docs/q1-evidence/：虚拟屏 E2E 45 断言全绿两轮 + 纯逻辑单测 12；⌘W 双路径只关一面、⌘⇧Enter 三态、EOF、焦点/resize 全链实测）
-- q2 配置 — 待做
+- q2 配置 ✅ 2026-08-31（取证 docs/q2-evidence/：虚拟屏 E2E 38 断言全绿 + 纯逻辑单测 11；ODP 缺省像素/Dracula 真实生效且让位/⌘G·⌘⇧P 重绑/#ff00ff 热重载像素传播/ninja.toml 收缩/q0 回归 PASS）
 - q3 插件系统 + 三门禁 — 待做
 - q4 分发 — 待做
 

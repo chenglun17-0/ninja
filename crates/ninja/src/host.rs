@@ -1,6 +1,10 @@
 //! q1 宿主单例：ghostty app/config 句柄、运行时回调（wakeup/action/
 //! clipboard/close_surface）、surface 生命周期（建/拆）与 action 全分发。
 //!
+//! q2 起：配置系统接入——生效配置的派生态（bg/焦点环/分隔条）随
+//! [`reload_config`] 刷新；RELOAD_CONFIG/CONFIG_CHANGE/TOGGLE_VISIBILITY
+//! 等配置动作进 dispatch（装载管线见 [`crate::config`]）。
+//!
 //! 所有回调都发生在主线程（action 由 app_tick 的邮箱排空或
 //! surface_key 同步触发；wakeup 只唤醒 RunLoop），与 q0 的
 //! AtomicPtr 单例同纪律：ghostty_app_tick 会同步重入 action_cb，不能用
@@ -20,14 +24,25 @@ use crate::pane;
 use crate::shell;
 use crate::surface::SurfaceHostView;
 
-/// 焦点环颜色（q1 静态：v1 ODP 光标蓝 #528bff；主题系统 q2 接）。
-pub const RING_COLOR: (u8, u8, u8) = (0x52, 0x8b, 0xff);
+/// 焦点环颜色源链：cursor-color → foreground → ODP 光标蓝（末位兑底仍是
+/// ODP 钉值）。注：cursor-color 是 ?TerminalColor 联合、无 cval——C API
+/// app 级句柄读不出（config_get 恒 false，与 link-previews 回读怪象同类），
+/// 实际链生效段是 foreground → 钉值。
+pub const RING_FALLBACK: (u8, u8, u8) = (0x52, 0x8b, 0xff);
 /// 分隔条线色（bg 提亮 ~25%）。
 const DIVIDER_LIFT: f64 = 0.25;
 
 struct Host {
     app: ghostty_app_t,
     config: ghostty_config_t,
+    /// 收缩后的 ninja.toml（q2 只解析不拉起；监督器 q3）。
+    host_config: crate::config::HostConfig,
+    /// 装载决策取证（dump 用；reload 时更新）。
+    load_info: crate::config::LoadInfo,
+    /// 热重载 mtime 快照（NSTimer 轮询比对）。
+    watch: crate::config::WatchState,
+    /// 已排期的重载拍（去重）。
+    reload_scheduled: bool,
     /// 活 surface → 其视图（Retained 持引用直到 surface_free 完成，
     /// 防 use-after-free；ghostty 回调可能晚到一拍）。
     live: Vec<(ghostty_surface_t, Retained<SurfaceHostView>)>,
@@ -38,6 +53,8 @@ struct Host {
     free_scheduled: bool,
     /// ghostty config 的 background 色（容器/分隔条/窗口 chrome 同源）。
     bg: (u8, u8, u8),
+    /// 焦点环色（cursor-color → foreground 链，见 [RING_FALLBACK]）。
+    ring: (u8, u8, u8),
 }
 
 static HOST: AtomicPtr<Host> = AtomicPtr::new(std::ptr::null_mut());
@@ -56,27 +73,33 @@ pub fn next_pane_id() -> u32 {
     NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// 建宿主（进程一次；main 里 ghostty_init 后调）。
-pub fn init(app: ghostty_app_t, config: ghostty_config_t) {
+/// 建宿主（进程一次；main 里 ghostty_init 后调）。装载管线已在
+/// [`crate::config::load_pipeline`] 跑完，这里接管句柄 + 派生态首读。
+pub fn init(app: ghostty_app_t, config: ghostty_config_t, load_info: crate::config::LoadInfo) {
     assert!(HOST.load(Ordering::Acquire).is_null(), "host already init");
-    // 背景色读一次（容器/分隔条/窗口 chrome；q1 静态，q2 主题系统接）。
-    let mut bg = ghostty_config_color_s { r: 0x16, g: 0x16, b: 0x1e };
-    unsafe {
-        ghostty_config_get(
-            config,
-            &mut bg as *mut ghostty_config_color_s as *mut c_void,
-            c"background".as_ptr(),
-            10,
+    let host_config = crate::config::load_host_config();
+    if !host_config.plugins.enabled.is_empty() {
+        // q2 只解析不拉起（监督器 q3）；空载红线：零插件进程/零 socket。
+        eprintln!(
+            "ninja: ninja.toml 启用插件 {:?}（q2 仅解析，监督器在 q3 拉起）",
+            host_config.plugins.enabled
         );
     }
-    let host = Box::new(Host {
+    let watch = crate::config::snapshot_watch(&load_info.watched);
+    let mut host = Box::new(Host {
         app,
         config,
+        host_config,
+        load_info,
+        watch,
+        reload_scheduled: false,
         live: Vec::new(),
         pending_free: Vec::new(),
         free_scheduled: false,
-        bg: (bg.r, bg.g, bg.b),
+        bg: (0x16, 0x16, 0x1e),
+        ring: RING_FALLBACK,
     });
+    refresh_derived(&mut host);
     HOST.store(Box::into_raw(host), Ordering::Release);
 }
 
@@ -99,12 +122,31 @@ pub fn shutdown() {
     }
 }
 
+/// 生效 ghostty config 句柄（菜单键位推导等短句柄读值用）。
+pub fn config() -> Option<ghostty_config_t> {
+    host_opt().map(|h| h.config)
+}
+
+/// NINJA_CFG_DUMP=<path> 时写生效配置取证 JSON（启动/热重载后调；
+/// 配置句柄与装载决策都在 Host 里，放这里最顺）。
+pub fn dump_config_if_requested() {
+    let Some(h) = host_opt() else { return };
+    if let Ok(path) = std::env::var("NINJA_CFG_DUMP") {
+        crate::config::dump_effective_config(&path, h.config, &h.load_info, &h.host_config);
+    }
+}
+
 /// 容器/分隔条底色（NSColor；pane.rs drawRect 用）。
 pub fn bg_color() -> Retained<objc2_app_kit::NSColor> {
     let Some(h) = host_opt() else {
         return gray(0x16, 0x16, 0x1e);
     };
     gray(h.bg.0, h.bg.1, h.bg.2)
+}
+
+/// 焦点环 RGB（pane.rs 焦点环 layer 边框用；cursor-color → foreground 链）。
+pub fn ring_rgb() -> (u8, u8, u8) {
+    host_opt().map(|h| h.ring).unwrap_or(RING_FALLBACK)
 }
 
 /// 分隔条 1px 线色（bg 提亮）。
@@ -124,6 +166,109 @@ fn gray(r: u8, g: u8, b: u8) -> Retained<objc2_app_kit::NSColor> {
         f64::from(b) / 255.0,
         1.0,
     )
+}
+
+// ---------------------------------------------------------------------------
+// 热重载（q2）：管线重跑 + ghostty_app_update_config + 派生态刷新
+// ---------------------------------------------------------------------------
+
+/// 从生效配置重读派生态（bg/焦点环）并刷新全部窗口 chrome/重绘。
+fn refresh_derived(h: &mut Host) {
+    h.bg = crate::config::get_color(h.config, "background").unwrap_or((0x16, 0x16, 0x1e));
+    h.ring = crate::config::get_color(h.config, "cursor-color")
+        .or_else(|| crate::config::get_color(h.config, "foreground"))
+        .unwrap_or(RING_FALLBACK);
+    // 全部窗口：背景色/阴影跟随 + 重绘（分隔条/容器底色随 drawRect 重读）。
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    for w in app.windows().iter() {
+        if let Some(container) = pane::container_of(&w) {
+            shell::apply_chrome(&w);
+            container.refresh_ring();
+            if let Some(cv) = w.contentView() {
+                cv.setNeedsDisplay(true);
+                for sub in cv.subviews() {
+                    sub.setNeedsDisplay(true);
+                }
+            }
+        }
+    }
+}
+
+/// 请求一次热重载（异步：下一拍执行，避免在 ghostty 调用栈内重入
+/// ghostty_app_update_config——RELOAD_CONFIG 可能从 surface_key 栈同步到）。
+/// 调用方：RELOAD_CONFIG action、mtime 监视拍。
+pub fn schedule_reload(reason: &str) {
+    let Some(h) = host_opt() else { return };
+    if h.reload_scheduled {
+        return;
+    }
+    h.reload_scheduled = true;
+    if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+        eprintln!("ninja: 热重载排期（{reason}）");
+    }
+    run_reload_tick_soon();
+}
+
+fn run_reload_tick_soon() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let Some(delegate) = app.delegate() else { return };
+    // SAFETY: -self 按约定返回 retain 过的引用。
+    let target: Retained<objc2::runtime::AnyObject> = unsafe { objc2::msg_send![&*delegate, self] };
+    // SAFETY: scheduledTimer 平凡；selector 由 app.rs 定义。
+    let timer = unsafe {
+        objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+            0.05,
+            &target,
+            objc2::sel!(ninjaReloadTick:),
+            None,
+            false,
+        )
+    };
+    std::mem::forget(timer); // 一次性；触发即失效
+}
+
+/// ninjaReloadTick: 实现体（app.rs 转发）：真正执行重载。
+pub fn reload_tick() {
+    let Some(h) = host_opt() else { return };
+    if !h.reload_scheduled {
+        return;
+    }
+    h.reload_scheduled = false;
+    // 1. 重跑装载管线（含 ninja.toml 重读 + 新监视集快照）。
+    let (cfg, info) = crate::config::load_pipeline();
+    let host_cfg = crate::config::load_host_config();
+    // 2. 传播：embedded 克隆新配置并下发全部 surface（字号/主题色即时
+    //    生效；CONFIG_CHANGE action 携新 config 回 dispatch——指针仅
+    //    回调内有效，我们不存）。旧句柄在传播后释放（embedded 已自持克隆）。
+    unsafe { ghostty_app_update_config(h.app, cfg) };
+    unsafe { ghostty_config_free(h.config) };
+    h.config = cfg;
+    h.load_info = info;
+    h.host_config = host_cfg;
+    h.watch = crate::config::snapshot_watch(&h.load_info.watched);
+    // 3. 派生态：bg/焦点环/窗口 chrome + 菜单键位重建 + 取证 dump。
+    refresh_derived(h);
+    crate::app::on_config_applied();
+    eprintln!(
+        "ninja: 配置已重载（用户 theme={} ODP={} 监视 {} 文件）",
+        h.load_info.user_theme, h.load_info.odp_applied, h.load_info.watched.len()
+    );
+}
+
+/// mtime 监视拍（app.rs 的 NSTimer 调）：任一配置文件变化 → 排期重载。
+pub fn watch_tick() {
+    let Some(h) = host_opt() else { return };
+    // 监视集每次重算（config-file 链可能变）。
+    let files = {
+        let mut w = crate::config::collect_ghostty_files(&crate::config::default_config_files());
+        w.push(crate::config::host_config_path());
+        w
+    };
+    if h.watch.changed(&files) {
+        schedule_reload("file-watch");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +659,53 @@ unsafe fn dispatch_action(
                 true
             }
 
-            // ---- 渲染/其余（q1 不需要；q2/q3 的面）----
+            // ---- 配置系统（q2）----
+            // ⌘⇧,（ghostty 默认 reload_config 绑定）/条件态变化（soft）：
+            // 下一拍重跑装载管线（见 schedule_reload——不在 ghostty 调用栈内
+            // 重入 update_config）。
+            GHOSTTY_ACTION_RELOAD_CONFIG => {
+                let soft = action.action.reload_config.soft;
+                schedule_reload(if soft { "reload_config(soft)" } else { "reload_config" });
+                true
+            }
+            // CONFIG_CHANGE：update_config 传播后携新 config 回调（指针仅
+            // 回调内有效）。派生态刷新由 reload_tick 统一做（swap 后）；
+            // 这里只确认接收。
+            GHOSTTY_ACTION_CONFIG_CHANGE => {
+                if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+                    eprintln!("ninja: CONFIG_CHANGE（新配置已传播全部 surface）");
+                }
+                true
+            }
+            // ninja 特有动作（插件面板）：宿主层绑 ⌘,，用户可经 ghostty
+            // keybind 统一重绑（认领空闲动作，见 crate::config 模块头）。
+            // q2 面板 UI 是 q3 交付（不做插件面板/主题切换 UI）：动作接收
+            // 如实记日志（取证可断言），q3 接真面板。
+            GHOSTTY_ACTION_TOGGLE_VISIBILITY => {
+                eprintln!(
+                    "ninja: toggle_visibility 收到（插件面板是 q3 交付，此处仅认领记录）"
+                );
+                true
+            }
+            // ghostty 默认 ⌘,=open_config 被宿主层重绑给面板；若用户又
+            // 改绑到 open_config，这里如实接收（q2 不内置编辑器，只提示）。
+            GHOSTTY_ACTION_OPEN_CONFIG => {
+                eprintln!(
+                    "ninja: open_config：编辑 ghostty 配置文件（路径见启动日志/用户配置目录）"
+                );
+                true
+            }
+            // ⌘Q（ghostty 默认 quit 绑定）与菜单 terminate: 同途。
+            GHOSTTY_ACTION_QUIT => {
+                let Some(mtm) = MainThreadMarker::new() else { return false };
+                let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+                // 标准 NSApp terminate（applicationShouldTerminate 走默认
+                // 同意，run 返回后 main 统一收尾；objc2 生成为安全方法）。
+                app.terminate(None);
+                true
+            }
+
+            // ---- 渲染/其余（q1 不需要；q3 的面）----
             GHOSTTY_ACTION_RENDER => {
                 // 嵌入 apprt 无 must_draw_from_app_thread（渲染线程自画），
                 // 该 action 不应到；防御性补一帧无害。
@@ -525,7 +716,7 @@ unsafe fn dispatch_action(
                 }
                 true
             }
-            _ => false, // MOUSE_OVER_LINK/MOUSE_SHAPE/CONFIG_CHANGE/OPEN_URL… 留 q2/q3
+            _ => false, // MOUSE_OVER_LINK/MOUSE_SHAPE/OPEN_URL… 留 q3
         }
     }
 }
@@ -566,12 +757,26 @@ unsafe extern "C" fn read_clipboard_cb(
 
 /// 剪贴板回调没有 surface 上下文（userdata 是 app 级）——取当前 key
 /// window 的焦点面（q0 demo 单面直取的推广；q1 主用法成立）。
-fn current_surface_view() -> Option<Retained<SurfaceHostView>> {
+pub fn current_surface_view() -> Option<Retained<SurfaceHostView>> {
     let mtm = MainThreadMarker::new()?;
     let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
-    let w = app.keyWindow().or_else(|| app.mainWindow())?;
-    let container = pane::container_of(&w)?;
-    container.focused_leaf().or_else(|| container.leaves().first().cloned())
+    let w = app.keyWindow().or_else(|| app.mainWindow());
+    if let Some(w) = w
+        && let Some(container) = pane::container_of(&w)
+        && let Some(leaf) = container.focused_leaf().or_else(|| container.leaves().first().cloned())
+    {
+        return Some(leaf);
+    }
+    // 兑底：无 key/main 窗口（后台启动未成 key 等）时取任一活面——
+    // 菜单键等价物经 performKeyEquivalent 到达时不依赖窗口 key 态，
+    // 单窗场景下语义等价（焦点面 = 唯一面）。
+    let h = host_opt()?;
+    for (_, view) in h.live.iter() {
+        if view.window().is_some() {
+            return Some(view.clone());
+        }
+    }
+    None
 }
 
 unsafe extern "C" fn confirm_read_clipboard_cb(

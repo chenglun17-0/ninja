@@ -791,9 +791,9 @@ impl SurfaceHostView {
         false
     }
 
-    /// 按绑定动作名执行（Edit 菜单 copy/paste/selectAll → ghostty
-    /// 绑定动作；与键位同一条路径）。
-    fn binding_action(&self, name: &str) {
+    /// 按绑定动作名执行（Edit 菜单 copy/paste/selectAll 与 q2 菜单镜像项
+    /// → ghostty 绑定动作；与键位同一条路径）。
+    pub(crate) fn binding_action(&self, name: &str) {
         let Some(s) = self.surface_opt() else { return };
         unsafe {
             ghostty_surface_binding_action(

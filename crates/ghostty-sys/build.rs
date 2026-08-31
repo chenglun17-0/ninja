@@ -33,14 +33,18 @@ fn main() {
             for f in ["fetch.sh", "build.sh", "xcrun-shim/xcrun"] {
                 println!("cargo:rerun-if-changed={}", vendor.join(f).display());
             }
-            println!(
-                "cargo:rerun-if-changed={}",
-                vendor
-                    .join("patches/0001-darwin-install-static-embed-lib.patch")
-                    .display()
-            );
+            for p in [
+                "patches/0001-darwin-install-static-embed-lib.patch",
+                "patches/0002-install-themes-on-embed-route.patch",
+            ] {
+                println!("cargo:rerun-if-changed={}", vendor.join(p).display());
+            }
             let archive = vendor.join("out/lib/libghostty-internal.a");
-            let need_build = !archive.exists() || scripts_newer_than(&vendor, &archive);
+            // 主题资源（q2：具名 theme= 解析需要）与归档同为构建产物。
+            let themes = vendor.join("out/share/ghostty/themes");
+            let need_build = !archive.exists()
+                || !themes.is_dir()
+                || scripts_newer_than(&vendor, &archive);
             if need_build {
                 let status = Command::new("bash")
                     .arg(vendor.join("build.sh"))
@@ -143,6 +147,7 @@ fn scripts_newer_than(vendor: &Path, archive: &Path) -> bool {
         vendor.join("build.sh"),
         vendor.join("xcrun-shim/xcrun"),
         vendor.join("patches/0001-darwin-install-static-embed-lib.patch"),
+        vendor.join("patches/0002-install-themes-on-embed-route.patch"),
     ];
     // 钉点源码变了（fetch.sh 校验的 COMMIT 变更）也覆盖 src/build.zig 时间戳。
     files.push(vendor.join("src/build.zig"));

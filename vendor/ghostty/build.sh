@@ -49,11 +49,17 @@ fi
 ./fetch.sh
 
 # Apply vendor patches (idempotent: reverse-apply first if already applied).
-PATCH_FILE="${PWD}/patches/0001-darwin-install-static-embed-lib.patch"
-if ! patch -R -s -N -p1 -d src --input "${PATCH_FILE}" >/dev/null 2>&1; then
-  :
-fi
-patch -s -N -p1 -d src --input "${PATCH_FILE}"
+# 0001: static embed lib on darwin (q0); 0002: bundled themes for named
+# `theme =` resolution (q2).
+for PATCH_FILE in \
+  "${PWD}/patches/0001-darwin-install-static-embed-lib.patch" \
+  "${PWD}/patches/0002-install-themes-on-embed-route.patch"
+do
+  if ! patch -R -s -N -p1 -d src --input "${PATCH_FILE}" >/dev/null 2>&1; then
+    :
+  fi
+  patch -s -N -p1 -d src --input "${PATCH_FILE}"
+done
 
 mkdir -p out
 ( cd src && zig build \
@@ -68,4 +74,5 @@ mkdir -p out
 
 test -f out/lib/libghostty-internal.a
 test -f out/include/ghostty.h
-echo "build: out/lib/libghostty-internal.a + out/include/ghostty.h" >&2
+test -d out/share/ghostty/themes
+echo "build: out/lib/libghostty-internal.a + out/include/ghostty.h + out/share/ghostty/themes" >&2

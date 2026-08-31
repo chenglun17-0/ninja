@@ -1,0 +1,24 @@
+ninja q2 shell — libghostty 1.3.2-master-+b63cfa0；配置：用户 theme=false ODP=true 监视 2 文件；资源目录 "/Users/jal/my_repos/ninja/vendor/ghostty/out/share/ghostty"
+ninja: action tag=41 has_view=false
+ninja: action tag=25 has_view=true
+ninja: action tag=22 has_view=true
+screen: NINJA_E2E_SCREEN=35（虚拟屏取证）
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: keyDown code=18 flags=0x100108 chars=Some("1") unmod=Some("1")
+2026-08-31 13:44:29.098 ninja[59959:15389391] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+ninja: action tag=15 has_view=true
+ninja: action tag=44 has_view=true
+ninja: surface_key code=18 text="1" mods=0x8 consumed=true
+ninja: action tag=32 has_view=true
+ninja: keyDown code=6 flags=0x100 chars=Some("z") unmod=Some("z")
+ninja: surface_key code=6 text="z" mods=0x0 consumed=true
+ninja: surface_key code=6 text=None mods=0x0 consumed=false
+ninja: keyDown code=43 flags=0x100100 chars=Some(",") unmod=Some(",")
+ninja: action tag=44 has_view=true
+ninja: surface_key code=43 text="," mods=0x8 consumed=false
+ninja: menu→binding_action(toggle_visibility)
+ninja: action tag=12 has_view=false
+ninja: toggle_visibility 收到（插件面板是 q3 交付，此处仅认领记录）
+ninja: action tag=12 has_view=false
+ninja: toggle_visibility 收到（插件面板是 q3 交付，此处仅认领记录）

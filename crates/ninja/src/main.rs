@@ -1,11 +1,13 @@
 //! ninja 宿主（libghostty 嵌入）。
 //!
-//! - 默认（无参数）：q1 交互壳——多窗/原生标签/分屏布局树接 libghostty
-//!   surface（[`app::run`]）。
+//! - 默认（无参数）：q2 交互壳——配置系统（ghostty 配置全量装载 + 热重载
+//!   + ODP 缺省）+ 多窗/原生标签/分屏布局树接 libghostty surface
+//!   （[`app::run`]）。
 //! - `--evidence-dir DIR`：q0 取证模式保留可重跑（[`q0_demo::run`]，
 //!   审计文档 docs/Q0-CAPABILITY-AUDIT.md 的复现入口，勿破坏）。
 
 mod app;
+mod config;
 mod host;
 mod keymap;
 mod pane;
@@ -19,6 +21,9 @@ mod surface;
 use std::path::PathBuf;
 
 fn main() {
+    // q2：具名主题解析需要 GHOSTTY_RESOURCES_DIR（resourcesdir.zig 只在
+    // ghostty_init 读一次）——两条运行路径（app/q0_demo）之前统一就位。
+    config::ensure_resources_dir();
     let args: Vec<String> = std::env::args().collect();
     let mut evidence_dir: Option<PathBuf> = None;
     let mut i = 1;
