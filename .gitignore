@@ -4,4 +4,5 @@
 !/tools/README.md
 vendor/ghostty/src/
 vendor/ghostty/out/
+scripts/e2e/virtual-display
 .DS_Store

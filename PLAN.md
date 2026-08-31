@@ -111,6 +111,16 @@ ninja/
 
 实施者与验证者不得同 thread。验证失败允许实施者修一轮，再验一次；第二次仍失败则停。
 
+### E2E 虚拟屏幕（2026-08-31 增补）
+
+GUI 取证默认在虚拟屏上跑，不打扰开发者主屏：
+
+- 工具 `scripts/e2e/virtual-display.m`（CGVirtualDisplay 私有 SPI，DeskPad 同款手法；编译命令见文件头）。`hold [w h hidpi]` 常驻创建虚拟屏（进程退出即拔屏，stdout 一行 JSON 出 displayID）；`list` / `screens` 清点（CG 层 / AppKit 层）。E2E 脚本模式：起 `hold` → 带 `NINJA_E2E_SCREEN=<displayID>` 跑宿主 → `kill` 收尾。
+- 宿主识别 `NINJA_E2E_SCREEN=<displayID>`：设置时窗口落在该 NSScreen（按 NSScreenNumber 匹配）；未设置走系统默认。这是取证钩子，不是产品配置，不进 ninja.toml。
+- 截图取证按窗口 ID（`screencapture -l` / CGWindowListCreateImage），与窗口在哪块屏无关。
+- 键盘取证优先走嵌入 API 直灌（surface key 接口），避免系统级 CGEvent 抢开发者焦点。
+- 虚拟屏不可用（无 GUI 会话、CI、别的机器）→ 回退主屏，取证输出标注实际用的屏。
+
 ## 重开条件
 
 只有这些事实才能改本合同，不能因为顺手改：
