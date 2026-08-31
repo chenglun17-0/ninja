@@ -1,10 +1,11 @@
 # ninja q0 embed demo report
-# unix 1788147296
+# unix 1788147782
 # libghostty a887df42 (zig 0.15.2, static libghostty-internal.a)
 
 wakeup_cb invocations: 2
-cell size: 17x37px (CELL_SIZE action)
-size limit: min 170x148 max 0x0 (SIZE_LIMIT action)
+screen: NINJA_E2E_SCREEN=5 (虚拟屏)
+cell size: 8x18px (CELL_SIZE action)
+size limit: min 80x72 max 0x0 (SIZE_LIMIT action)
 config_change actions: 1
 key_sequence actions: 1
 key_table actions: 0

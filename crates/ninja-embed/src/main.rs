@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use objc2::rc::Retained;
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::{msg_send, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSScreen,
     NSPasteboard, NSPasteboardTypeString, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::{kCFRunLoopCommonModes, CFRunLoopTimerContext};
@@ -57,6 +57,8 @@ struct Demo {
     step: u32,
     closing: bool,
     results: Vec<(String, bool, String)>,
+    // 取证实际用的屏（PLAN「E2E 虚拟屏幕」：NINJA_E2E_SCREEN 或主屏回退）
+    screen_note: String,
 }
 
 // SAFETY 不变量：Demo 只在主线程访问（timer_cb / action_cb / 剪贴板回调都
@@ -591,6 +593,7 @@ unsafe extern "C-unwind" fn timer_cb(
             "wakeup_cb invocations: {}\n",
             WAKEUPS.load(Ordering::Relaxed)
         ));
+        report.push_str(&format!("screen: {}\n", d.screen_note));
         if let Some((w, h)) = d.cell_size_px {
             report.push_str(&format!("cell size: {w}x{h}px (CELL_SIZE action)\n"));
         }
@@ -794,6 +797,47 @@ fn main() {
         );
         window.setTitle(&NSString::from_str("ninja q0 — libghostty embed"));
         window.setContentView(Some(&view));
+
+        // NINJA_E2E_SCREEN=<displayID>（PLAN「E2E 虚拟屏幕」增补）：窗口落到指定
+        // 虚拟屏（按 deviceDescription NSScreenNumber 匹配），不打扰主屏；
+        // 未设置/未匹配 → 主屏兜底，取证标注实际用的屏。
+        let mut screen_note = String::from("default(main)");
+        if let Ok(id) = std::env::var("NINJA_E2E_SCREEN") {
+            match id.trim().parse::<u32>() {
+                Ok(target) => {
+                    let key = NSString::from_str("NSScreenNumber");
+                    let matched = NSScreen::screens(mtm).iter().find(|s| {
+                        let desc = unsafe { s.deviceDescription() };
+                        let v: Option<Retained<objc2_foundation::NSObject>> =
+                            unsafe { msg_send![&*desc, objectForKey: &*key] };
+                        v.map(|v| {
+                            let num: isize = unsafe { msg_send![&*v, integerValue] };
+                            num as u32 == target
+                        })
+                        .unwrap_or(false)
+                    });
+                    if let Some(s) = matched {
+                        let vf = s.visibleFrame();
+                        let w = (vf.size.width - 24.0).min(940.0).max(320.0);
+                        let h = (vf.size.height - 24.0).min(620.0).max(240.0);
+                        unsafe { window.setContentSize(NSSize::new(w, h)) };
+                        window.setFrameOrigin(NSPoint::new(
+                            vf.origin.x + (vf.size.width - w) / 2.0,
+                            vf.origin.y + (vf.size.height - h) / 2.0,
+                        ));
+                        screen_note = format!("NINJA_E2E_SCREEN={target} (虚拟屏)");
+                    } else {
+                        screen_note = format!("NINJA_E2E_SCREEN={target} 未匹配，回退主屏");
+                    }
+                }
+                Err(_) => screen_note = format!("NINJA_E2E_SCREEN={id:?} 非法，回退主屏"),
+            }
+        }
+        println!("screen: {screen_note}");
+        {
+            let _ = writeln!(&log, "screen: {screen_note}");
+        }
+
         window.makeKeyAndOrderFront(None);
         app.activateIgnoringOtherApps(true);
 
@@ -837,6 +881,7 @@ fn main() {
                 step: 0,
                 closing: false,
                 results: Vec::new(),
+                screen_note,
             });
             DEMO_PTR.store(Box::into_raw(demo), Ordering::Release);
         }

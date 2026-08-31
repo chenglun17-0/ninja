@@ -1,29 +1,30 @@
-[  0.020s] action CELL_SIZE 17x37px
-[  0.020s] action SIZE_LIMIT min 170x148 max 0x0
-[  0.402s] surface size: 1880x1240px, 110x33 cells, cell 17x37px
-[  0.402s] pty: tty_name=/dev/ttys000 foreground_pid=70240
-[  0.802s] input: surface_text("echo TYPED-VIA-SURFACE-TEXT") + key ENTER (consumed=true)
+screen: NINJA_E2E_SCREEN=5 (虚拟屏)
+[  0.017s] action CELL_SIZE 8x18px
+[  0.017s] action SIZE_LIMIT min 80x72 max 0x0
+[  0.401s] surface size: 940x620px, 117x34 cells, cell 8x18px
+[  0.401s] pty: tty_name=/dev/ttys000 foreground_pid=98349
+[  0.801s] input: surface_text("echo TYPED-VIA-SURFACE-TEXT") + key ENTER (consumed=true)
 [  1.810s] read_text(viewport) 274 bytes, 前 4 行: "LJH:ninja jal$ printf 'GRID-READ-LINE-1\\nGRID-READ-LINE-2\\n' ⏎ GRID-READ-LINE-1 ⏎ GRID-READ-LINE-2 ⏎ LJH:ninja jal$ printf '\\e]8;;https://ghostty.org/q0\\e\\\\CLICKABLE-LINK\\e]8;;\\e\\\\\\n'"
 [check] grid-read-viewport: PASS — read_text(POINT_VIEWPORT) 同时拿到 initial_input 输出与键盘输入回显
-[  2.307s] read_text(region rows 1..2) = "GRID-READ-LINE-1\nGRID-READ-LINE-2"
+[  2.306s] read_text(region rows 1..2) = "GRID-READ-LINE-1\nGRID-READ-LINE-2"
 [check] grid-read-region: PASS — read_text 精确网格区域（VIEWPORT 坐标 rows 1..2）
 [  2.802s] CLICKABLE-LINK 输出行位于 row 4（⌘ 扫描从全网格兜底）
 [  2.802s] action MOUSE_SHAPE pointer（linkAtPos 命中链接）
 [  2.802s] action MOUSE_OVER_LINK url=https://ghostty.org/q0
 [  2.802s] mouse_pos(view pt, mods=⌘) row 3 col 40 -> MOUSE_OVER_LINK 触发
-[  3.410s] config link-previews = false
+[  3.409s] config link-previews = false
 [check] hyperlink-hover: PASS — MOUSE_OVER_LINK url=Some("https://ghostty.org/q0")
-[  3.736s] screenshot shot1-terminal.png (438485 bytes)
+[  3.704s] screenshot shot1-terminal.png (128777 bytes)
 [  4.115s] overlay added: 宿主 subview(wantsLayer+CALayer 50%红) 叠在 ghostty Metal 层上方
-[  4.812s] screenshot shot2-overlay.png (450939 bytes)
-[  5.209s] action KEY_SEQUENCE active=false
-[  5.209s] action CELL_SIZE 17x37px
-[  5.209s] action CONFIG_CHANGE
-[  5.209s] surface_update_config(background=3a2a5b)，config_get 校验 bg=(58,42,91)
-[  6.496s] screenshot shot3-config-change.png (333039 bytes)
+[  4.794s] screenshot shot2-overlay.png (130207 bytes)
+[  5.203s] action KEY_SEQUENCE active=false
+[  5.203s] action CELL_SIZE 8x18px
+[  5.203s] action CONFIG_CHANGE
+[  5.203s] surface_update_config(background=3a2a5b)，config_get 校验 bg=(58,42,91)
+[  6.497s] screenshot shot3-config-change.png (130906 bytes)
 [check] config-runtime-change: PASS — surface_update_config 生效（见 shot3 背景变化），CONFIG_CHANGE 回调 1 次
 [  6.610s] key_is_binding: config(⌘T)=true config(A)=false surface(⌘T)=true flags=1
 [check] key-binding-intercept: PASS — config/surface_key_is_binding：⌘T 判定为绑定、A 不是（可在派发前拦截）
-[  7.203s] report written: docs/q0-evidence/report.txt
-[  7.203s] OVERALL: PASS
-[  7.203s] teardown: surface_free → app_free → config_free → exit
+[  7.202s] report written: docs/q0-evidence/report.txt
+[  7.202s] OVERALL: PASS
+[  7.202s] teardown: surface_free → app_free → config_free → exit

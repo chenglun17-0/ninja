@@ -3,7 +3,7 @@
 - 钉点：ghostty `a887df42c56f6de86c0fe6da9c4eeca37931e083`（1.3.2-dev；`minimum_zig_version = 0.15.2`，与本机钉版 `/usr/local/bin/zig` 一致）；codeload tarball sha256 `fb4b2f9f…866b6`（fetch.sh 校验，本次实测匹配）。
 - 构建：`vendor/ghostty/build.sh` → `out/lib/libghostty-internal.a`（静态合并归档，ReleaseFast，本次 141MB）+ `out/include/ghostty.h`（1209 行公开嵌入 API）。
 - FFI：`crates/ghostty-sys`（bindgen 0.72 对安装出的 `ghostty.h` 生成绑定，静态链入；`nm target/debug/ninja-embed` 可见 `_ghostty_app_new`/`_ghostty_surface_new`/`_ghostty_surface_read_text` 等）。
-- 实测：`cargo run -p ninja-embed -- --evidence-dir docs/q0-evidence`（自驱动取证机，本次新树上跑出 **overall: PASS**，2026-08-31，unix 1788147296）。本报告所有「实测」均出自 `docs/q0-evidence/`（demo.log / report.txt / 截图 / 网格文本），可重跑复核。
+- 实测：`cargo run -p ninja-embed -- --evidence-dir docs/q0-evidence`（自驱动取证机，本次新树上跑出 **overall: PASS**，2026-08-31；按 PLAN「E2E 虚拟屏幕」增补跑在虚拟屏 `NINJA_E2E_SCREEN=5`（1920x1080 像素 1:1，`scripts/e2e/virtual-display hold` 建屏），未打扰主屏，report.txt `screen:` 行有标注）。本报告所有「实测」均出自 `docs/q0-evidence/`（demo.log / report.txt / 截图 / 网格文本），可重跑复核。
 
 ## 结论总表
 
@@ -29,7 +29,7 @@
   - 键盘回显：`surface_text("echo TYPED-VIA-SURFACE-TEXT") + key ENTER (consumed=true)` 后，视口文本里出现回显（`TYPED-VIA-SURFACE-TEXT`）——输入与渲染链路真实工作。
   - 全视口：`read_text(viewport) 274 bytes`，同时含 initial_input 的输出与键盘输入回显（`grid-read-viewport PASS`，产物 `grid-viewport.txt`）。
   - 精确区域：按全视口定位到的行号做 rows 1..2 区域读取，内容恰为 `GRID-READ-LINE-1\nGRID-READ-LINE-2`（`grid-region.txt`，`grid-read-region PASS`）——网格坐标（列×行）可精确寻址。
-- 注记：文本级读取；单元格样式/旗标（含 hyperlink 属性本身）不随文本返回。hit 若需「cell + 修饰键」语义，坐标由像素→cell 换算（`ghostty_surface_size` 给 cell 宽高；本次实测 cell 17x37px、110x33 cells）。
+- 注记：文本级读取；单元格样式/旗标（含 hyperlink 属性本身）不随文本返回。hit 若需「cell + 修饰键」语义，坐标由像素→cell 换算（`ghostty_surface_size` 给 cell 宽高；本次虚拟屏实测 cell 8x18px、117x34 cells，像素 1:1）。
 
 ## 2. hyperlink 读取：有 API，两条触发语义必须知道
 
@@ -46,16 +46,16 @@
 ## 3. 屏幕快照
 
 - 文本：**有 API** = #1 `read_text`（全视口即「屏幕文本快照」，含 SCREEN 坐标取滚动历史）。
-- 像素：**无直接 API**（头文件无 surface 像素/纹理读取函数）。**绕法**：surface 的 Metal 层挂在**宿主自持**的 NSView 里（见 #4），所以宿主可以截自己的视图层级——demo 用 `screencapture -l<windowNumber>` 实测三张（`shot1/2/3.png`，438/450/333KB），本次运行 TCC 未拦（被拦也不影响「有绕法」的结论，只影响像素证据形式）；进程内等价物 `CGWindowListCreateImage`。对 ADE `layer` 原语（宿主自建 IOSurface 合成）无影响。
+- 像素：**无直接 API**（头文件无 surface 像素/纹理读取函数）。**绕法**：surface 的 Metal 层挂在**宿主自持**的 NSView 里（见 #4），所以宿主可以截自己的视图层级——demo 用 `screencapture -l<windowNumber>` 实测三张（`shot1/2/3.png`，129/130/131KB，虚拟屏像素 1:1），本次运行 TCC 未拦（被拦也不影响「有绕法」的结论，只影响像素证据形式）；进程内等价物 `CGWindowListCreateImage`。对 ADE `layer` 原语（宿主自建 IOSurface 合成）无影响。
 
 ## 4. surface 之上合成层：有 API（结构性保证）
 
 - 结构：`ghostty_surface_config_s.platform.macos.nsview`（头文件 L449）——宿主自建 NSView 交给 ghostty；vendored 源 `src/renderer/Metal.zig` L108-111 在 macOS 上把 ghostty 的 `IOSurfaceLayer` 直接设为该 view 的 `layer`（layer-hosting view）。因此宿主对同一 view 加 subview/sublayer 即在终端之上。
-- **实测**（demo.log + `pixel-sample.swift` 相对矩形平均色，可重跑）：
+- **实测**（demo.log + `pixel-sample.swift` 相对矩形平均色，可重跑；虚拟屏像素 1:1，理论值可直接对算）：
   - t≈4.1 给宿主 view 加 42% 宽、50% 透明红 subview 后：
     - `shot1`（叠加前）：左半 (22,22,30)、右区 (21,21,29) —— 两侧同色 ≈ #16161e 背景加文本。
-    - `shot2`（叠加后）：左半 (22,22,30) 不变，右区 **(136,25,24)** 明显偏红 —— 50% 红叠在**渲染中的终端内容**之上（叠在纯 #16161e 上的理论值 ~(135,11,15)，实测偏亮来自底层文本像素透过）。
-    - `shot3`（叠加 + 改背景后）：左半 **(58,42,91)** 恰为 #3a2a5b（运行时配置改色的像素级证明），右区 (158,36,60) = 50% 红叠 #3a2a5b 加文本 —— 层与终端同时变化，顺序保持。
+    - `shot2`（叠加后）：左半 (22,22,30) 不变，右区 **(134,10,14)** —— 50% 红叠在渲染中的终端内容之上；理论值 ½(255,0,0)+½(22,22,30)=(138,11,15)，实测几乎逐字节吻合。
+    - `shot3`（叠加 + 改背景后）：左半 **(58,42,91)** 恰为 #3a2a5b（运行时配置改色的像素级证明），右区 (153,20,45) ≈ 理论值 ½(255,0,0)+½(58,42,91)=(156,21,45) —— 层与终端同时变化，顺序保持。
 - 结论：ADE `layer` 原语的「宿主合成到 surface 之上」在嵌入路径上成立（q3 再接 IOSurface 跨进程共享）。
 
 ## 5. 配置加载与运行时改：有 API
@@ -86,6 +86,7 @@
 5. **bindgen**：allowlist 仅 `ghostty_*/GHOSTTY_*`（公开嵌入面）；对**安装出的** `out/include/ghostty.h` 生成（保证与链接产物同源）；`prepend_enum_name=false` 保持头文件常量名；`-DGHOSTTY_STATIC`。
 6. 版本串 `1.3.2-master-+f3bf497`：ghostty 构建期从**所在仓库**的 git 取版本描述，vendored 源在 ninja 仓库内所以带了 ninja 的 commit——纯展示问题，不影响 API。
 7. 本次实施期修复：新写 build.sh 时 `--prefix` 误写 `${PWD}/out`（`cd src` 后展开，产物落进 src/out），实测暴露后改回 `${PWD}/../out`——上一轮该处曾因 0001/0002 补丁叠加引入过别的问题（历史 cac180e），此路径敏感，改动必须跑 `test -f out/lib/libghostty-internal.a` 兜底（已有）。
+8. **E2E 虚拟屏对齐（PLAN 2026-08-31 增补，与本阶段同期落地）**：本报告取证跑在虚拟屏上（`scripts/e2e/virtual-display hold` 建屏 → `NINJA_E2E_SCREEN=<displayID>` 落窗，`ninja-embed` 已识别该钩子；同一提交内也验证过回退路径：NINJA_E2E_SCREEN 空值/未匹配 → 主屏，report `screen:` 行标注）。虚拟屏 hidpi=0、像素 1:1，取证数值更干净。
 
 ## 红线自查（q0 范围）
 
@@ -100,7 +101,12 @@
 tools/README.md 里的方式装 zig 0.15.2   # zig version 必须是 0.15.2
 vendor/ghostty/build.sh                 # 构建（fetch 校验 + 补丁 + zig，ReleaseFast）
 cargo build                             # bindgen + 静态链入（首次自动触发上面的构建）
-cargo run -p ninja-embed -- --evidence-dir docs/q0-evidence   # 实测取证（~8s，需 GUI 会话）
+xcrun --sdk macosx clang -fobjc-arc -framework Foundation -framework CoreGraphics \
+      -framework AppKit -Wl,-undefined,dynamic_lookup \
+      scripts/e2e/virtual-display.m -o scripts/e2e/virtual-display   # E2E 虚拟屏工具（一次性）
+./scripts/e2e/virtual-display hold &    # stdout 一行 JSON 取 displayID（进程退出即拔屏）
+NINJA_E2E_SCREEN=<displayID> cargo run -p ninja-embed -- --evidence-dir docs/q0-evidence  # ~8s，需 GUI 会话
+kill %1                                 # 拔虚拟屏
 cat docs/q0-evidence/report.txt         # 五项检查 + overall
 swift docs/q0-evidence/pixel-sample.swift docs/q0-evidence/shot3-config-change.png 0.10 0.35 0.40 0.65
                                         # → (58,42,91) = #3a2a5b 像素级配置生效
