@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    # q0：libghostty 嵌入路径。宿主产品 crate（crates/ninja）随 q1 壳阶段进来。
+    "crates/ghostty-sys",
+    "crates/ninja-embed",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false

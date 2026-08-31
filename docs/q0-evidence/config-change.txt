@@ -1,0 +1,3 @@
+background = 3a2a5b
+link-previews = true
+font-size = 14
