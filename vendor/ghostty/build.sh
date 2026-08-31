@@ -75,4 +75,9 @@ mkdir -p out
 test -f out/lib/libghostty-internal.a
 test -f out/include/ghostty.h
 test -d out/share/ghostty/themes
-echo "build: out/lib/libghostty-internal.a + out/include/ghostty.h + out/share/ghostty/themes" >&2
+# embed 路线不跑 GhosttyResources：terminfo 必须另装到 resources 的兄
+# 弟目录，否则 PTY 的 TERMINFO 指向空目录，zsh zle/autosuggestions 光标
+# 回退失败，输入看起来像 llsls。
+./install-terminfo.sh "${PWD}/out/share"
+test -f out/share/terminfo/78/xterm-ghostty
+echo "build: out/lib/libghostty-internal.a + out/include/ghostty.h + out/share/ghostty/themes + out/share/terminfo" >&2

@@ -9,8 +9,8 @@ DMG 公开托管与 tap 公开发布是**后续决定**（公开分发前必须�
 
 | 脚本 | 产物 | 做什么 |
 | --- | --- | --- |
-| `scripts/package_app.sh` | `dist/Ninja.app` | `cargo build --release -p ninja`（仅宿主，**不打 ninja-preview/ninja-theme**）→ 程序化图标（`make_icon.sh` → `Resources/AppIcon.icns`，像素自检失败即中止）→ **拷 vendored ghostty 主题资源 → `Contents/Resources/ghostty`（574 主题，资源不是插件）** → 组 bundle（Info.plist 最小键集）→ 动态解析签名身份 → `codesign --force --identifier dev.ninja.ninja --options runtime` → `--verify --deep --strict` |
-| `scripts/package_dmg.sh` | `dist/Ninja-0.1.0-arm64.dmg` | staging（Ninja.app + `/Applications` 符号链接，拖拽安装）→ `hdiutil UDZO` → 挂卷自检（验签、二进制在、**插件不在**、图标两侧在、**Resources/ghostty/themes 在**）→ **再生 `scripts/tap/Casks/ninja.rb`**（version + sha256 + file:// url 钉 DMG 实物） |
+| `scripts/package_app.sh` | `dist/Ninja.app` | `cargo build --release -p ninja`（仅宿主，**不打 ninja-preview/ninja-theme**）→ 程序化图标（`make_icon.sh` → `Resources/AppIcon.icns`，像素自检失败即中止）→ **拷 vendored ghostty 主题资源 → `Contents/Resources/ghostty`（574 主题，资源不是插件）** → **tic `xterm-ghostty` terminfo → `Contents/Resources/terminfo`（与 ghostty 资源兄妹目录，libghostty 据此设 TERM/TERMINFO）** → 组 bundle（Info.plist 最小键集）→ 动态解析签名身份 → `codesign --force --identifier dev.ninja.ninja --options runtime` → `--verify --deep --strict` |
+| `scripts/package_dmg.sh` | `dist/Ninja-0.1.0-arm64.dmg` | staging（Ninja.app + `/Applications` 符号链接，拖拽安装）→ `hdiutil UDZO` → 挂卷自检（验签、二进制在、**插件不在**、图标两侧在、**Resources/ghostty/themes 在**、**terminfo/78/xterm-ghostty 在**）→ **再生 `scripts/tap/Casks/ninja.rb`**（version + sha256 + file:// url 钉 DMG 实物） |
 | `scripts/tap/` | tap 仓库模板（入库） | `Casks/ninja.rb`（生成物，勿手改）+ README（用法与 Gatekeeper 语义）；物化成独立 git 目录后 `brew tap` 接入 |
 
 - version 单源 = workspace `Cargo.toml` 的 `[workspace.package] version`（0.1.0）：
@@ -19,9 +19,12 @@ DMG 公开托管与 tap 公开发布是**后续决定**（公开分发前必须�
 - bundle id **dev.ninja.ninja**（= codesign `--identifier`，签名稳定标识）。
 - `LSMinimumSystemVersion` 取**产物二进制 LC_BUILD_VERSION minos**（11.0）。
 - `dist/` 已入 `.gitignore`（DMG/.app 不入 git）；DMG 拖拽路径与 cask 路径并存。
-- **默认零插件红线**：bundle/DMG 只有宿主二进制 + 图标 + ghostty 主题资源，
-  无 ninja-preview/ninja-theme（打包与 DMG 自检双向断言；实测见
+- **默认零插件红线**：bundle/DMG 只有宿主二进制 + 图标 + ghostty 主题资源 +
+  terminfo，无 ninja-preview/ninja-theme（打包与 DMG 自检双向断言；实测见
   [docs/q4-evidence/](docs/q4-evidence/)）。
+- **terminfo 随包**：libghostty 在设了 `GHOSTTY_RESOURCES_DIR` 时把 PTY 的
+  `TERM=xterm-ghostty`、`TERMINFO=<Resources>/terminfo`。缺这份数据库时 zsh
+  的 autosuggestions/syntax-highlighting 光标回退失败，输入会画成 `llsls`。
 - **主题资源随包**（q4 宿主唯一代码改动）：宿主 `ensure_resources_dir` 解析优先级 =
   已设 `GHOSTTY_RESOURCES_DIR`（用户覆盖/调试）> **bundle 相对**（`Contents/Resources/ghostty`）
   > build.rs 烘入的开发树绝对路径。分发机上烘入路径不存在，bundle 相对是唯一真源；

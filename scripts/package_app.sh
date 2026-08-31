@@ -14,6 +14,8 @@
 # - ghostty 主题资源（vendored 补丁 0002 装出，574 主题）是**资源不是
 #   插件**，随包进 Contents/Resources/ghostty；宿主 ensure_resources_dir
 #   按 bundle 相对路径优先解析（分发机上烘入的绝对开发路径不存在）。
+# - xterm-ghostty terminfo 随包进 Contents/Resources/terminfo（与 ghostty
+#   资源兄妹目录）。libghostty 据此设 TERM/TERMINFO；缺则 zsh zle 重绘乱字。
 # - 产物落 dist/（已 .gitignore）。DMG 见 scripts/package_dmg.sh。
 #
 # 用法：scripts/package_app.sh
@@ -23,7 +25,7 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
 APP_NAME="Ninja"
-BUNDLE_ID="dev.ninja.ninja"   # 钉死：同时是 codesign --identifier（签名稳定标识）
+BUNDLE_ID="dev.ninja.ninja" # 钉死：同时是 codesign --identifier（签名稳定标识）
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"
 GHOSTTY_RES="$ROOT/vendor/ghostty/out/share/ghostty"
@@ -31,7 +33,10 @@ GHOSTTY_RES="$ROOT/vendor/ghostty/out/share/ghostty"
 # version 单源 = workspace Cargo.toml [workspace.package]（cask / DMG 文件
 # 名 / Info.plist 全部由此派生，见 scripts/package_dmg.sh）。
 VERSION="$(awk '/^\[workspace\.package\]/{f=1} f && /^version[[:space:]]*=/{gsub(/[\" ]/,"",$3); print $3; exit}' Cargo.toml)"
-[[ -n "$VERSION" ]] || { echo "错误：读不到 workspace version（Cargo.toml）" >&2; exit 1; }
+[[ -n "$VERSION" ]] || {
+	echo "错误：读不到 workspace version（Cargo.toml）" >&2
+	exit 1
+}
 
 echo "==> [1/6] cargo build --release -p ninja（仅宿主；ninja-preview/ninja-theme 不进 bundle）"
 cargo build --release -p ninja
@@ -40,11 +45,11 @@ cargo build --release -p ninja
 #（rustc 对 aarch64-apple-darwin 的默认部署目标 = 11.0；objc2 0.6 /
 # app-kit 0.3 声明的支持下限比它宽，但低于 minos 的声明是谎——dyld 在
 # 更旧的系统上拒载该二进制。实机：macOS 26.6.1 arm64）。
-MIN_SYS_VER="$(otool -l target/release/ninja \
-  | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')"
+MIN_SYS_VER="$(otool -l target/release/ninja |
+	awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')"
 if [[ -z "$MIN_SYS_VER" ]]; then
-  echo "错误：读不到二进制 LC_BUILD_VERSION minos（otool）" >&2
-  exit 1
+	echo "错误：读不到二进制 LC_BUILD_VERSION minos（otool）" >&2
+	exit 1
 fi
 echo "    LSMinimumSystemVersion = ${MIN_SYS_VER}（二进制 minos，见脚本注释）"
 
@@ -62,14 +67,20 @@ echo "==> [3/6] ghostty 主题资源随包 → Contents/Resources/ghostty"
 # 插件约束不变）。宿主 resolve bundle 相对（Contents/Resources/ghostty）
 # 优先于 build.rs 烘入的绝对开发路径（config.rs ensure_resources_dir）。
 [[ -d "$GHOSTTY_RES/themes" ]] || {
-  echo "错误：$GHOSTTY_RES/themes 不存在（先跑 vendor/ghostty/build.sh）" >&2; exit 1; }
+	echo "错误：$GHOSTTY_RES/themes 不存在（先跑 vendor/ghostty/build.sh）" >&2
+	exit 1
+}
 ditto "$GHOSTTY_RES" "$APP/Contents/Resources/ghostty"
 THEME_N="$(find "$APP/Contents/Resources/ghostty/themes" -type f | wc -l | tr -d ' ')"
 echo "    themes：${THEME_N} 个文件（开发树同源）"
+# terminfo 与 ghostty 资源兄妹目录（Exec.zig TERMINFO=dirname(resources)/terminfo）。
+# 缺这一步时 TERM=xterm-ghostty 但库找不到，zsh-autosuggestions/syntax-highlighting
+# 重绘光标失败，打 ls 会显示成 ~ llsls。
+"$ROOT/vendor/ghostty/install-terminfo.sh" "$APP/Contents/Resources"
 
 echo "==> [4/6] Info.plist（最小键集 + CFBundleIconFile）"
 
-cat > "$APP/Contents/Info.plist" <<EOF
+cat >"$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -102,23 +113,29 @@ EOF
 # 图标引用自检（回归）：资源与 plist 钥必须同时在、指向一致——任一
 # 侧缺失/错名 = Finder/Dock 静默回退通用图标，肉眼难察，必须机器断言。
 [[ -f "$APP/Contents/Resources/AppIcon.icns" ]] || {
-  echo "错误：Resources/AppIcon.icns 缺失" >&2; exit 1; }
+	echo "错误：Resources/AppIcon.icns 缺失" >&2
+	exit 1
+}
 [[ "$(plutil -extract CFBundleIconFile raw "$APP/Contents/Info.plist")" == "AppIcon.icns" ]] || {
-  echo "错误：Info.plist CFBundleIconFile ≠ AppIcon.icns" >&2; exit 1; }
+	echo "错误：Info.plist CFBundleIconFile ≠ AppIcon.icns" >&2
+	exit 1
+}
 [[ "$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" == "$VERSION" ]] || {
-  echo "错误：Info.plist CFBundleShortVersionString ≠ $VERSION" >&2; exit 1; }
+	echo "错误：Info.plist CFBundleShortVersionString ≠ $VERSION" >&2
+	exit 1
+}
 
 echo "==> [5/6] 解析签名身份（security find-identity；缺真实身份 = 失败）"
-IDENTITIES="$(security find-identity -v -p codesigning \
-  | sed -n 's/^[[:space:]]*[0-9]*)[[:space:]]*[A-Fa-f0-9]* "\(.*\)"$/\1/p' \
-  || true)"
+IDENTITIES="$(security find-identity -v -p codesigning |
+	sed -n 's/^[[:space:]]*[0-9]*)[[:space:]]*[A-Fa-f0-9]* "\(.*\)"$/\1/p' ||
+	true)"
 if [[ -z "$IDENTITIES" ]]; then
-  echo "错误：钥匙串里没有可用代码签名身份。不打包 adhoc 副本（假分发）。" >&2
-  exit 1
+	echo "错误：钥匙串里没有可用代码签名身份。不打包 adhoc 副本（假分发）。" >&2
+	exit 1
 fi
 IDENTITY="$(grep -m1 '^Developer ID Application' <<<"$IDENTITIES" || true)"
 if [[ -z "$IDENTITY" ]]; then
-  IDENTITY="$(head -n1 <<<"$IDENTITIES")"
+	IDENTITY="$(head -n1 <<<"$IDENTITIES")"
 fi
 echo "    身份：$IDENTITY"
 
@@ -127,25 +144,38 @@ echo "==> [6/6] codesign（identifier=${BUNDLE_ID}，hardened runtime）"
 # 同形——将来补 Developer ID 即可走 notarytool，无需重打签名策略）；
 # 宿主无 JIT/无动态库插件，运行时不受限。adhoc linker 签名被本步覆盖。
 codesign --force \
-  --identifier "$BUNDLE_ID" \
-  --options runtime \
-  --sign "$IDENTITY" \
-  "$APP"
+	--identifier "$BUNDLE_ID" \
+	--options runtime \
+	--sign "$IDENTITY" \
+	"$APP"
 
 echo "==> 验签（--deep --strict）"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 echo "==> spctl 评估（2026-08-31 决策：不购 Developer ID、不公证——预期不通过，如实记录，见 DISTRIBUTION.md）"
 if spctl -a -vv "$APP"; then
-  echo "    spctl 通过（有 Developer ID——非预期但如实记录）"
+	echo "    spctl 通过（有 Developer ID——非预期但如实记录）"
 else
-  echo "    spctl 不通过（Apple Development 签名，非 Developer ID）：按决策如实记录"
+	echo "    spctl 不通过（Apple Development 签名，非 Developer ID）：按决策如实记录"
 fi
 
 echo "==> bundle 内容清点（零插件断言：无 ninja-preview/ninja-theme）"
 find "$APP" -type f -not -path '*/Resources/ghostty/*' | sort
-[[ ! -e "$APP/Contents/MacOS/ninja-preview" ]] || { echo "错误：bundle 进了 ninja-preview" >&2; exit 1; }
-[[ ! -e "$APP/Contents/MacOS/ninja-theme" ]] || { echo "错误：bundle 进了 ninja-theme" >&2; exit 1; }
-[[ "$THEME_N" -gt 500 ]] || { echo "错误：主题资源异常少（${THEME_N}）" >&2; exit 1; }
+[[ ! -e "$APP/Contents/MacOS/ninja-preview" ]] || {
+	echo "错误：bundle 进了 ninja-preview" >&2
+	exit 1
+}
+[[ ! -e "$APP/Contents/MacOS/ninja-theme" ]] || {
+	echo "错误：bundle 进了 ninja-theme" >&2
+	exit 1
+}
+[[ "$THEME_N" -gt 500 ]] || {
+	echo "错误：主题资源异常少（${THEME_N}）" >&2
+	exit 1
+}
+[[ -f "$APP/Contents/Resources/terminfo/78/xterm-ghostty" ]] || {
+	echo "错误：bundle 缺 terminfo/78/xterm-ghostty" >&2
+	exit 1
+}
 
 echo "完成：${APP}（version=${VERSION}，身份：${IDENTITY}）"
