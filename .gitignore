@@ -1,18 +1,7 @@
-# rust
 /target
-
-# p7 分发产物（scripts/package_app.sh / package_dmg.sh 落点）
 /dist
-
-# 本地工具链（zig 钉版 tarball 解压目录），见 tools/README.md
 /tools/*
 !/tools/README.md
-# D-C 取证脚本（CPU 压力/空闲探针，可复跑对比）：入库
-!/tools/cpu_pressure_probe.sh
-!/tools/spinner_pressure_probe.sh
-!/tools/idle_cpu_probe.sh
-
-# q0 vendored libghostty（钉 a887df42）：源码与构建产物不入库
-# （fetch.sh 钉 commit + tarball sha256 校验获取；build.sh 出 libghostty-internal.a）。
 vendor/ghostty/src/
 vendor/ghostty/out/
+.DS_Store
