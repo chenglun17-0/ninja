@@ -109,7 +109,10 @@ static int cmdHold(int argc, const char *argv[]) {
         desc.sizeInMillimeters = CGSizeMake(600, 340);
         desc.vendorID = 0xE2E2;
         desc.productID = 0xE2E1;
-        desc.serialNum = 0xE2E1;
+        // serial 每实例唯一（pid）：多个 hold 可共存，且残留实例不会因
+        // 同标识去重把新实例的创建拒掉（WindowServer 对同 vendor/product/
+        // serial 的虚拟屏去重——固定 serial 曾让验证员残留的 hold 堵死新建）。
+        desc.serialNum = (unsigned int)getpid();
 
         CGVirtualDisplay *vd = [[CGVirtualDisplay alloc] initWithDescriptor:desc];
         if (vd == nil) { fprintf(stderr, "CGVirtualDisplay create failed\n"); return 1; }

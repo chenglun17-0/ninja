@@ -103,10 +103,11 @@ fn check(demo: &mut Demo, name: &str, ok: bool, detail: String) {
 // ghostty runtime 回调
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn wakeup_cb(_userdata: *mut c_void) {
+extern "C" fn wakeup_cb(_userdata: *mut c_void) {
     WAKEUPS.fetch_add(1, Ordering::Relaxed);
     // 可能从 IO/渲染线程调用：只唤醒主 RunLoop，主线程 timer 里 app_tick
-    //（CFRunLoop 唤醒线程安全；objc2-core-foundation 0.3 的 wake_up 是安全方法）。
+    //（CFRunLoop 唤醒线程安全；函数体无 unsafe 操作，签名无需 unsafe——
+    //  安全 extern "C" fn 可协变到 bindgen 的 unsafe fn 指针类型）。
     objc2_core_foundation::CFRunLoop::main().unwrap().wake_up();
 }
 
@@ -280,7 +281,8 @@ unsafe extern "C" fn write_clipboard_cb(
     }
 }
 
-unsafe extern "C" fn close_surface_cb(_userdata: *mut c_void, process_alive: bool) {
+extern "C" fn close_surface_cb(_userdata: *mut c_void, process_alive: bool) {
+    // 函数体无 unsafe 操作（d_opt 是安全封装）；签名无需 unsafe。
     let Some(d) = d_opt() else { return };
     log_line(d, &format!("close_surface_cb process_alive={process_alive}"));
     d.closing = true; // 主循环拆卸
@@ -330,7 +332,7 @@ unsafe extern "C-unwind" fn timer_cb(
             action: GHOSTTY_ACTION_PRESS,
             mods: GHOSTTY_MODS_NONE,
             consumed_mods: GHOSTTY_MODS_NONE,
-            keycode: GHOSTTY_KEY_ENTER as u32,
+            keycode: GHOSTTY_KEY_ENTER,
             text: b"\r\0".as_ptr() as *const c_char,
             unshifted_codepoint: '\r' as u32,
             composing: false,
@@ -406,7 +408,7 @@ unsafe extern "C-unwind" fn timer_cb(
         log_line(d, &format!("CLICKABLE-LINK 输出行位于 row {lr}（⌘ 扫描从全网格兜底）"));
         // mouse_pos 语义同 macOS AppKit mouseMoved：view points、原点在「上」
         // （mouseMoved 传 frame.height - pos.y；embedded.zig cursorPosToPixels 只缩放）。
-        let scale = d.window.backingScaleFactor() as f64;
+        let scale = d.window.backingScaleFactor();
         let (cw_pt, ch_pt) = (
             size.cell_width_px as f64 / scale,
             size.cell_height_px as f64 / scale,
@@ -481,11 +483,10 @@ unsafe extern "C-unwind" fn timer_cb(
                 let l = CALayer::new();
                 // 50% 透明红
                 let comps: [f64; 4] = [1.0, 0.0, 0.0, 0.5];
-                if let Some(space) = objc2_core_graphics::CGColorSpace::new_device_rgb() {
-                    if let Some(c) = CGColor::new(Some(space.as_ref()), comps.as_ptr()) {
+                if let Some(space) = objc2_core_graphics::CGColorSpace::new_device_rgb()
+                    && let Some(c) = CGColor::new(Some(space.as_ref()), comps.as_ptr()) {
                         l.setBackgroundColor(Some(c.as_ref()));
                     }
-                }
                 l.setBorderWidth(3.0);
                 let b2 = overlay.bounds();
                 l.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), b2.size));
@@ -557,8 +558,8 @@ unsafe extern "C-unwind" fn timer_cb(
     if d.step == 11 && t > 6.6 {
         d.step = 12;
         unsafe {
-            let cmd_t = key_event(GHOSTTY_KEY_T as u32, GHOSTTY_MODS_SUPER, b"t\0");
-            let plain_a = key_event(GHOSTTY_KEY_A as u32, GHOSTTY_MODS_NONE, b"a\0");
+            let cmd_t = key_event(GHOSTTY_KEY_T, GHOSTTY_MODS_SUPER, b"t\0");
+            let plain_a = key_event(GHOSTTY_KEY_A, GHOSTTY_MODS_NONE, b"a\0");
             let is_bind_cfg_t = ghostty_config_key_is_binding(d.config, cmd_t);
             let is_bind_cfg_a = ghostty_config_key_is_binding(d.config, plain_a);
             let mut flags: ghostty_binding_flags_e = 0;
@@ -751,7 +752,7 @@ fn main() {
                 i += 2;
             }
             other => {
-                eprintln!("unknown arg {other}; usage: ninja-embed [--evidence-dir DIR]");
+                eprintln!("unknown arg {other}; usage: ninja [--evidence-dir DIR]");
                 std::process::exit(2);
             }
         }
@@ -807,11 +808,11 @@ fn main() {
                 Ok(target) => {
                     let key = NSString::from_str("NSScreenNumber");
                     let matched = NSScreen::screens(mtm).iter().find(|s| {
-                        let desc = unsafe { s.deviceDescription() };
+                        let desc = s.deviceDescription();
                         let v: Option<Retained<objc2_foundation::NSObject>> =
-                            unsafe { msg_send![&*desc, objectForKey: &*key] };
+                            msg_send![&*desc, objectForKey: &*key];
                         v.map(|v| {
-                            let num: isize = unsafe { msg_send![&*v, integerValue] };
+                            let num: isize = msg_send![&*v, integerValue];
                             num as u32 == target
                         })
                         .unwrap_or(false)
@@ -820,7 +821,7 @@ fn main() {
                         let vf = s.visibleFrame();
                         let w = (vf.size.width - 24.0).min(940.0).max(320.0);
                         let h = (vf.size.height - 24.0).min(620.0).max(240.0);
-                        unsafe { window.setContentSize(NSSize::new(w, h)) };
+                        window.setContentSize(NSSize::new(w, h));
                         window.setFrameOrigin(NSPoint::new(
                             vf.origin.x + (vf.size.width - w) / 2.0,
                             vf.origin.y + (vf.size.height - h) / 2.0,
@@ -843,7 +844,7 @@ fn main() {
 
         let scale = window
             .screen()
-            .map(|s| s.backingScaleFactor() as f64)
+            .map(|s| s.backingScaleFactor())
             .unwrap_or(2.0);
 
         // 4. ghostty app + runtime 回调

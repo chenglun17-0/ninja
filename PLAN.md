@@ -71,6 +71,14 @@ ninja/
 
 执行单位是**一个阶段**。每个阶段：盘点 → 实施 → 独立验证。验证失败则停。不要一次做完整条链。
 
+### 进度
+
+- q0 嵌入底座 ✅ 2026-08-31（审计 docs/Q0-CAPABILITY-AUDIT.md，overall PASS；hit 两数据源均有 API；取证跑虚拟屏）
+- q1 壳 — 待做
+- q2 配置 — 待做
+- q3 插件系统 + 三门禁 — 待做
+- q4 分发 — 待做
+
 ### q0 嵌入底座
 
 做：钉版构建 libghostty；Rust FFI；一个 AppKit 窗口挂一个 surface，跑 shell、能输入能渲染。

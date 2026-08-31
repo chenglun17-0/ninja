@@ -2,8 +2,8 @@
 
 - 钉点：ghostty `a887df42c56f6de86c0fe6da9c4eeca37931e083`（1.3.2-dev；`minimum_zig_version = 0.15.2`，与本机钉版 `/usr/local/bin/zig` 一致）；codeload tarball sha256 `fb4b2f9f…866b6`（fetch.sh 校验，本次实测匹配）。
 - 构建：`vendor/ghostty/build.sh` → `out/lib/libghostty-internal.a`（静态合并归档，ReleaseFast，本次 141MB）+ `out/include/ghostty.h`（1209 行公开嵌入 API）。
-- FFI：`crates/ghostty-sys`（bindgen 0.72 对安装出的 `ghostty.h` 生成绑定，静态链入；`nm target/debug/ninja-embed` 可见 `_ghostty_app_new`/`_ghostty_surface_new`/`_ghostty_surface_read_text` 等）。
-- 实测：`cargo run -p ninja-embed -- --evidence-dir docs/q0-evidence`（自驱动取证机，本次新树上跑出 **overall: PASS**，2026-08-31；按 PLAN「E2E 虚拟屏幕」增补跑在虚拟屏 `NINJA_E2E_SCREEN=5`（1920x1080 像素 1:1，`scripts/e2e/virtual-display hold` 建屏），未打扰主屏，report.txt `screen:` 行有标注）。本报告所有「实测」均出自 `docs/q0-evidence/`（demo.log / report.txt / 截图 / 网格文本），可重跑复核。
+- FFI：`crates/ghostty-sys`（bindgen 0.72 对安装出的 `ghostty.h` 生成绑定，静态链入；`nm target/debug/ninja` 可见 `_ghostty_app_new`/`_ghostty_surface_new`/`_ghostty_surface_read_text` 等）。
+- 实测：`cargo run -p ninja -- --evidence-dir docs/q0-evidence`（自驱动取证机，本次新树上跑出 **overall: PASS**，2026-08-31；按 PLAN「E2E 虚拟屏幕」增补跑在虚拟屏 `NINJA_E2E_SCREEN=5`（1920x1080 像素 1:1，`scripts/e2e/virtual-display hold` 建屏），未打扰主屏，report.txt `screen:` 行有标注）。本报告所有「实测」均出自 `docs/q0-evidence/`（demo.log / report.txt / 截图 / 网格文本），可重跑复核。
 
 ## 结论总表
 
@@ -86,11 +86,11 @@
 5. **bindgen**：allowlist 仅 `ghostty_*/GHOSTTY_*`（公开嵌入面）；对**安装出的** `out/include/ghostty.h` 生成（保证与链接产物同源）；`prepend_enum_name=false` 保持头文件常量名；`-DGHOSTTY_STATIC`。
 6. 版本串 `1.3.2-master-+f3bf497`：ghostty 构建期从**所在仓库**的 git 取版本描述，vendored 源在 ninja 仓库内所以带了 ninja 的 commit——纯展示问题，不影响 API。
 7. 本次实施期修复：新写 build.sh 时 `--prefix` 误写 `${PWD}/out`（`cd src` 后展开，产物落进 src/out），实测暴露后改回 `${PWD}/../out`——上一轮该处曾因 0001/0002 补丁叠加引入过别的问题（历史 cac180e），此路径敏感，改动必须跑 `test -f out/lib/libghostty-internal.a` 兜底（已有）。
-8. **E2E 虚拟屏对齐（PLAN 2026-08-31 增补，与本阶段同期落地）**：本报告取证跑在虚拟屏上（`scripts/e2e/virtual-display hold` 建屏 → `NINJA_E2E_SCREEN=<displayID>` 落窗，`ninja-embed` 已识别该钩子；同一提交内也验证过回退路径：NINJA_E2E_SCREEN 空值/未匹配 → 主屏，report `screen:` 行标注）。虚拟屏 hidpi=0、像素 1:1，取证数值更干净。
+8. **E2E 虚拟屏对齐（PLAN 2026-08-31 增补，与本阶段同期落地）**：本报告取证跑在虚拟屏上（`scripts/e2e/virtual-display hold` 建屏 → `NINJA_E2E_SCREEN=<displayID>` 落窗，`ninja`（宿主 crate，2026-08-31 由 ninja-embed 更名，对齐 PLAN 目标树）已识别该钩子；同一提交内也验证过回退路径：NINJA_E2E_SCREEN 空值/未匹配 → 主屏，report `screen:` 行标注）。虚拟屏 hidpi=0、像素 1:1，取证数值更干净。
 
 ## 红线自查（q0 范围）
 
-- 不建插件运行时/socket/进程：本次树只有 `ghostty-sys` + `ninja-embed` 两个 crate，无任何插件、协议、spawn 代码；空载路径零插件。
+- 不建插件运行时/socket/进程：本次树只有 `ghostty-sys` + `ninja` 两个 crate（宿主原落名 ninja-embed，同日更名），无任何插件、协议、spawn 代码；空载路径零插件。
 - 不做 Agent、图片/PDF 预览、市场、Linux：无相关代码。
 - 不重度 fork Ghostty：仅 `patches/0001`（+7 行，darwin 静态安装）；q2 范围的 0002（themes）本次不加。
 - 只做本阶段：q1 的 window/tab/split、q2 的配置系统均未开工。
@@ -105,7 +105,7 @@ xcrun --sdk macosx clang -fobjc-arc -framework Foundation -framework CoreGraphic
       -framework AppKit -Wl,-undefined,dynamic_lookup \
       scripts/e2e/virtual-display.m -o scripts/e2e/virtual-display   # E2E 虚拟屏工具（一次性）
 ./scripts/e2e/virtual-display hold &    # stdout 一行 JSON 取 displayID（进程退出即拔屏）
-NINJA_E2E_SCREEN=<displayID> cargo run -p ninja-embed -- --evidence-dir docs/q0-evidence  # ~8s，需 GUI 会话
+NINJA_E2E_SCREEN=<displayID> cargo run -p ninja -- --evidence-dir docs/q0-evidence  # ~8s，需 GUI 会话
 kill %1                                 # 拔虚拟屏
 cat docs/q0-evidence/report.txt         # 五项检查 + overall
 swift docs/q0-evidence/pixel-sample.swift docs/q0-evidence/shot3-config-change.png 0.10 0.35 0.40 0.65

@@ -1,5 +1,5 @@
 [package]
-name = "ninja-embed"
+name = "ninja"
 description = "q0: libghostty 嵌入最小验证——AppKit 窗口挂一个 surface，跑 bash、能输入能渲染，并留能力审计取证"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "ninja-embed"
+name = "ninja"
 path = "src/main.rs"
 
 [dependencies]
