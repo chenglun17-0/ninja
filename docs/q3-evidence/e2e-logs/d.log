@@ -1,0 +1,32 @@
+ninja q0 embed demo — evidence: /tmp/nq3-d
+libghostty 1.3.2-master-+b63cfa0 mode=2
+screen: NINJA_E2E_SCREEN=50 (虚拟屏)
+[  0.011s] action CELL_SIZE 8x18px
+[  0.011s] action SIZE_LIMIT min 80x72 max 0x0
+[  0.402s] surface size: 940x620px, 117x34 cells, cell 8x18px
+[  0.402s] pty: tty_name=/dev/ttys000 foreground_pid=39351
+[  0.802s] input: surface_text("echo TYPED-VIA-SURFACE-TEXT") + key ENTER (consumed=true)
+[  1.810s] read_text(viewport) 677 bytes, 前 4 行: "clear ⏎ printf 'GRID-READ-LINE-1\\nGRID-READ-LINE-2\\n' ⏎ printf '\\e]8;;https://ghostty.org/q0\\e\\\\CLICKABLE-LINK\\e]8;;\\e\\\\\\n' ⏎ Last login: Mon Aug 31 15:45:11 on ttys000"
+[check] grid-read-viewport: PASS — read_text(POINT_VIEWPORT) 同时拿到 initial_input 输出与键盘输入回显
+[  2.307s] read_text(region rows 11..12) = "GRID-READ-LINE-1\nGRID-READ-LINE-2"
+[check] grid-read-region: PASS — read_text 精确网格区域（VIEWPORT 坐标 rows 11..12）
+[  2.802s] CLICKABLE-LINK 输出行位于 row 14（⌘ 扫描从全网格兜底）
+[  2.803s] action MOUSE_SHAPE pointer（linkAtPos 命中链接）
+[  2.803s] action MOUSE_OVER_LINK url=https://ghostty.org/q0
+[  2.803s] mouse_pos(view pt, mods=⌘) row 2 col 20 -> MOUSE_OVER_LINK 触发
+[  3.410s] config link-previews = false
+[check] hyperlink-hover: PASS — MOUSE_OVER_LINK url=Some("https://ghostty.org/q0")
+[  3.705s] screenshot shot1-terminal.png (160633 bytes)
+[  4.116s] overlay added: 宿主 subview(wantsLayer+CALayer 50%红) 叠在 ghostty Metal 层上方
+[  4.818s] screenshot shot2-overlay.png (162490 bytes)
+[  5.205s] action KEY_SEQUENCE active=false
+[  5.205s] action CELL_SIZE 8x18px
+[  5.205s] action CONFIG_CHANGE
+[  5.205s] surface_update_config(background=3a2a5b)，config_get 校验 bg=(58,42,91)
+[  6.517s] screenshot shot3-config-change.png (164733 bytes)
+[check] config-runtime-change: PASS — surface_update_config 生效（见 shot3 背景变化），CONFIG_CHANGE 回调 1 次
+[  6.609s] key_is_binding: config(⌘T)=true config(A)=false surface(⌘T)=true flags=1
+[check] key-binding-intercept: PASS — config/surface_key_is_binding：⌘T 判定为绑定、A 不是（可在派发前拦截）
+[  7.203s] report written: /tmp/nq3-d/report.txt
+[  7.203s] OVERALL: PASS
+[  7.203s] teardown: surface_free → app_free → config_free → exit

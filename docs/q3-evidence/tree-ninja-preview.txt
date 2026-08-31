@@ -1,0 +1,55 @@
+ninja-preview v0.1.0 (/Users/jal/my_repos/ninja/crates/ninja-preview)
+├── ninja-protocol v0.1.0 (/Users/jal/my_repos/ninja/crates/ninja-protocol)
+│   ├── serde v1.0.229
+│   │   ├── serde_core v1.0.229
+│   │   └── serde_derive v1.0.229 (proc-macro)
+│   │       ├── proc-macro2 v1.0.107
+│   │       │   └── unicode-ident v1.0.24
+│   │       ├── quote v1.0.47
+│   │       │   └── proc-macro2 v1.0.107 (*)
+│   │       └── syn v3.0.4
+│   │           ├── proc-macro2 v1.0.107 (*)
+│   │           ├── quote v1.0.47 (*)
+│   │           └── unicode-ident v1.0.24
+│   └── serde_json v1.0.151
+│       ├── itoa v1.0.18
+│       ├── memchr v2.8.3
+│       ├── serde_core v1.0.229
+│       └── zmij v1.0.23
+├── objc2 v0.6.4
+│   └── objc2-encode v4.1.0
+├── objc2-core-foundation v0.3.2
+│   ├── bitflags v2.13.1
+│   ├── block2 v0.6.2
+│   │   └── objc2 v0.6.4 (*)
+│   ├── dispatch2 v0.3.1
+│   │   ├── bitflags v2.13.1
+│   │   └── objc2 v0.6.4 (*)
+│   ├── libc v0.2.189
+│   └── objc2 v0.6.4 (*)
+├── objc2-core-graphics v0.3.2
+│   ├── bitflags v2.13.1
+│   ├── block2 v0.6.2 (*)
+│   ├── dispatch2 v0.3.1 (*)
+│   ├── libc v0.2.189
+│   ├── objc2 v0.6.4 (*)
+│   ├── objc2-core-foundation v0.3.2 (*)
+│   └── objc2-metal v0.3.2
+│       ├── bitflags v2.13.1
+│       ├── objc2 v0.6.4 (*)
+│       └── objc2-foundation v0.3.2
+│           ├── bitflags v2.13.1
+│           └── objc2 v0.6.4 (*)
+├── objc2-core-text v0.3.2
+│   ├── bitflags v2.13.1
+│   ├── block2 v0.6.2 (*)
+│   ├── libc v0.2.189
+│   ├── objc2 v0.6.4 (*)
+│   ├── objc2-core-foundation v0.3.2 (*)
+│   └── objc2-core-graphics v0.3.2 (*)
+└── objc2-io-surface v0.3.2
+    ├── bitflags v2.13.1
+    ├── libc v0.2.189
+    ├── objc2 v0.6.4 (*)
+    ├── objc2-core-foundation v0.3.2 (*)
+    └── objc2-foundation v0.3.2 (*)

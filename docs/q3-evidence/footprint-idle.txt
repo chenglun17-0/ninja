@@ -1,0 +1,3 @@
+ninja idle footprint median: 94798832 bytes
+ghostty 1.3.0 footprint median: 169379016 bytes
+ratio ninja/ghostty = 0.560

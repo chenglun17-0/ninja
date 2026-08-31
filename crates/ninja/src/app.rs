@@ -45,6 +45,10 @@ pub struct Ivars {
     zoom_file: RefCell<Option<String>>,
     /// zoom 钩子上次已应用的内容（去抖）。
     zoom_last: RefCell<Option<String>>,
+    /// q3 面板取证钩子：NINJA_PANEL_PLUGIN_FILE 轮询的文件路径。
+    panel_file: RefCell<Option<String>>,
+    /// 面板钩子上次已应用的行集（去抖）。
+    panel_last: RefCell<Option<String>>,
     /// 本壳持有的窗口强引用（v1 红线：close 期间必须有人持有，close
     /// 完成后延迟一拍释放）。
     pub windows: RefCell<Vec<Retained<NSWindow>>>,
@@ -80,6 +84,10 @@ define_class!(
             {
                 window.makeFirstResponder(Some(crate::surface::as_responder(first)));
             }
+
+            // q3：启用即拉起——runloop 就绪后拉起全部 enabled 插件
+            //（空载无分发器 = 无操作，红线不变）。
+            crate::plugins::spawn_startup_plugins();
 
             // 拉前台（deprecated 但行为稳定，v1 同款）。
             #[allow(deprecated)]
@@ -136,6 +144,26 @@ define_class!(
             // "cfgdump"（写 NINJA_CFG_DUMP）、"reloadcfg"（⌘⇧, 同途的
             // 绑定驱动热重载）与 "panel"（binding_action(toggle_visibility)
             // 直证 ninja 特有动作进 dispatch）。E2E 用。
+            // q3 面板取证钩子：NINJA_PANEL_PLUGIN_FILE=<path> 每 0.2s 读
+            // 文件，每行 "<name> on|off" 驱动面板开关（与 UI checkbox 同
+            // 一条路径，免 CGEvent）。E2E 用。
+            if let Ok(f) = std::env::var("NINJA_PANEL_PLUGIN_FILE") {
+                self.ivars().panel_file.replace(Some(f));
+                // SAFETY: 同上（-self 返回 retain 过的引用）。
+                let target: Retained<objc2::runtime::AnyObject> = unsafe { msg_send![self, self] };
+                // SAFETY: scheduledTimer 平凡。
+                let timer = unsafe {
+                    objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                        0.2,
+                        &target,
+                        objc2::sel!(ninjaPanelTick:),
+                        None,
+                        true,
+                    )
+                };
+                std::mem::forget(timer); // 进程生命期常驻
+            }
+
             if let Ok(f) = std::env::var("NINJA_ZOOM_FILE") {
                 self.ivars().zoom_file.replace(Some(f));
                 // SAFETY: 同上（-self 返回 retain 过的引用）。
@@ -164,6 +192,14 @@ define_class!(
                 eprintln!("ninja: terminateAfterLastWindowClosed? -> true");
             }
             true
+        }
+
+        // q3：terminate: 直接 exit(0)、Rust 栈不展开、静态槽不 drop——
+        // 插件面（子进程/层/色板覆盖/socket 文件）必须在这里显式收
+        //（幂等；SIGKILL 路径的 socket 尸体由下次启动 sweep 清扫）。
+        #[unsafe(method(applicationWillTerminate:))]
+        fn applicationWillTerminate(&self, _notification: &NSNotification) {
+            crate::plugins::host_shutdown();
         }
 
         #[unsafe(method(applicationDidBecomeActive:))]
@@ -559,6 +595,38 @@ define_class!(
             host::reload_tick();
         }
 
+        /// q3 面板钩子拍：NINJA_PANEL_PLUGIN_FILE 每行 "<name> on|off"
+        /// 驱动面板开关（与 UI 同路；内容去抖）。
+        #[unsafe(method(ninjaPanelTick:))]
+        fn ninja_panel_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            let Some(path) = self.ivars().panel_file.borrow().clone() else {
+                return;
+            };
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let content = raw.trim().to_string();
+            if content.is_empty()
+                || self.ivars().panel_last.borrow().as_deref() == Some(content.as_str())
+            {
+                return;
+            }
+            *self.ivars().panel_last.borrow_mut() = Some(content.clone());
+            for line in content.lines().map(str::trim) {
+                let Some((name, on)) = line
+                    .rsplit_once(char::is_whitespace)
+                    .map(|(n, o)| (n.trim(), o.trim()))
+                else {
+                    continue;
+                };
+                match on {
+                    "on" | "1" | "true" => crate::panel::toggle_from_hook(name, true),
+                    "off" | "0" | "false" => crate::panel::toggle_from_hook(name, false),
+                    other => eprintln!("ninja: NINJA_PANEL_PLUGIN_FILE 行 {line:?} 的开关值 {other:?} 无效（on|off）"),
+                }
+            }
+        }
+
         /// 配置文件 mtime 监视拍（0.5s repeating）。
         #[unsafe(method(ninjaConfigTick:))]
         fn ninja_config_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
@@ -814,6 +882,8 @@ pub fn run() {
         selftest: RefCell::new(None),
         zoom_file: RefCell::new(None),
         zoom_last: RefCell::new(None),
+        panel_file: RefCell::new(None),
+        panel_last: RefCell::new(None),
         windows: RefCell::new(Vec::new()),
         closing: RefCell::new(Vec::new()),
         prune_scheduled: Cell::new(false),

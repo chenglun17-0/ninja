@@ -78,10 +78,13 @@ pub fn next_pane_id() -> u32 {
 pub fn init(app: ghostty_app_t, config: ghostty_config_t, load_info: crate::config::LoadInfo) {
     assert!(HOST.load(Ordering::Acquire).is_null(), "host already init");
     let host_config = crate::config::load_host_config();
+    // q3 监督器：enabled 空 = 空载（不 bind socket 不拉进程，红线不变）；
+    // 非空 = 绑定 ${TMPDIR}/ninja-ade-{pid}.sock（拉起发生在 runloop
+    // 就绪后，app 的 applicationDidFinishLaunching）。
+    crate::plugins::init(crate::plugins::PluginsConfig::from(&host_config.plugins));
     if !host_config.plugins.enabled.is_empty() {
-        // q2 只解析不拉起（监督器 q3）；空载红线：零插件进程/零 socket。
         eprintln!(
-            "ninja: ninja.toml 启用插件 {:?}（q2 仅解析，监督器在 q3 拉起）",
+            "ninja: ninja.toml 启用插件 {:?}（启用即拉起，监督器见 plugins.rs）",
             host_config.plugins.enabled
         );
     }
@@ -110,6 +113,9 @@ pub fn shutdown() {
     if p.is_null() {
         return;
     }
+    // q3：插件面先收（幂等；terminate: 路径经 applicationWillTerminate
+    // 已收过一遍，这里防御 app.run 返回的罕见路径）。
+    crate::plugins::host_shutdown();
     let mut host = unsafe { Box::from_raw(p) };
     let mut all = std::mem::take(&mut host.live);
     all.append(&mut host.pending_free);
@@ -329,6 +335,8 @@ pub fn close_leaf_deferred(view: &SurfaceHostView) {
     let Some(surface) = view.surface_opt() else {
         return;
     };
+    // q3：pane 关闭先收它的插件层（摘 overlay + 通知插件）。
+    crate::plugins::host_close_layers_of_pane(view.pane_id());
     // 先断开（view 不再收事件），再从 live 摘、进延迟队列。
     view.ivars().surface.set(std::ptr::null_mut());
     let Some(host) = host_opt() else { return };
@@ -679,14 +687,46 @@ unsafe fn dispatch_action(
             }
             // ninja 特有动作（插件面板）：宿主层绑 ⌘,，用户可经 ghostty
             // keybind 统一重绑（认领空闲动作，见 crate::config 模块头）。
-            // q2 面板 UI 是 q3 交付（不做插件面板/主题切换 UI）：动作接收
-            // 如实记日志（取证可断言），q3 接真面板。
+            // q3：面板 UI（⌘, 开关 = panel::toggle_visibility）。
             GHOSTTY_ACTION_TOGGLE_VISIBILITY => {
-                eprintln!(
-                    "ninja: toggle_visibility 收到（插件面板是 q3 交付，此处仅认领记录）"
-                );
+                eprintln!("ninja: toggle_visibility 收到（⌘, → 插件面板）");
+                crate::panel::toggle_visibility();
                 true
             }
+            // q3 hit 适配器——链接源：ghostty 的 ⌘+click（over_link 时
+            // processLinks → openUrl → 本 action）。这里接管返回 true，
+            // 由 plugins.rs 广播 hit 仲裁（claim → 插件；无认领 →
+            // /usr/bin/open 系统默认），避免 ghostty 内置 fallback。
+            GHOSTTY_ACTION_OPEN_URL => {
+                let u = action.action.open_url;
+                let url = if u.url.is_null() {
+                    String::new()
+                } else {
+                    let bytes = std::slice::from_raw_parts(u.url as *const u8, u.len);
+                    String::from_utf8_lossy(bytes).to_string()
+                };
+                if let Some(v) = view.as_deref() {
+                    crate::plugins::handle_open_url(v, &url);
+                }
+                true
+            }
+            // hover 链接通知（⌘+hover 的预览链由 ghostty 内核门控，宿主
+            // 只记录；点击路径走 OPEN_URL，不依赖本 action）。
+            GHOSTTY_ACTION_MOUSE_OVER_LINK => {
+                let u = action.action.mouse_over_link;
+                let url = if u.url.is_null() {
+                    String::new()
+                } else {
+                    let bytes = std::slice::from_raw_parts(u.url as *const u8, u.len);
+                    String::from_utf8_lossy(bytes).to_string()
+                };
+                if std::env::var_os("NINJA_ADE_DEBUG").is_some() && !url.is_empty() {
+                    eprintln!("ninja[ade]: hover link {url:?}");
+                }
+                true
+            }
+            // 光标形状：AppKit 指针光标由系统/默认处理，认领防 fallback 噪声。
+            GHOSTTY_ACTION_MOUSE_SHAPE => true,
             // ghostty 默认 ⌘,=open_config 被宿主层重绑给面板；若用户又
             // 改绑到 open_config，这里如实接收（q2 不内置编辑器，只提示）。
             GHOSTTY_ACTION_OPEN_CONFIG => {
@@ -716,7 +756,7 @@ unsafe fn dispatch_action(
                 }
                 true
             }
-            _ => false, // MOUSE_OVER_LINK/MOUSE_SHAPE/OPEN_URL… 留 q3
+            _ => false
         }
     }
 }

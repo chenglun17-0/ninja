@@ -59,6 +59,11 @@ use std::time::SystemTime;
 
 use ghostty_sys::*;
 
+/// q3：插件主题覆盖层文件名（plugins.rs 的 theme.set 适配器写；装载序
+/// 压用户文件之后、finalize 之前——finalize 的 loadTheme 重放会把这层
+/// 压顶，见模块头）。
+pub const PLUGIN_THEME_LAYER_FILE: &str = "plugin-theme.conf";
+
 /// vendored 构建烘进来的 ghostty 资源目录（含 themes/；无则空串）。
 pub const BAKED_RESOURCES_DIR: &str = env!("NINJA_GHOSTTY_RESOURCES_DIR");
 
@@ -414,6 +419,37 @@ pub fn load_host_config() -> HostConfig {
     }
 }
 
+/// q3 面板写回：把 `[plugins] enabled` 名单写回 ninja.toml（toml 往返：
+/// 其它段与键保留，注释/格式不保——面板是机器写入方，手写文件请自行
+/// 备份；文件不存在则创建）。返回写入路径。
+pub fn write_plugins_enabled(enabled: &[String]) -> std::io::Result<PathBuf> {
+    let path = host_config_path();
+    let mut value: toml::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok())
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    if !value.is_table() {
+        value = toml::Value::Table(toml::map::Map::new()); // 顶层坏值：重建
+    }
+    let table = value.as_table_mut().expect("顶层是表");
+    let plugins = table
+        .entry("plugins".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if !plugins.is_table() {
+        *plugins = toml::Value::Table(toml::map::Map::new());
+    }
+    plugins["enabled"] = toml::Value::Array(
+        enabled.iter().map(|s| toml::Value::String(s.clone())).collect(),
+    );
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = toml::to_string(&value)
+        .map_err(|e| std::io::Error::other(format!("toml 序列化失败：{e}")))?;
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
 // ---------------------------------------------------------------------------
 // 装载管线
 // ---------------------------------------------------------------------------
@@ -425,6 +461,8 @@ pub struct LoadInfo {
     pub user_theme: bool,
     /// ODP 层是否装载。
     pub odp_applied: bool,
+    /// 插件主题覆盖层是否装载（q3：theme.set 适配器；色板名）。
+    pub plugin_theme: Option<String>,
     /// 层文件目录。
     pub layer_dir: PathBuf,
     /// 监视的配置文件集（热重载用）。
@@ -476,6 +514,8 @@ pub fn load_pipeline() -> (ghostty_config_t, LoadInfo) {
     };
     let user_theme = user_sets_theme(&ghostty_files);
     let odp_applied = !user_theme;
+    // q3：插件主题覆盖（theme.set 适配器写层文件压顶）。
+    let plugin_theme = crate::plugins::plugin_theme_override();
 
     let dir = layer_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -484,6 +524,12 @@ pub fn load_pipeline() -> (ghostty_config_t, LoadInfo) {
     let odp_layer = dir.join(ODP_LAYER_FILE);
     if odp_applied {
         let _ = std::fs::write(&odp_layer, odp_layer_text());
+    }
+    let plugin_layer = dir.join(PLUGIN_THEME_LAYER_FILE);
+    if let Some((_, text)) = &plugin_theme {
+        let _ = std::fs::write(&plugin_layer, text);
+    } else {
+        let _ = std::fs::remove_file(&plugin_layer);
     }
 
     unsafe {
@@ -497,11 +543,17 @@ pub fn load_pipeline() -> (ghostty_config_t, LoadInfo) {
         }
         ghostty_config_load_default_files(cfg);
         ghostty_config_load_recursive_files(cfg);
+        // 插件主题层：压用户文件之后、finalize 之前——loadTheme 的
+        // _replay_steps 重放会把这层压在一切之上（q3 theme.set 适配器）。
+        if plugin_theme.is_some() {
+            load_file_cfg(cfg, &plugin_layer);
+        }
         ghostty_config_finalize(cfg);
         let diagnostics = print_diagnostics(cfg);
         (cfg, LoadInfo {
             user_theme,
             odp_applied,
+            plugin_theme: plugin_theme.map(|(name, _)| name),
             layer_dir: dir,
             watched,
             diagnostics,
@@ -819,6 +871,13 @@ pub fn dump_effective_config(
     ));
     s.push_str(&format!("  \"user_theme\": {},\n", info.user_theme));
     s.push_str(&format!("  \"odp_applied\": {},\n", info.odp_applied));
+    s.push_str(&format!(
+        "  \"plugin_theme\": {},\n",
+        info.plugin_theme
+            .as_deref()
+            .map(json_str)
+            .unwrap_or_else(|| "null".into())
+    ));
     s.push_str(&format!(
         "  \"layer_dir\": {},\n",
         json_str(&info.layer_dir.to_string_lossy())

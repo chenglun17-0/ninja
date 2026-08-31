@@ -1,0 +1,60 @@
+virtual display: 54 (frame x=)
+
+== A ODP 缺省主题（隔离：无任何用户配置）
+(App Support 真实配置已暂存 1 个)
+  [PASS] A1 ODP 层装载（user_theme=False）
+  [PASS] A2 background=#282c34（ODP）
+  [PASS] A3 foreground=#abb2bf（ODP）
+  [PASS] A4 ANSI16=ODP 钉值
+  [PASS] A5 像素背景 ≈ #282c34（像素 40,44,52，期望 [40,44,52]±10）
+  (记录) link_previews_readback=True（q0 审计怪象：surface 层动作实际放行）
+
+== B 用户既有配置常用子集直接生效（App Support 正宗位置：theme/字号/键位）
+(App Support 真实配置已暂存 1 个)
+  [PASS] B1 theme=Dracula 探测 → ODP 让位
+  [PASS] B2 Dracula bg/fg 生效（具名主题真实解析）
+  [PASS] B3 Dracula ANSI 生效（themes 资源目录）
+  [PASS] B4 用户 font-size=18 生效
+  [PASS] B5 用户 keybind 重绑生效（⌘⇧O→new_split:right）
+  [PASS] B6 像素背景 ≈ Dracula #282a36（像素 40,42,54，期望 [40,42,54]±10）
+
+== C 键位继承 + 热重载（隔离：XDG 配置驱动）
+(App Support 真实配置已暂存 1 个)
+  [PASS] C0 启动即装载 XDG 用户配置（font-size=24）
+  [PASS] C1 重绑生效：⌘G→new_split:right（trigger 表）
+  [PASS] C2 真键 ⌘G 触发 new_split:right（leaves） = 2
+  [PASS] C3 NEW_SPLIT action 经 action_cb 分发（c.log）
+  [PASS] C4 mtime 热重载：⌘G 不再绑 split（回默认 ⌘D，配置自默认表重建）
+  [PASS] C5 旧绑定失效：⌘G 不再分屏 = 2
+  [PASS] C6 新绑定动作生效 decrease_font_size（cols 81→85）
+  [PASS] C7 真键 ⌘T 经菜单等价物→binding_action(new_tab)（派生键位）
+  [PASS] C7b NEW_TAB action 到 dispatch（c.log）
+  [PASS] C8 reload_config action 路径热重载（⌘⇧, 同途）
+  [PASS] C8b 重载后 background=#ff00ff（dump）
+  [PASS] C10 热重载像素：背景 → 品红（强对比）（像素 255,0,255，期望 [255,0,255]±10）
+  [PASS] C9 重载日志（c.log「配置已重载」）
+  [PASS] C9b CONFIG_CHANGE 回调（update_config 传播）
+
+== D ninja 特有动作重绑（⌘,=ignore、⌘⇧P=toggle_visibility）
+(App Support 真实配置已暂存 1 个)
+  [PASS] D1 toggle_visibility 重绑 ⌘⇧P（宿主层 ⌘, 认领被用户覆盖）
+  [PASS] D2 旧键 ⌘, 失效（ignore）
+  [PASS] D3 新键 ⌘⇧P → TOGGLE_VISIBILITY action 到宿主 dispatch（d.log）
+  [PASS] D4 binding_action(toggle_visibility) 直驱 dispatch（累计次数） = 2
+
+== E ninja.toml 收缩（v1 键警告忽略；[plugins] 只解析不拉起）
+  [PASS] E1 [keys] 警告（语义不复活）
+  [PASS] E2 终端项警告（走 ghostty 配置）
+  [PASS] E2b [theme] 段警告
+  [PASS] E2c [plugins] 启用即拉起提示（q3 监督器）
+  [PASS] E3 [plugins] 解析收下
+  [PASS] E4 解析失败降级为未启用（监督器边界）
+  [PASS] E5 宿主 unix socket 数（ADE socket 1 个） = 1
+
+== F q0 取证模式回归（--evidence-dir）
+  [PASS] F1 q0 模式 exit 0
+  [PASS] F2 q0 report.txt overall: PASS
+
+== 结果：PASS=38 FAIL=0
+PASS=38 FAIL=0
+OVERALL: PASS

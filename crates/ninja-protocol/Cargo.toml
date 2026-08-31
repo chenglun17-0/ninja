@@ -1,0 +1,16 @@
+[package]
+name = "ninja-protocol"
+description = "ADE 协议 v0：六类消息 + u32le 长度前缀 UTF-8 JSON 帧编解码（v/type 信封、版本门）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 纯数据类型 + JSON。不依赖宿主 ninja / ninja-preview / ninja-theme，也
+# 不依赖任何运行时（socket/线程 一概没有）——第二语言实现只看文档。
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[example]]
+name = "dump_messages"

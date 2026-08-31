@@ -4,6 +4,10 @@ members = [
     # q0：libghostty 嵌入路径。宿主产品 crate（crates/ninja）随 q1 壳阶段进来。
     "crates/ghostty-sys",
     "crates/ninja",
+    # q3：ADE 协议 v0（纯数据类型 + 帧编解码）与两个官方示例插件。
+    "crates/ninja-protocol",
+    "crates/ninja-preview",
+    "crates/ninja-theme",
 ]
 
 [workspace.package]
@@ -11,3 +15,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ninja-protocol = { path = "crates/ninja-protocol" }

@@ -339,12 +339,16 @@ start_app e 0
 grep -q "\[keys\] 已收缩" "$LOGDIR/e.log" && ok "E1 [keys] 警告（语义不复活）" || bad "E1 [keys] 警告缺失"
 grep -qE "(shell|font-family|font-size).{0,40}已收缩" "$LOGDIR/e.log" && ok "E2 终端项警告（走 ghostty 配置）" || bad "E2 终端项警告缺失"
 grep -q "\`theme\` 已收缩" "$LOGDIR/e.log" && ok "E2b [theme] 段警告" || bad "E2b [theme] 警告缺失"
-grep -q "仅解析" "$LOGDIR/e.log" && ok "E2c [plugins] 只解析提示" || bad "E2c 提示缺失"
+# q3 起 [plugins] 语义升级为「启用即拉起」（监督器上线）——提示语更换。
+grep -q "启用即拉起" "$LOGDIR/e.log" && ok "E2c [plugins] 启用即拉起提示（q3 监督器）" || bad "E2c 提示缺失"
 assert_json /tmp/nq2-e/dump.json "d['plugins_enabled']==['preview','theme']" "E3 [plugins] 解析收下"
-# 空载红线：无插件进程；宿主 unix socket 零。
-if ! pgrep -laf "ninja-preview|ninja-theme" | grep -v grep; then ok "E4 零插件进程（q2 不拉起）"; else bad "E4 出现插件进程"; fi
+# q3 语义：enabled 非空 → 监督器上线（bind socket + 按名拉起）。本段
+# fixture 的名字（preview/theme + 不存在的 paths）解析不到二进制 →
+# 「找不到二进制 → 降级为未启用」路径的取证（真实拉起/回收链在
+# q3-evidence B/C 段）。空载红线（默认零插件零 socket）也在 q3 A 段回归。
+grep -q '找不到二进制.*降级为未启用' "$LOGDIR/e.log" && ok "E4 解析失败降级为未启用（监督器边界）" || bad "E4 降级日志缺失"
 LSOF=$(lsof -a -U -p "$APP_PID" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
-assert_eq "E5 宿主 unix socket 数（零插件 socket）" 0 "$LSOF"
+assert_eq "E5 宿主 unix socket 数（ADE socket 1 个）" 1 "$LSOF"
 cp /tmp/nq2-e/dump.json "$EV/e-dump.json"
 stop_app
 unset NINJA_CONFIG

@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 ghostty-sys = { path = "../ghostty-sys" }
+# q3：ADE 协议（纯数据类型 + 帧编解码）。
+ninja-protocol.workspace = true
 libc = "0.2"
 # q2 配置：ninja.toml 收缩后的解析（[plugins] 等）。
 toml = "0.9"
@@ -50,12 +52,30 @@ objc2-app-kit = { version = "0.3", features = [
     "NSMenuItem",
     "NSTextInputClient",
     "NSTrackingArea",
+    # q3 插件面板：开关与状态行。
+    "NSButton",
+    "NSControl",
+    "NSTextField",
 ] }
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer"] }
+# q3 层原语：全局 IOSurface（跨进程共享像素）。
+objc2-io-surface = "0.3"
 # 覆盖层取证：NSColor → CGColor 填 CALayer 背景。
-objc2-core-graphics = { version = "0.3", features = ["CGColor"] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGColor",
+    "CGColorSpace",
+    # q3 层原语：present 时 IOSurface 像素拷贝成 CGImage，LayerView 的
+    # drawRect 里画进 layer-backed 内容。
+    "CGDataProvider",
+    "CGImage",
+    "CGContext",
+] }
 objc2-core-foundation = { version = "0.3", features = [
     "CFBase",
     "CFRunLoop",
     "CFString",
+    # q3 层原语：IOSurface 属性字典 + present 像素拷贝（CFData）。
+    "CFDictionary",
+    "CFNumber",
+    "CFData",
 ] }

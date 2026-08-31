@@ -11,6 +11,9 @@ mod config;
 mod host;
 mod keymap;
 mod pane;
+// q3：插件监督器 + 适配器与插件面板。
+mod panel;
+mod plugins;
 // q0 取证机原样保留（审计文档复现依赖其行为与输出；q0 时代的 lint
 // 噪声不随之重构）。
 #[allow(deprecated, clippy::manual_c_str_literals, clippy::unnecessary_cast, clippy::ptr_arg, clippy::collapsible_if, clippy::manual_clamp)]

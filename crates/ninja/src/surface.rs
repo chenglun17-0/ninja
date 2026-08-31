@@ -55,8 +55,12 @@ pub struct Ivars {
     max_px: Cell<Option<(u32, u32)>>,
     /// INITIAL_SIZE（逻辑 points；仅首面/未显示窗口应用一次）。
     pub initial_pt: Cell<Option<(u32, u32)>>,
-    /// CELL_SIZE（px；make_window 的默认 80x24 定窗用）。
+    /// CELL_SIZE（px；make_window 的默认 80x24 定窗用。q3 hit 的像素→
+    /// cell 换算改用网格占比（见 plugins.rs point_to_cell 的取舍记录），
+    /// 本字段只服务窗口定尺寸）。
     pub cell_px: Cell<Option<(u32, u32)>>,
+    /// 上次 push_size 推过的视图尺寸（points；变化 = resize → q3 收层）。
+    pub last_pushed_pt: Cell<Option<(f64, f64)>>,
 }
 
 define_class!(
@@ -166,6 +170,18 @@ define_class!(
                 self.interpret(event);
                 return;
             };
+            // q3：插件键盘路由先行——本 pane 有插件层（层前台）或已授予
+            // 热键命中时，键事件转 input.key 给插件，不进终端。
+            if crate::plugins::key_route(
+                self,
+                event.keyCode(),
+                keymap::mods_from_flags(event.modifierFlags().0 as u64),
+                event
+                    .charactersIgnoringModifiers()
+                    .map(|c| c.to_string()),
+            ) {
+                return;
+            }
             let action = if event.isARepeat() {
                 GHOSTTY_ACTION_REPEAT
             } else {
@@ -258,8 +274,15 @@ define_class!(
         fn mouse_up(&self, event: &NSEvent) {
             let Some(s) = self.surface_opt() else { return };
             let mods = keymap::mods_from_flags(event.modifierFlags().0 as u64);
+            // q3 hit：点击上下文先登记（OPEN_URL action 在下面的 release
+            // 调用里同步重入时分发——链接源）。
+            crate::plugins::click_begin(self, self.point_of_event(event), mods);
             unsafe { ghostty_surface_mouse_button(s, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods) };
             unsafe { ghostty_surface_mouse_pressure(s, 0, 0.0) };
+            // q3 hit：链接源没分发过且是 ⌘+click → 网格源路径识别。
+            if let Some((_pane, row, col, proto_mods)) = crate::plugins::click_end(self) {
+                crate::plugins::handle_grid_hit(self, row, col, proto_mods);
+            }
         }
 
         #[unsafe(method(rightMouseDown:))]
@@ -559,6 +582,7 @@ impl SurfaceHostView {
             max_px: Cell::new(None),
             initial_pt: Cell::new(None),
             cell_px: Cell::new(None),
+            last_pushed_pt: Cell::new(None),
         });
         // 默认内容尺寸（80x24 近似；surface 就绪后 INITIAL_SIZE/CELL_SIZE
         // 会校准窗口）。
@@ -627,6 +651,21 @@ impl SurfaceHostView {
             .map(|w| w.backingScaleFactor())
             .unwrap_or(2.0)
             .max(1.0);
+        if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+            eprintln!(
+                "ninja: push_size pane={} bounds=({:.1},{:.1}) scale={scale}",
+                self.pane_id(),
+                b.size.width,
+                b.size.height
+            );
+        }
+        // q3：几何变了 → 本 pane 的插件层回收（v0 层不跟随 resize 重排，
+        // 收掉由插件下次 claim 重开）。
+        let now = (b.size.width, b.size.height);
+        if self.ivars().last_pushed_pt.get().is_some_and(|prev| prev != now) {
+            crate::plugins::host_close_layers_of_pane(self.pane_id());
+        }
+        self.ivars().last_pushed_pt.set(Some(now));
         unsafe {
             ghostty_surface_set_content_scale(s, scale, scale);
             ghostty_surface_set_size(

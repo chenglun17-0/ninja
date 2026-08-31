@@ -65,6 +65,15 @@ pub fn make_window(
     // SAFETY: 布尔 setter，无别名风险。
     unsafe { window.setReleasedWhenClosed(false) };
 
+    // E2E 虚拟屏落位在**建面之前**：建面首推 push_size 读窗口所在屏的
+    // backingScaleFactor——先落位保证首推就用目标屏的 scale（先建面再
+    // 移屏会留下 2x→1x 的记账错位：渲染挤压 + 底部暗带，q3 hit 的行
+    // 读取/像素换算全漂移，实测踩过；app.rs 的居中只对非 E2E 路径）。
+    let on_e2e_screen = std::env::var_os("NINJA_E2E_SCREEN").is_some();
+    if on_e2e_screen {
+        place_on_e2e_screen(&window);
+    }
+
     // 首叶 surface（建面统一走 inherited_config 传 context）。
     let first = container.first_leaf();
     let parent = parent.filter(|p| p.surface_opt().is_some());
@@ -123,6 +132,15 @@ fn place_on_e2e_screen(window: &NSWindow) {
         vf.origin.x + (vf.size.width - w) / 2.0,
         vf.origin.y + (vf.size.height - h) / 2.0,
     ));
+    // 落屏后重推 surface 几何：建面时窗口未上屏（backingScale 取主屏），
+    // 跨屏移动若 scale 变化必须重推 content_scale/size——否则 surface
+    // 以旧 scale 记账（px 网格与视图 points 错位：q3 hit 的行读取与
+    // 像素换算全部漂移，实测虚拟屏 1x vs 主屏 2x 踩过）。
+    if let Some(container) = crate::pane::container_of(window) {
+        for leaf in container.leaves() {
+            leaf.push_size();
+        }
+    }
     println!("screen: NINJA_E2E_SCREEN={target}（虚拟屏取证）");
 }
 
