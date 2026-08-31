@@ -79,18 +79,15 @@ pub fn make_window(
     let first = container.first_leaf();
     let parent = parent.filter(|p| p.surface_opt().is_some());
     host::attach_surface(&first, context, parent);
-    // INITIAL_SIZE action（surface_new 期间已到）：未显示窗口按它定内容
-    // 尺寸。默认配置 window-width/height=0（无 INITIAL_SIZE）——退回
-    // CELL_SIZE × 80x24 的默认窗（v1 同款语义；scale 反算 points）。
-    if !window.isVisible() {
-        let size = first
-            .ivars()
-            .initial_pt
-            .get()
-            .or_else(|| default_initial_pt(&window, &first));
-        if let Some((w, h)) = size {
-            window.setContentSize(objc2_foundation::NSSize::new(w as f64, h as f64));
-        }
+    // Ghostty：window-width 与 window-height 都 >0 才发 INITIAL_SIZE（格子
+    // × cell + padding）。都为 0（缺省）时 AppKit 本尊用 SurfaceView
+    // 800×600，不按 80×24 缩窗。Ninja 同款：有 INITIAL_SIZE 才覆盖。
+    if !window.isVisible()
+        && let Some((w, h)) = first.ivars().initial_pt.get()
+        && w > 0
+        && h > 0
+    {
+        window.setContentSize(objc2_foundation::NSSize::new(w as f64, h as f64));
     }
     place_on_e2e_screen(&window);
     window
@@ -101,12 +98,16 @@ pub fn make_window(
 /// 尺寸夹到 visibleFrame 内；未设置/未匹配 → 系统默认不动。这是取证
 /// 钩子，不是产品配置。
 fn place_on_e2e_screen(window: &NSWindow) {
-    let Ok(id) = std::env::var("NINJA_E2E_SCREEN") else { return };
+    let Ok(id) = std::env::var("NINJA_E2E_SCREEN") else {
+        return;
+    };
     let Ok(target) = id.trim().parse::<u32>() else {
         println!("screen: NINJA_E2E_SCREEN={id:?} 非法，回退系统默认");
         return;
     };
-    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
     let key = NSString::from_str("NSScreenNumber");
     let matched = NSScreen::screens(mtm).iter().find(|s| {
         let desc = s.deviceDescription();
@@ -143,19 +144,6 @@ fn place_on_e2e_screen(window: &NSWindow) {
         }
     }
     println!("screen: NINJA_E2E_SCREEN={target}（虚拟屏取证）");
-}
-
-/// CELL_SIZE(px) × (80, 24) → 内容 points（INITIAL_SIZE 缺省时）。
-fn default_initial_pt(
-    window: &objc2_app_kit::NSWindow,
-    first: &crate::surface::SurfaceHostView,
-) -> Option<(u32, u32)> {
-    let (cw, ch) = first.ivars().cell_px.get()?;
-    let scale = window.backingScaleFactor().max(1.0);
-    Some((
-        (f64::from(cw) * 80.0 / scale).ceil() as u32,
-        (f64::from(ch) * 24.0 / scale).ceil() as u32,
-    ))
 }
 
 /// Ghostty 默认 `macos-titlebar-style = transparent`：标题栏透明、底色 =
@@ -342,7 +330,9 @@ pub fn new_tab(mtm: MainThreadMarker, parent: Option<&SurfaceHostView>) -> Retai
         .as_ref()
         .and_then(|w| container_of(w))
         .and_then(|c| c.focused_leaf().or_else(|| c.leaves().first().cloned()));
-    let parent = parent.filter(|p| p.surface_opt().is_some()).or(from_host.as_deref());
+    let parent = parent
+        .filter(|p| p.surface_opt().is_some())
+        .or(from_host.as_deref());
     let w = make_window(mtm, parent, ghostty_sys::GHOSTTY_SURFACE_CONTEXT_TAB);
     match &host_window {
         Some(host) => {

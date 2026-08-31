@@ -626,7 +626,9 @@ unsafe fn dispatch_action(
                 view.ivars().initial_pt.set(Some((s.width, s.height)));
                 // 只对未显示窗口生效（建窗流程 make_window 消费；运行中
                 // 的窗口不被字体/配置变化重置——macOS 本尊同款只管新窗）。
-                if let Some(w) = view.window()
+                // width/height 为 0 表示配置没钉格子数，保持 800×600 缺省。
+                if s.width > 0 && s.height > 0
+                    && let Some(w) = view.window()
                     && !w.isVisible()
                 {
                     w.setContentSize(objc2_foundation::NSSize::new(

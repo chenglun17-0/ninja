@@ -55,7 +55,7 @@ pub struct Ivars {
     max_px: Cell<Option<(u32, u32)>>,
     /// INITIAL_SIZE（逻辑 points；仅首面/未显示窗口应用一次）。
     pub initial_pt: Cell<Option<(u32, u32)>>,
-    /// CELL_SIZE（px；make_window 的默认 80x24 定窗用。q3 hit 的像素→
+    /// CELL_SIZE（px；窗口约束/取证用。q3 hit 的像素→
     /// cell 换算改用网格占比（见 plugins.rs point_to_cell 的取舍记录），
     /// 本字段只服务窗口定尺寸）。
     pub cell_px: Cell<Option<(u32, u32)>>,
@@ -584,11 +584,11 @@ impl SurfaceHostView {
             cell_px: Cell::new(None),
             last_pushed_pt: Cell::new(None),
         });
-        // 默认内容尺寸（80x24 近似；surface 就绪后 INITIAL_SIZE/CELL_SIZE
-        // 会校准窗口）。
+        // Ghostty AppKit SurfaceView 默认 800×600；window-width/height
+        // 都 >0 时 INITIAL_SIZE 再校准。
         let frame = NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(590.0, 390.0),
+            NSSize::new(800.0, 600.0),
         );
         // SAFETY: super 的 initWithFrame:；ivars 已就位。
         unsafe { msg_send![super(this), initWithFrame: frame] }
