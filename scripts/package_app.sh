@@ -24,14 +24,14 @@ VERSION="0.1.0"               # 与 workspace.package version 一致
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"
 
-echo "==> [1/5] cargo build --release -p ninja（仅宿主；ninja-preview/ninja-theme 不进 bundle）"
-cargo build --release -p ninja
+echo "==> [1/5] cargo build --release -p ninja-embed（仅宿主；ninja-preview/ninja-theme 不进 bundle）"
+cargo build --release -p ninja-embed
 
 # LSMinimumSystemVersion 取证依据：产物二进制的 LC_BUILD_VERSION minos
 #（rustc 对 aarch64-apple-darwin 的默认部署目标 = 11.0；objc2 0.6 /
 # app-kit 0.3 声明的支持下限比它宽，但低于 minos 的声明是谎——dyld 在
 # 更旧的系统上拒载该二进制。实机：macOS 26.6.1 arm64）。
-MIN_SYS_VER="$(otool -l target/release/ninja \
+MIN_SYS_VER="$(otool -l target/release/ninja-embed \
   | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')"
 if [[ -z "$MIN_SYS_VER" ]]; then
   echo "错误：读不到二进制 LC_BUILD_VERSION minos（otool）" >&2
@@ -42,7 +42,7 @@ echo "    LSMinimumSystemVersion = ${MIN_SYS_VER}（二进制 minos，见脚本�
 echo "==> [2/5] 组 $APP 骨架 + 程序化图标（Resources/AppIcon.icns）"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/ninja "$APP/Contents/MacOS/ninja"
+cp target/release/ninja-embed "$APP/Contents/MacOS/ninja"
 # 图标是资源不是插件（「默认零插件」不变）：Swift/CoreGraphics 矢量绘制
 # 10 尺寸（16…1024，含 @2x）→ iconutil 合 icns。make_icon.sh 内建
 # 像素级回归自检，失败即中止打包——不产出无图标/坏图标的分发物。

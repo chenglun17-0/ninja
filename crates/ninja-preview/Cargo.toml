@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-# 红线（STACK.md / PLAN.md p5）：本 crate 是独立进程，只准依赖
+# 红线（PRODUCT.md / PLAN.md）：本 crate 是独立进程，只准依赖
 # ninja-protocol + 系统框架。永不依赖宿主 crate `ninja`（验收：
 # `cargo tree -p ninja-preview` 无宿主 crate）、不链 libghostty-vt、
 # 不经任何宿主内部 API——与宿主只交换 ADE socket 上的 JSON 帧。

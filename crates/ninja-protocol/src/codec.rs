@@ -12,7 +12,7 @@
 
 use serde::Deserialize;
 
-use crate::message::{Message, PROTOCOL_VERSION, is_known_type};
+use crate::message::{is_known_type, Message, PROTOCOL_VERSION};
 
 /// 解码错误。前四类都是「不能猜」的硬错误。
 #[derive(Clone, Debug, PartialEq)]
@@ -126,7 +126,7 @@ impl Message {
     /// **插件侧**入口。解码同上；不同在处置契约：任何
     /// [`DecodeError::UnsupportedVersion`] 都意味着双方说的不是同一种
     /// 协议——**插件必须立即退出**（stderr 一行 + 非零退出码），不降级、
-    /// 不猜旧格式。这是 STACK.md「插件碰到不支持的 v 必须退出」的
+    /// 不猜旧格式。这是 PLAN.md「插件碰到不支持的 v 必须退出」的
     /// 代码落点。
     pub fn decode_plugin(bytes: &[u8]) -> Result<Message, DecodeError> {
         // 解码与宿主侧一致；差异是嵌入方对错误的处置（退出 vs 断连）。

@@ -1,14 +1,14 @@
-# p7 分发：签名 .app + DMG（默认零插件）
+# 分发：签名 .app + DMG（默认零插件）
 
-对应 [PLAN.md](PLAN.md) p7「签名分发」；产品约束见 [PRODUCT.md](PRODUCT.md)（默认零插件：
+对应 [PLAN.md](PLAN.md) q4「单一宿主与分发」；产品约束见 [PRODUCT.md](PRODUCT.md)（默认零插件：
 分发物不含预览、不含 Agent）。仓库仍不公开——本文件描述的是**已知收件人**的分发，
-不是公开下载分发（见「公证残留」）。
+不是公开下载分发（见「公证残留」）。产品宿主是 `ninja-embed`，打进 bundle 后可执行文件仍叫 `ninja`。
 
 ## 产物与打包
 
 | 脚本 | 产物 | 做什么 |
 | --- | --- | --- |
-| `scripts/package_app.sh` | `dist/Ninja.app` | `cargo build --release -p ninja`（仅宿主，**不打 ninja-preview/ninja-theme**）→ 程序化图标（`make_icon.sh` → `Resources/AppIcon.icns`）→ 组 bundle → `codesign --force --identifier dev.ninja.ninja --options runtime` → `--verify --deep --strict` 自检 |
+| `scripts/package_app.sh` | `dist/Ninja.app` | `cargo build --release -p ninja-embed`（仅宿主，**不打 ninja-preview/ninja-theme**）→ 拷成 `Contents/MacOS/ninja` → 程序化图标（`make_icon.sh` → `Resources/AppIcon.icns`）→ 组 bundle → `codesign --force --identifier dev.ninja.ninja --options runtime` → `--verify --deep --strict` 自检 |
 | `scripts/package_dmg.sh` | `dist/Ninja-0.1.0-arm64.dmg` | staging（Ninja.app + `/Applications` 符号链接，拖拽安装）→ `hdiutil UDZO` → 挂卷验签/清点/图标自检 |
 | `scripts/make_icon.sh`（+ 源 `make_icon.swift`） | `.icns`（10 尺寸） | Swift/CoreGraphics 程序化绘制 Ninja 图标（无位图资产入库）：macOS 圆角方形深底 `#282C34`（呼应 ODP）+ 扁平忍者头（头带 ODP 红、飘带、眼缝 + ODP 蓝双眼），10 个标准尺寸 PNG（16…1024，含 @2x）→ `iconutil` 合 icns；内建像素级回归自检（特征色落位/透明角/尺寸/icns 回读），失败即中止打包 |
 

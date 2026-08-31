@@ -1,11 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ninja",
     "crates/ninja-protocol",
     "crates/ninja-preview",
     "crates/ninja-theme",
-    # q0（v2）：libghostty 全量嵌入路径。v1 引擎层在 crates/ninja 保留到 q4 退役。
     "crates/ghostty-sys",
     "crates/ninja-embed",
 ]
@@ -17,12 +15,7 @@ rust-version = "1.90"
 publish = false
 
 [workspace.dependencies]
-# 钉 libghostty-vt 0.2.1（sys 层钉 ghostty commit a887df42c56f6de86c0fe6da9c4eeca37931e083，
-# 默认 vendored 静态链 libghostty-vt.a + kitty-graphics）。
-# 只允许走 include/ghostty/ 公开 C API；顶层内部 include/ghostty.h 禁止（STACK.md）。
-libghostty-vt = "0.2.1"
-
-# p3 ADE 协议：宿主与示例插件共用纯数据类型；协议仍只经 socket 交换字节。
+# ADE 协议：宿主与示例插件共用纯数据类型；协议仍只经 socket 交换字节。
 ninja-protocol = { path = "crates/ninja-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

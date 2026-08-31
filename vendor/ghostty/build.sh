@@ -1,7 +1,7 @@
 #!/bin/bash
 # ninja q0: build the pinned full-embed libghostty (static, darwin) via zig.
 #
-# Decision (recorded in docs/Q0-CAPABILITY-AUDIT.md + STACK.md): route (a)
+# Decision (recorded in docs/Q0-CAPABILITY-AUDIT.md + PLAN.md): route (a)
 # "zig static archive" over route (b) "xcodebuild xcframework".
 #   (a) one combined libghostty-internal.a linked straight into the Rust
 #       host; tiny build.zig patch (patches/0001) installs it on darwin

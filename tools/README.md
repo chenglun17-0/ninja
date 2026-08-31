@@ -2,10 +2,10 @@
 
 本目录被 `.gitignore` 忽略（`README.md` 除外），存放按需钉版的工具链。
 
-## zig 0.15.2（p0）
+## zig 0.15.2
 
-宿主通过 `libghostty-vt` 0.2.1（sys 层钉 ghostty commit
-`a887df42c56f6de86c0fe6da9c4eeca37931e083`，1.3.2-dev）vendored 构建终端核，
+产品宿主通过 vendored libghostty 嵌入（钉 ghostty commit
+`a887df42c56f6de86c0fe6da9c4eeca37931e083`，1.3.2-dev）构建终端核，
 该钉点要求 `minimum_zig_version = "0.15.2"`；ghostty HEAD 已要求 0.16，
 故 brew stable（0.16.x）不可用于钉点构建。安装方式：
 
@@ -60,5 +60,4 @@ layer_preview / off_is_light）；X2 起标题栏像素回归（titlebar_theme�
 （`PageList.grow → Page.verifyIntegrity`，`sample` 取证），渲染路径占比
 <5%，所以该项修前修后基本持平——D-C 的 renderer 收益要看 spinner 项
 （Partial 帧单行解码）与 idle 项（Clean 帧零提交）。帧级计数取证用
-`NINJA_FRAME_STATS=<path>` 环境变量（宿主周期落盘 drawn/skipped），
-E2E 回归见 `crates/ninja/tests/dirty_frame_skip.rs`。
+`NINJA_FRAME_STATS=<path>` 环境变量（宿主周期落盘 drawn/skipped）。
