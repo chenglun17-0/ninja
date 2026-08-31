@@ -76,8 +76,8 @@ ninja/
 - q0 嵌入底座 ✅ 2026-08-31（审计 docs/Q0-CAPABILITY-AUDIT.md，overall PASS；hit 两数据源均有 API；取证跑虚拟屏）
 - q1 壳 ✅ 2026-08-31（取证 docs/q1-evidence/：虚拟屏 E2E 45 断言全绿两轮 + 纯逻辑单测 12；⌘W 双路径只关一面、⌘⇧Enter 三态、EOF、焦点/resize 全链实测）
 - q2 配置 ✅ 2026-08-31（取证 docs/q2-evidence/：虚拟屏 E2E 38 断言全绿 + 纯逻辑单测 11；ODP 缺省像素/Dracula 真实生效且让位/⌘G·⌘⇧P 重绑/#ff00ff 热重载像素传播/ninja.toml 收缩/q0 回归 PASS）
-- q3 插件系统 + 三门禁 — 待做
-- q4 分发 — 待做
+- q3 插件系统 + 三门禁 ✅ 2026-08-31（取证 docs/q3-evidence/：虚拟屏 E2E 47 断言全绿两轮 + q0/q1/q2 回归 PASS；三门禁=空载 0.55× Ghostty、⌘click 路径→层内看文本→Esc 回焦点、关掉即轻三场景）
+- q4 分发 ✅ 2026-08-31（brew tap + cask/DMG：本地 file:// tap `brew install --cask ninja` 装 .app；Apple Development 真签、无公证 Gatekeeper 行为已实测记录；卸载无残留。证据 docs/q4-evidence/）
 
 ### q0 嵌入底座
 
@@ -103,11 +103,11 @@ ninja/
 
 过：**三大门禁全部通过**（空载内存对照 Ghostty 本尊、第一个插件、关掉即轻）。
 
-### q4 分发
+### q4 分发（brew tap + cask/DMG）
 
-做：签名的 macOS .app + DMG。默认零插件。仓库描述与实际一致。
+做：Homebrew tap 分发（2026-08-31 用户决策：不购 99 刀 Developer ID、不做公证）。tap 仓库布局 + **cask**：`brew install --cask ninja` 下载 DMG 并安装 .app（拖拽式 DMG 由打包脚本产出；cask 钉 version + sha256）；产物 .app 用本机真实签名身份（Apple Development，无身份即失败，不出 adhoc）；默认零插件（DMG 不含 ninja-preview/ninja-theme）。DISTRIBUTION.md 与实际一致。
 
-过：别人能装上当日常终端用。仓库仍不公开。
+过：本地 tap（file://）+ 本地 DMG `brew install --cask` 全新安装 → 打开即日常终端（虚拟屏取证抽查）；`brew uninstall --cask` 无残留；隔离副本的 Gatekeeper 行为实测并如实记录（无公证时隔离属性的影响与处理——`--no-quarantine` / cask quarantine 语义，写进文档）。仓库仍不公开；DMG 公开托管与 tap 公开发布是后续决定。
 
 ## Workflow 合同
 

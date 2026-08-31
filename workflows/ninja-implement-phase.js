@@ -28,9 +28,9 @@ const PHASES = {
       "hit、layer、input、theme.set 接上；示例插件（ninja-preview/ninja-theme）只走公开协议（进程外 JSON，不链宿主内部 API、不链 ghostty.h），协议契约测试在。三大门禁全部通过：空载内存对照 Ghostty 本尊（同量级）、第一个插件（点击路径→终端内看文本/代码）、关掉即轻（禁用后内存回空载、无残留进程）。Ghostty 语义坑停在宿主适配器，不改协议。",
   },
   q4: {
-    title: "分发",
+    title: "分发（brew tap + cask/DMG）",
     accept:
-      "签名的 macOS .app + DMG；默认零插件（分发物不含预览/主题插件）；本机可用真实签名身份（无身份即失败，不出 adhoc）。别人能装上当日常终端用；仓库描述与实际一致。仓库仍不公开。",
+      "Homebrew tap 分发（2026-08-31 用户决策：不购 99 刀 Developer ID、不做公证）。tap 仓库布局 + cask：brew install --cask ninja 下载 DMG 并安装 .app（拖拽式 DMG 由打包脚本产出；cask 钉 version + sha256）；产物 .app 用本机真实签名身份（Apple Development，无身份即失败，不出 adhoc）；默认零插件（DMG 不含 ninja-preview/ninja-theme）。DISTRIBUTION.md 与实际一致。本地 tap（file://）+ 本地 DMG brew install --cask 全新安装 → 打开即日常终端（虚拟屏取证抽查）；brew uninstall --cask 无残留；隔离副本的 Gatekeeper 行为实测并如实记录（无公证时隔离属性的影响与处理——--no-quarantine / cask quarantine 语义，写进文档）。仓库仍不公开；DMG 公开托管与 tap 公开发布是后续决定。",
   },
 };
 

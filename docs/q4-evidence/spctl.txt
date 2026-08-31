@@ -1,0 +1,2 @@
+/Applications/Ninja.app: rejected
+origin=Apple Development: zhan zong (35SLXS3LTS)

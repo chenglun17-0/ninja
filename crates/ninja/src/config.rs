@@ -477,23 +477,45 @@ fn layer_dir() -> PathBuf {
     d
 }
 
-/// 在 `ghostty_init` 前把烘入的 vendored 资源目录设为
-/// `GHOSTTY_RESOURCES_DIR`（具名主题解析需要；resourcesdir.zig 只在 init
-/// 读一次）。已设的环境变量（用户覆盖/调试）不动；烘入路径缺 themes/
-/// （如 NINJA_GHOSTTY_EMBED_DIR 指向外部产物）不设，具名主题会解析失败
-/// 并出现在诊断里。
+/// 分发 bundle 的资源目录（q4）：可执行文件在 `Contents/MacOS/` 下时，
+/// `Contents/Resources/ghostty`（打包脚本拷入的 574 主题随包资源）存在
+/// `themes/` 即认定有效。
+fn bundle_resources_dir(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    if macos.file_name()?.to_str()? != "MacOS" {
+        return None;
+    }
+    let dir = macos.parent()?.join("Resources/ghostty");
+    dir.join("themes").is_dir().then_some(dir)
+}
+
+/// 资源目录解析核心（纯函数，单测覆盖分支）：**bundle 相对 > 烘入开发
+/// 路径**——分发机上烘入的绝对开发路径（本机构建）不存在，bundle 相对
+/// 是唯一真源；开发树里两者都在时 bundle 相对同样优先（装进 /Applications
+/// 的副本不该回头看开发树）。
+fn resolve_resources_dir(exe: Option<&Path>, baked: &str) -> Option<PathBuf> {
+    if let Some(dir) = exe.and_then(bundle_resources_dir) {
+        return Some(dir);
+    }
+    if !baked.is_empty() && Path::new(baked).join("themes").is_dir() {
+        return Some(PathBuf::from(baked));
+    }
+    None
+}
+
+/// 在 `ghostty_init` 前解析并设 `GHOSTTY_RESOURCES_DIR`（具名主题解析需要；
+/// resourcesdir.zig 只在 init 读一次）。优先级：已设的环境变量（用户覆盖/
+/// 调试，不动）> bundle 相对（q4 分发）> build.rs 烘入的开发路径。都解析
+/// 不到则不设，具名主题会解析失败并出现在诊断里。
 pub fn ensure_resources_dir() {
     if std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some() {
         return;
     }
-    if BAKED_RESOURCES_DIR.is_empty() {
-        return;
+    let exe = std::env::current_exe().ok();
+    if let Some(dir) = resolve_resources_dir(exe.as_deref(), BAKED_RESOURCES_DIR) {
+        // SAFETY: main 线程早期、ghostty_init 之前（唯一入口 main 调）。
+        unsafe { std::env::set_var("GHOSTTY_RESOURCES_DIR", &dir) };
     }
-    if !Path::new(BAKED_RESOURCES_DIR).join("themes").is_dir() {
-        return;
-    }
-    // SAFETY: main 线程早期、ghostty_init 之前（唯一入口 main 调）。
-    unsafe { std::env::set_var("GHOSTTY_RESOURCES_DIR", BAKED_RESOURCES_DIR) };
 }
 
 fn load_file_cfg(cfg: ghostty_config_t, path: &Path) {
@@ -967,6 +989,59 @@ pub fn dump_effective_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk_res_dir(dir: &Path) -> PathBuf {
+        // 在 dir 下造 themes/（含一个主题文件）＝ 有效资源目录。
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::write(dir.join("themes/OneDarkPro"), "palette = 0=#3f4451\n").unwrap();
+        dir.to_path_buf()
+    }
+
+    #[test]
+    fn resources_bundle_relative_wins_over_baked_dev_path() {
+        // q4 分发：安装副本（Contents/MacOS 可执行 + Resources/ghostty）在
+        // 开发机上也不得回头看烘入路径——bundle 相对优先。
+        let root = std::env::temp_dir().join(format!("ninja-res-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("app/Contents/MacOS")).unwrap();
+        let bundle = mk_res_dir(&root.join("app/Contents/Resources/ghostty"));
+        std::fs::write(root.join("app/Contents/MacOS/ninja"), b"").unwrap();
+        let baked = mk_res_dir(&root.join("dev-ghostty")); // 烘入路径同样有效
+        let got = resolve_resources_dir(Some(&root.join("app/Contents/MacOS/ninja")), baked.to_str().unwrap());
+        assert_eq!(got.as_deref(), Some(bundle.as_path()), "bundle 相对必须优先于烘入路径");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resources_baked_dev_path_when_no_bundle() {
+        // 开发树（target/release/ninja，无 Resources 布局）：烘入路径生效。
+        let root = std::env::temp_dir().join(format!("ninja-res-baked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("target/release")).unwrap();
+        std::fs::write(root.join("target/release/ninja"), b"").unwrap();
+        let baked = mk_res_dir(&root.join("dev-ghostty"));
+        let got = resolve_resources_dir(Some(&root.join("target/release/ninja")), baked.to_str().unwrap());
+        assert_eq!(got.as_deref(), Some(baked.as_path()));
+        // bundle 布局在但 Resources/ghostty 缺 themes/（坏包）→ 走烘入。
+        std::fs::create_dir_all(root.join("app2/Contents/MacOS")).unwrap();
+        std::fs::write(root.join("app2/Contents/MacOS/ninja"), b"").unwrap();
+        std::fs::create_dir_all(root.join("app2/Contents/Resources/ghostty")).unwrap();
+        let got = resolve_resources_dir(Some(&root.join("app2/Contents/MacOS/ninja")), baked.to_str().unwrap());
+        assert_eq!(got.as_deref(), Some(baked.as_path()), "无 themes/ 的 bundle 目录不算数");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resources_none_when_neither() {
+        // 外部产物（NINJA_GHOSTTY_EMBED_DIR 无资源）：exe 无 bundle、烘入空。
+        let root = std::env::temp_dir().join(format!("ninja-res-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let got = resolve_resources_dir(Some(&root.join("bin/ninja")), "");
+        assert_eq!(got, None);
+        let got = resolve_resources_dir(None, "");
+        assert_eq!(got, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn odp_layer_text_is_explicit_ghostty_config() {

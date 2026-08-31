@@ -1,0 +1,3 @@
+Error: Calling the `--[no-]quarantine` switch is disabled! There is no replacement.
+You have disabled automatic updates and have not updated today.
+Do not report this issue until you've run `brew update` and tried again.

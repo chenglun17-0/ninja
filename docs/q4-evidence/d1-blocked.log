@@ -1,0 +1,3 @@
+2026-08-31 17:09:15.850 Df syspolicyd[502:10618f9] [com.apple.syspolicy.exec:default] GK evaluateScanResult: 0, PST: (path: b56c34908703edbb), (team: USJRJKKX2X), (id: dev.ninja.ninja), (bundle_id: dev.ninja.ninja), 1, 0, 1, 0, 0, 0, 0
+2026-08-31 17:09:15.850 Df syspolicyd[502:10618f9] [com.apple.syspolicy.exec:default] Prompt shown (6, 0), waiting for response: PST: (path: b56c34908703edbb), (team: USJRJKKX2X), (id: dev.ninja.ninja), (bundle_id: dev.ninja.ninja)
+2026-08-31 17:09:17.545 Df syspolicyd[502:10618f9] [com.apple.syspolicy.exec:default] Adding Gatekeeper denial breadcrumb (open): PST: (path: b56c34908703edbb), (team: USJRJKKX2X), (id: dev.ninja.ninja), (bundle_id: dev.ninja.ninja)

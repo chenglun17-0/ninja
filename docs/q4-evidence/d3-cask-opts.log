@@ -1,0 +1,6 @@
+==> Fetching downloads for: ninja/local/ninja
+✔︎ Cask ninja (0.1.0)
+Warning: --no-quarantine bypasses macOS’s Gatekeeper, reducing system security. Do not use this flag unless you understand the risks.
+==> Installing Cask ninja
+==> Moving App 'Ninja.app' to '/Applications/Ninja.app'
+🍺  ninja was successfully installed!
