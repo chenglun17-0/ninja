@@ -28,8 +28,10 @@
 //!   门控、`config_get(link-previews)` 回读怪象全部消化在 ghostty 内核
 //!   与本适配器——不进协议。
 //! - **网格源（兜底）**：⌘+click 无链接命中时，宿主用
-//!   `ghostty_surface_read_text` 读点击行 + 网格占比换算做 token 识别
-//!   （cwd 取 PWD action 的 OSC-7 报告值，缺省空串）。
+//!   `ghostty_surface_read_text` 读点击行 + 网格占比换算做 token 识别。
+//!   cwd：OSC-7/`PWD` action（Ghostty 原样是 `file://…`，适配器剥成
+//!   文件系统路径）→ 前台 pid 的真实 cwd（包里没有 shell-integration
+//!   时 OSC-7 根本不会来）。空串才放弃相对路径。
 //! - 广播 `hit` → 收 `hit.claim`/`hit.ignore`（500ms 同步短超时；静默/
 //!   断连=不认领）→ `priority` 大者胜 → 无认领走系统默认
 //!   （`/usr/bin/open`）。
@@ -364,20 +366,123 @@ pub fn classify_token(token: &str) -> Option<HitKind> {
 }
 
 /// OPEN_URL 载荷分类（适配器取舍，证据见 q3-evidence）：
-/// - 带 `scheme://`：常见 scheme（http/https/file/mailto/ftp）→ `url`，
+/// - `file://`：剥成文件系统路径，归 `path`（pager 只认领 path；
+///   把 file URL 当 `url` 会落到 `/usr/bin/open`，预览永远不触发）；
+/// - 带其它 `scheme://`：常见 scheme（http/https/mailto/ftp）→ `url`，
 ///   其余自定义 scheme → `osc8`；
 /// - **无 scheme**：ghostty 的 URL 匹配器 + `resolvePathForOpening` 会把
 ///   路径 token 解析成（绝对）文件路径再送 OPEN_URL——这是 ⌘+click 路径
-///   的主数据源，归 `path`（ninja-preview 这类 pager 只认领 path）。
+///   的主数据源，归 `path`。
 pub fn classify_url(url: &str) -> HitKind {
+    if file_url_to_fs_path(url).is_some() {
+        return HitKind::Path;
+    }
     let Some((scheme, rest)) = url.split_once("://") else {
         return HitKind::Path; // 无 scheme：ghostty 已解析的文件路径
     };
     let _ = rest;
     match scheme {
-        "http" | "https" | "file" | "mailto" | "ftp" => HitKind::Url,
+        "http" | "https" | "mailto" | "ftp" => HitKind::Url,
         _ => HitKind::Osc8,
     }
+}
+
+/// Ghostty OSC-7 / OPEN_URL 的 `file://` 载荷 → 文件系统路径。
+///
+/// 语义坑停在宿主：`terminal.getPwd()` 原样是 `file:///tmp`，插件
+/// `PathBuf::from(cwd).join(rel)` 会拼出不存在的路径然后 ignore。
+/// 不是 file URL → None（调用方当普通路径用）。
+pub fn file_url_to_fs_path(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("file://")?;
+    let path = if rest.starts_with('/') {
+        rest
+    } else if let Some(slash) = rest.find('/') {
+        // file://localhost/tmp 或 file://hostname/tmp
+        &rest[slash..]
+    } else {
+        return None;
+    };
+    Some(percent_decode(path))
+}
+
+/// OSC-7 / 已是绝对路径 / 其它：尽量得到可 `join` 的 cwd。
+pub fn normalize_cwd(raw: &str) -> String {
+    if let Some(p) = file_url_to_fs_path(raw) {
+        return p;
+    }
+    raw.to_string()
+}
+
+/// OPEN_URL / 网格 token → (kind, 给插件的 text)。file URL 剥成 path。
+pub fn normalize_open_payload(kind: HitKind, text: &str) -> (HitKind, String) {
+    if let Some(p) = file_url_to_fs_path(text) {
+        return (HitKind::Path, p);
+    }
+    (kind, text.to_string())
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(
+                std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 点击用的 cwd：规范化的 OSC-7 → 前台进程真实目录 → 空。
+fn cwd_for_view(view: &SurfaceHostView) -> String {
+    if let Some(raw) = view.ivars().pwd.borrow().as_deref() {
+        let n = normalize_cwd(raw);
+        if !n.is_empty() && (n.starts_with('/') || n.starts_with('~')) {
+            return n;
+        }
+    }
+    let Some(surface) = view.surface_opt() else {
+        return String::new();
+    };
+    let pid = unsafe { ghostty_sys::ghostty_surface_foreground_pid(surface) };
+    if pid == 0 {
+        return String::new();
+    }
+    macos_pid_cwd(pid as u32).unwrap_or_default()
+}
+
+fn macos_pid_cwd(pid: u32) -> Option<String> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let sz = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            sz,
+        )
+    };
+    if got <= 0 {
+        return None;
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast::<u8>(), 1024)
+    };
+    let end = bytes.iter().position(|&c| c == 0).unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
 /// ghostty mods → 协议修饰键列表。
@@ -2155,7 +2260,8 @@ pub fn handle_open_url(view: &SurfaceHostView, url: &str) {
         None => (0, 0, view.pane_id(), Vec::new()),
     };
     let kind = classify_url(url);
-    dispatch_hit_with_default(view, kind, url, row, col, pane, mods);
+    let (kind, text) = normalize_open_payload(kind, url);
+    dispatch_hit_with_default(view, kind, &text, row, col, pane, mods);
 }
 
 /// 网格源分发（surface.rs mouseUp 后调）：读点击行 → token → 分类 →
@@ -2179,7 +2285,8 @@ pub fn handle_grid_hit(view: &SurfaceHostView, row: u32, col: u32, mods: Vec<Mod
         ade_debug(&format!("grid: token {token:?} 不像路径/URL，不分发"));
         return;
     };
-    dispatch_hit_with_default(view, kind, &token, row, col, view.pane_id(), mods);
+    let (kind, text) = normalize_open_payload(kind, &token);
+    dispatch_hit_with_default(view, kind, &text, row, col, view.pane_id(), mods);
 }
 
 /// 广播 + 仲裁 + 无认领系统默认 的公共出口。
@@ -2198,12 +2305,12 @@ fn dispatch_hit_with_default(
         default_open(kind, text, view);
         return;
     }
-    let cwd = view.ivars().pwd.borrow().clone().unwrap_or_default();
-    let hit = Hit::new(id, kind, text, cwd, row, col, pane, mods);
+    let cwd = cwd_for_view(view);
+    let hit = Hit::new(id, kind, text, &cwd, row, col, pane, mods);
     let geom = collect_geom(view);
     let outcome = dispatch_hit(&hit, geom.as_ref());
     ade_debug(&format!(
-        "hit id={id} kind={kind:?} text={text:?} → {outcome:?}"
+        "hit id={id} kind={kind:?} text={text:?} cwd={cwd:?} → {outcome:?}"
     ));
     match outcome {
         DispatchOutcome::Claimed { .. } => {}
@@ -2218,7 +2325,7 @@ fn default_open(kind: HitKind, text: &str, view: &SurfaceHostView) {
     let target = match kind {
         HitKind::Url | HitKind::Osc8 => Some(text.to_string()),
         HitKind::Path => {
-            let cwd = view.ivars().pwd.borrow().clone().unwrap_or_default();
+            let cwd = cwd_for_view(view);
             let resolved = if text.starts_with('/') || text.starts_with('~') {
                 std::path::PathBuf::from(text)
             } else if !cwd.is_empty() {
@@ -2450,12 +2557,36 @@ mod tests {
     #[test]
     fn url_classification_for_open_url_action() {
         assert_eq!(classify_url("https://ghostty.org"), HitKind::Url);
-        assert_eq!(classify_url("file:///tmp/a.txt"), HitKind::Url);
+        // file:// 归 path：pager 只认领 path，不能落到系统 open。
+        assert_eq!(classify_url("file:///tmp/a.txt"), HitKind::Path);
         assert_eq!(classify_url("myapp://deep/link"), HitKind::Osc8);
         // 无 scheme：ghostty resolvePathForOpening 已解析的文件路径 → path
         //（⌘+click 路径的主数据源，ninja-preview 只认领 path）。
         assert_eq!(classify_url("/tmp/nq3p/sample.txt"), HitKind::Path);
         assert_eq!(classify_url("~/notes.md"), HitKind::Path);
+    }
+
+    #[test]
+    fn file_url_and_osc7_become_fs_paths() {
+        assert_eq!(
+            file_url_to_fs_path("file:///Users/jal/src").as_deref(),
+            Some("/Users/jal/src")
+        );
+        assert_eq!(
+            file_url_to_fs_path("file://localhost/tmp/a").as_deref(),
+            Some("/tmp/a")
+        );
+        assert_eq!(
+            file_url_to_fs_path("file:///Users/foo%20bar").as_deref(),
+            Some("/Users/foo bar")
+        );
+        assert_eq!(file_url_to_fs_path("/tmp/a"), None);
+        assert_eq!(file_url_to_fs_path("https://x.io/a"), None);
+        assert_eq!(normalize_cwd("file:///Users/jal"), "/Users/jal");
+        assert_eq!(normalize_cwd("/Users/jal"), "/Users/jal");
+        let (k, t) = normalize_open_payload(HitKind::Url, "file:///tmp/a.txt");
+        assert_eq!(k, HitKind::Path);
+        assert_eq!(t, "/tmp/a.txt");
     }
 
     // ------------------------------------------------------------------

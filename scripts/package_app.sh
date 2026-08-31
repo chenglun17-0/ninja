@@ -16,6 +16,9 @@
 #   按 bundle 相对路径优先解析（分发机上烘入的绝对开发路径不存在）。
 # - xterm-ghostty terminfo 随包进 Contents/Resources/terminfo（与 ghostty
 #   资源兄妹目录）。libghostty 据此设 TERM/TERMINFO；缺则 zsh zle 重绘乱字。
+# - shell-integration 随包进 Contents/Resources/ghostty/shell-integration
+#   （embed 构建不跑 GhosttyResources）。缺则 OSC-7 不来，相对路径 ⌘+click
+#   无法解析。
 # - 产物落 dist/（已 .gitignore）。DMG 见 scripts/package_dmg.sh。
 #
 # 用法：scripts/package_app.sh
@@ -73,6 +76,15 @@ echo "==> [3/6] ghostty 主题资源随包 → Contents/Resources/ghostty"
 ditto "$GHOSTTY_RES" "$APP/Contents/Resources/ghostty"
 THEME_N="$(find "$APP/Contents/Resources/ghostty/themes" -type f | wc -l | tr -d ' ')"
 echo "    themes：${THEME_N} 个文件（开发树同源）"
+# shell-integration：Exec.zig 从 $GHOSTTY_RESOURCES_DIR/shell-integration
+# 注入 zsh/bash 的 OSC-7。embed 构建不跑 GhosttyResources，必须从源树补进。
+SHELL_INT="$ROOT/vendor/ghostty/src/src/shell-integration"
+[[ -d "$SHELL_INT/zsh" ]] || {
+	echo "错误：$SHELL_INT/zsh 不存在" >&2
+	exit 1
+}
+ditto "$SHELL_INT" "$APP/Contents/Resources/ghostty/shell-integration"
+echo "    shell-integration：$(ls "$APP/Contents/Resources/ghostty/shell-integration" | tr '\n' ' ')"
 # terminfo 与 ghostty 资源兄妹目录（Exec.zig TERMINFO=dirname(resources)/terminfo）。
 # 缺这一步时 TERM=xterm-ghostty 但库找不到，zsh-autosuggestions/syntax-highlighting
 # 重绘光标失败，打 ls 会显示成 ~ llsls。
@@ -175,6 +187,10 @@ find "$APP" -type f -not -path '*/Resources/ghostty/*' | sort
 }
 [[ -f "$APP/Contents/Resources/terminfo/78/xterm-ghostty" ]] || {
 	echo "错误：bundle 缺 terminfo/78/xterm-ghostty" >&2
+	exit 1
+}
+[[ -e "$APP/Contents/Resources/ghostty/shell-integration/zsh" ]] || {
+	echo "错误：bundle 缺 shell-integration/zsh" >&2
 	exit 1
 }
 

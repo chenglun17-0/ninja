@@ -659,9 +659,11 @@ unsafe fn dispatch_action(
                 true
             }
             GHOSTTY_ACTION_PWD => {
-                let pwd = CStr::from_ptr(action.action.pwd.pwd)
+                // Ghostty 原样是 OSC-7（file:///path）；插件 join 要文件系统路径。
+                let raw = CStr::from_ptr(action.action.pwd.pwd)
                     .to_string_lossy()
                     .to_string();
+                let pwd = crate::plugins::normalize_cwd(&raw);
                 if let Some(v) = &view {
                     *v.ivars().pwd.borrow_mut() = Some(pwd);
                 }
