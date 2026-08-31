@@ -48,14 +48,17 @@ fi
 
 ./fetch.sh
 
-# Apply vendor patches (idempotent: reverse-apply first if already applied).
-for PATCH_FILE in \
-  "${PWD}/patches/0001-darwin-install-static-embed-lib.patch" \
+# Apply vendor patches (idempotent). Stacked patches must be reversed in
+# reverse order first; reversing 0001 while 0002 is still applied fails
+# the context match and a subsequent forward apply duplicates the hunk.
+PATCHES=(
+  "${PWD}/patches/0001-darwin-install-static-embed-lib.patch"
   "${PWD}/patches/0002-install-themes-on-embed-route.patch"
-do
-  if ! patch -R -s -N -p1 -d src --input "${PATCH_FILE}" >/dev/null 2>&1; then
-    :
-  fi
+)
+for ((i=${#PATCHES[@]}-1; i>=0; i--)); do
+  patch -R -s -N -p1 -d src --input "${PATCHES[$i]}" >/dev/null 2>&1 || true
+done
+for PATCH_FILE in "${PATCHES[@]}"; do
   patch -s -N -p1 -d src --input "${PATCH_FILE}"
 done
 
