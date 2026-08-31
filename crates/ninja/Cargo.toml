@@ -35,11 +35,13 @@ objc2-foundation = { version = "0.3", features = [
     # q1 壳：IME（NSTextInputClient 回调参数）/ zoom dump 之外的文本对象。
     "NSRange",
     "NSAttributedString",
+    "NSUserDefaults",
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "AppKitDefines",
     "NSApplication",
     "NSWindow",
+    "NSWindowRestoration",
     "NSView",
     "NSResponder",
     "NSEvent",

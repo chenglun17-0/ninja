@@ -53,7 +53,7 @@
 //! 回 CONFIG_CHANGE action）→ host 刷新派生态（bg/焦点环/窗口 chrome、
 //! 菜单键位重建）。ghostty 默认键位 ⌘⇧,（reload_config action）同途。
 
-use std::ffi::c_void;
+use std::ffi::{c_void, CStr};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -795,6 +795,37 @@ pub fn get_f32(cfg: ghostty_config_t, key: &str) -> Option<f32> {
         )
     };
     ok.then_some(v)
+}
+
+/// 读可选 i16（window-position-x/y；未设 → None）。
+pub fn get_i16(cfg: ghostty_config_t, key: &str) -> Option<i16> {
+    let mut v: i16 = 0;
+    let ok = unsafe {
+        ghostty_config_get(
+            cfg,
+            &mut v as *mut i16 as *mut c_void,
+            key.as_ptr() as *const _,
+            key.len(),
+        )
+    };
+    ok.then_some(v)
+}
+
+/// 读枚举键（C API 给出 C 字符串，如 window-save-state = "always"）。
+pub fn get_enum_str(cfg: ghostty_config_t, key: &str) -> Option<String> {
+    let mut p: *const std::ffi::c_char = std::ptr::null();
+    let ok = unsafe {
+        ghostty_config_get(
+            cfg,
+            &mut p as *mut *const std::ffi::c_char as *mut c_void,
+            key.as_ptr() as *const _,
+            key.len(),
+        )
+    };
+    if !ok || p.is_null() {
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
 }
 
 /// 读 bool 键（q0 审计遗留的 link-previews 回读怪象记录用）。

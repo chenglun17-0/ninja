@@ -11,6 +11,8 @@
 //!   多 pane 只关焦点面、单 pane 放行原生语义）；
 //! - `windowWillClose` → 全叶 surface_free（延迟，见 [`crate::host`]）。
 
+use std::sync::Mutex;
+
 use objc2::rc::Retained;
 use objc2::{msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
@@ -18,7 +20,7 @@ use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSEventType, NSScreen, NSView, NSWindow,
     NSWindowOrderingMode, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSUserDefaults};
 
 use crate::host;
 use crate::pane::container_of;
@@ -26,6 +28,52 @@ use crate::surface::SurfaceHostView;
 
 /// 所有终端窗口共用的 tabbing identifier（相同才能自动成组）。
 const TABBING_ID: &str = "ninja-terminal";
+const LAST_FRAME_KEY: &str = "dev.ninja.last-window-frame";
+const QUIT_KEEPS_WINDOWS_KEY: &str = "NSQuitAlwaysKeepsWindows";
+
+/// Ghostty `TerminalController.lastCascadePoint`：新窗错开，不叠在上一扇上。
+static LAST_CASCADE: Mutex<NSPoint> = Mutex::new(NSPoint { x: 0.0, y: 0.0 });
+
+/// Ghostty 开窗尺寸优先级（showWindow + defaultSize）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeChoice {
+    Maximize,
+    InitialSize,
+    Restored,
+    Default800x600,
+}
+
+/// Ghostty 开窗原点：配置坐标 → 上次位置 → 居中；多窗再 cascade。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginChoice {
+    ConfigPos,
+    Restored,
+    Center,
+}
+
+/// `maximize` > `window-width`+`window-height`（INITIAL_SIZE）> 上次尺寸 > 800×600。
+pub fn choose_size(maximize: bool, has_initial_size: bool, has_restored_size: bool) -> SizeChoice {
+    if maximize {
+        SizeChoice::Maximize
+    } else if has_initial_size {
+        SizeChoice::InitialSize
+    } else if has_restored_size {
+        SizeChoice::Restored
+    } else {
+        SizeChoice::Default800x600
+    }
+}
+
+/// `window-position-x/y` 都设 > 上次原点 > 居中。
+pub fn choose_origin(has_config_pos: bool, has_restored_origin: bool) -> OriginChoice {
+    if has_config_pos {
+        OriginChoice::ConfigPos
+    } else if has_restored_origin {
+        OriginChoice::Restored
+    } else {
+        OriginChoice::Center
+    }
+}
 
 /// 建一个窗口：内容 = PaneContainer（含首个叶子）。`parent` 给出时首叶
 /// surface 按 `context`（WINDOW/TAB）走 inherited_config（继承字号/工作
@@ -91,6 +139,187 @@ pub fn make_window(
     }
     place_on_e2e_screen(&window);
     window
+}
+
+/// 按 Ghostty `showWindow` + `applyCascade` 展示：尺寸/原点优先级见
+/// [`choose_size`]/[`choose_origin`]；多窗且未钉坐标时 cascade。
+/// E2E 虚拟屏只 orderFront（落位已在 make_window）。
+pub fn present_window(window: &NSWindow) {
+    apply_quit_keeps_windows();
+    if std::env::var_os("NINJA_E2E_SCREEN").is_none() {
+        apply_open_policy(window);
+    }
+    window.makeKeyAndOrderFront(None);
+}
+
+fn apply_open_policy(window: &NSWindow) {
+    let cfg = host::config();
+    let maximize = cfg.and_then(|c| crate::config::get_bool(c, "maximize")).unwrap_or(false);
+    let pos = match (
+        cfg.and_then(|c| crate::config::get_i16(c, "window-position-x")),
+        cfg.and_then(|c| crate::config::get_i16(c, "window-position-y")),
+    ) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    };
+    let has_initial = window_has_initial_size(window);
+    let saved = load_last_frame();
+    let size = choose_size(maximize, has_initial, saved.is_some());
+    match size {
+        SizeChoice::Maximize => {
+            if let Some(screen) = window.screen().or_else(fallback_screen) {
+                window.setFrame_display(screen.visibleFrame(), true);
+            }
+        }
+        SizeChoice::InitialSize | SizeChoice::Default800x600 => {}
+        SizeChoice::Restored => {
+            if let Some(saved) = saved {
+                let mut f = window.frame();
+                f.size = saved.size;
+                window.setFrame_display(f, true);
+            }
+        }
+    }
+    let origin = choose_origin(pos.is_some(), saved.is_some());
+    match origin {
+        OriginChoice::ConfigPos => {
+            if let Some((x, y)) = pos {
+                apply_config_position(window, x, y);
+            }
+        }
+        OriginChoice::Restored => {
+            if let Some(saved) = saved {
+                let mut f = window.frame();
+                f.origin = saved.origin;
+                clamp_to_visible(window, &mut f);
+                window.setFrame_display(f, true);
+            }
+        }
+        OriginChoice::Center => window.center(),
+    }
+    apply_cascade(window, pos.is_some());
+    apply_restorable(window);
+}
+
+fn window_has_initial_size(window: &NSWindow) -> bool {
+    container_of(window)
+        .and_then(|c| c.leaves().into_iter().next())
+        .and_then(|v| v.ivars().initial_pt.get())
+        .is_some_and(|(w, h)| w > 0 && h > 0)
+}
+
+fn fallback_screen() -> Option<objc2::rc::Retained<NSScreen>> {
+    MainThreadMarker::new().and_then(NSScreen::mainScreen)
+}
+
+fn apply_config_position(window: &NSWindow, x: i16, y: i16) {
+    let Some(screen) = window.screen().or_else(fallback_screen) else {
+        return;
+    };
+    let vf = screen.visibleFrame();
+    let size = window.frame().size;
+    let mut origin = NSPoint::new(
+        vf.origin.x + f64::from(x),
+        vf.origin.y + vf.size.height - f64::from(y) - size.height,
+    );
+    origin.x = origin.x.clamp(vf.origin.x, vf.origin.x + vf.size.width - size.width);
+    origin.y = origin.y.clamp(vf.origin.y, vf.origin.y + vf.size.height - size.height);
+    window.setFrameOrigin(origin);
+}
+
+fn clamp_to_visible(window: &NSWindow, frame: &mut NSRect) {
+    let Some(screen) = window.screen().or_else(fallback_screen) else {
+        return;
+    };
+    let vf = screen.visibleFrame();
+    frame.origin.x = frame.origin.x.clamp(vf.origin.x, vf.origin.x + vf.size.width - frame.size.width);
+    frame.origin.y = frame.origin.y.clamp(vf.origin.y, vf.origin.y + vf.size.height - frame.size.height);
+}
+
+fn apply_cascade(window: &NSWindow, has_fixed_pos: bool) {
+    if has_fixed_pos {
+        return;
+    }
+    let count = ninja_window_count();
+    let Ok(mut last) = LAST_CASCADE.lock() else {
+        return;
+    };
+    if count > 1 {
+        *last = window.cascadeTopLeftFromPoint(*last);
+    } else {
+        *last = window.cascadeTopLeftFromPoint(NSPoint::ZERO);
+    }
+}
+
+fn ninja_window_count() -> usize {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return 0;
+    };
+    NSApplication::sharedApplication(mtm)
+        .windows()
+        .iter()
+        .filter(|w| container_of(w).is_some())
+        .count()
+}
+
+fn apply_quit_keeps_windows() {
+    let state = host::config()
+        .and_then(|c| crate::config::get_enum_str(c, "window-save-state"))
+        .unwrap_or_else(|| "default".into());
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let key = NSString::from_str(QUIT_KEEPS_WINDOWS_KEY);
+    match state.as_str() {
+        "never" => unsafe {
+            let _: () = msg_send![&defaults, setBool: false, forKey: &*key];
+        },
+        "always" => unsafe {
+            let _: () = msg_send![&defaults, setBool: true, forKey: &*key];
+        },
+        _ => defaults.removeObjectForKey(&key),
+    }
+}
+
+fn apply_restorable(window: &NSWindow) {
+    let state = host::config()
+        .and_then(|c| crate::config::get_enum_str(c, "window-save-state"))
+        .unwrap_or_else(|| "default".into());
+    window.setRestorable(state != "never");
+}
+
+/// 热重载时同步 NSQuitAlwaysKeepsWindows（Ghostty configDidChange 同款）。
+pub fn sync_save_state() {
+    apply_quit_keeps_windows();
+}
+
+/// Ghostty LastWindowPosition：可见窗才写，避免装饰变化覆盖。
+pub fn save_last_frame(window: &NSWindow) {
+    if !window.isVisible() {
+        return;
+    }
+    let f = window.frame();
+    let s = format!(
+        "{} {} {} {}",
+        f.origin.x, f.origin.y, f.size.width, f.size.height
+    );
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let key = NSString::from_str(LAST_FRAME_KEY);
+    let val = NSString::from_str(&s);
+    unsafe {
+        defaults.setObject_forKey(Some(&val), &key);
+    }
+}
+
+fn load_last_frame() -> Option<NSRect> {
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let key = NSString::from_str(LAST_FRAME_KEY);
+    let s: Option<Retained<NSString>> = unsafe { msg_send![&defaults, stringForKey: &*key] };
+    let s = s?.to_string();
+    let mut it = s.split_whitespace();
+    let x: f64 = it.next()?.parse().ok()?;
+    let y: f64 = it.next()?.parse().ok()?;
+    let w: f64 = it.next()?.parse().ok()?;
+    let h: f64 = it.next()?.parse().ok()?;
+    Some(NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)))
 }
 
 /// NINJA_E2E_SCREEN=<displayID>（PLAN「E2E 虚拟屏幕」增补，q0 平移）：
@@ -311,11 +540,7 @@ pub fn window_should_close(w: &NSWindow) -> bool {
 /// 发起面（inherited_config(context=WINDOW) 继承字号/工作目录）。
 pub fn new_window(mtm: MainThreadMarker, parent: Option<&SurfaceHostView>) -> Retained<NSWindow> {
     let w = make_window(mtm, parent, ghostty_sys::GHOSTTY_SURFACE_CONTEXT_WINDOW);
-    // E2E 虚拟屏时 make_window 已定窗，不叠 center。
-    if std::env::var_os("NINJA_E2E_SCREEN").is_none() {
-        w.center();
-    }
-    w.makeKeyAndOrderFront(None);
+    present_window(&w);
     w
 }
 
@@ -540,6 +765,23 @@ mod tests {
         // ODP #282c34；浅色外观会让标题字变成黑字叠在深色底上（看不见）。
         assert!(!super::bg_is_light(0x28, 0x2c, 0x34));
         assert!(super::bg_is_light(0xf5, 0xf5, 0xf5));
+    }
+
+    #[test]
+    fn window_size_priority_matches_ghostty() {
+        use super::{choose_size, SizeChoice};
+        assert_eq!(choose_size(true, true, true), SizeChoice::Maximize);
+        assert_eq!(choose_size(false, true, true), SizeChoice::InitialSize);
+        assert_eq!(choose_size(false, false, true), SizeChoice::Restored);
+        assert_eq!(choose_size(false, false, false), SizeChoice::Default800x600);
+    }
+
+    #[test]
+    fn window_origin_priority_matches_ghostty() {
+        use super::{choose_origin, OriginChoice};
+        assert_eq!(choose_origin(true, true), OriginChoice::ConfigPos);
+        assert_eq!(choose_origin(false, true), OriginChoice::Restored);
+        assert_eq!(choose_origin(false, false), OriginChoice::Center);
     }
 
     #[test]

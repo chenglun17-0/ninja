@@ -189,6 +189,7 @@ fn refresh_derived(h: &mut Host) {
     h.ring = crate::config::get_color(h.config, "cursor-color")
         .or_else(|| crate::config::get_color(h.config, "foreground"))
         .unwrap_or(RING_FALLBACK);
+    crate::shell::sync_save_state();
     // 全部窗口：背景色/阴影跟随 + 重绘（分隔条/容器底色随 drawRect 重读）。
     let Some(mtm) = MainThreadMarker::new() else { return };
     let app = objc2_app_kit::NSApplication::sharedApplication(mtm);

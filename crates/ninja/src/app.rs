@@ -73,11 +73,7 @@ define_class!(
 
             // 首窗（context=WINDOW；INITIAL_SIZE 定尺寸见 make_window）。
             let window = shell::make_window(mtm, None, ghostty_sys::GHOSTTY_SURFACE_CONTEXT_WINDOW);
-            // E2E 虚拟屏（NINJA_E2E_SCREEN）时 make_window 已定窗，不叠 center。
-            if std::env::var_os("NINJA_E2E_SCREEN").is_none() {
-                window.center();
-            }
-            window.makeKeyAndOrderFront(None);
+            shell::present_window(&window);
             // 首叶夺焦（窗口 key 后把 first responder 落在终端面上）。
             if let Some(container) = crate::pane::container_of(&window)
                 && let Some(first) = container.leaves().first()
@@ -238,6 +234,7 @@ define_class!(
             // SAFETY: object() 返回通知对象（此处恒为 NSWindow）。
             let window: Option<&NSWindow> = unsafe { msg_send![notification, object] };
             if let Some(w) = window {
+                shell::save_last_frame(w);
                 if let Some(content) = w.contentView() {
                     shell::window_closed(&content);
                 }
@@ -250,8 +247,12 @@ define_class!(
         // tab 组内的窗口切 key：同步 app 焦点给 ghostty（DidResign 先于
         // DidBecome，终态正确）。
         #[unsafe(method(windowDidBecomeKey:))]
-        fn windowDidBecomeKey(&self, _notification: &NSNotification) {
+        fn windowDidBecomeKey(&self, notification: &NSNotification) {
             host::with_app(|app| unsafe { ghostty_sys::ghostty_app_set_focus(app, true) });
+            let window: Option<&NSWindow> = unsafe { msg_send![notification, object] };
+            if let Some(w) = window {
+                shell::save_last_frame(w);
+            }
         }
 
         #[unsafe(method(windowDidResignKey:))]
