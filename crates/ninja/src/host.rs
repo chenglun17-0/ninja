@@ -738,9 +738,7 @@ unsafe fn dispatch_action(
             // ghostty 默认 ⌘,=open_config 被宿主层重绑给面板；若用户又
             // 改绑到 open_config，这里如实接收（q2 不内置编辑器，只提示）。
             GHOSTTY_ACTION_OPEN_CONFIG => {
-                eprintln!(
-                    "ninja: open_config：编辑 ghostty 配置文件（路径见启动日志/用户配置目录）"
-                );
+                crate::config::open_ghostty_config();
                 true
             }
             // ⌘Q（ghostty 默认 quit 绑定）与菜单 terminate: 同途。

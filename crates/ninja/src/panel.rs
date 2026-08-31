@@ -69,6 +69,12 @@ define_class!(
         fn ninja_panel_refresh(&self, _sender: Option<&AnyObject>) {
             self.refresh();
         }
+
+        /// 打开 Ghostty 配置文件（系统默认文本编辑器）。
+        #[unsafe(method(ninjaOpenGhosttyConfig:))]
+        fn ninja_open_ghostty_config(&self, _sender: Option<&AnyObject>) {
+            crate::config::open_ghostty_config();
+        }
     }
 
     unsafe impl NSObjectProtocol for PluginPanel {}
@@ -208,9 +214,21 @@ impl PluginPanel {
             let hint = label(mtm, "无插件（ninja.toml [plugins] enabled 配置）", 16.0, y, 420.0, 18.0);
             hint.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
             content.addSubview(&hint);
+            y += 26.0;
         }
+        y += 8.0;
+        let cfg_btn = NSButton::new(mtm);
+        cfg_btn.setButtonType(NSButtonType::MomentaryPushIn);
+        cfg_btn.setTitle(&NSString::from_str("编辑 Ghostty 配置"));
+        unsafe {
+            cfg_btn.setTarget(Some(self));
+            cfg_btn.setAction(Some(objc2::sel!(ninjaOpenGhosttyConfig:)));
+        }
+        cfg_btn.setFrame(NSRect::new(NSPoint::new(12.0, y), NSSize::new(200.0, 24.0)));
+        content.addSubview(&cfg_btn);
+        y += 28.0;
         // 按行数收窗高（空面板不占屏）。
-        let height = (y + 16.0).max(90.0);
+        let height = (y + 16.0).max(110.0);
         let f = window.frame();
         window.setFrame_display(
             NSRect::new(f.origin, NSSize::new(f.size.width, height)),

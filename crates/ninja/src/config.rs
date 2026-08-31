@@ -203,6 +203,37 @@ pub fn default_config_files() -> Vec<PathBuf> {
     out
 }
 
+/// 用系统默认文本编辑器打开 Ghostty 配置（`ghostty_config_open_path` 会
+/// 按 AppSupport/XDG 优先序选路径，不存在则创建）。面板按钮与
+/// `open_config` 动作共用。
+pub fn open_ghostty_config() {
+    let Some(path) = ghostty_config_edit_path() else {
+        eprintln!("ninja: 无法确定 ghostty 配置路径");
+        return;
+    };
+    match std::process::Command::new("/usr/bin/open")
+        .args(["-t", &path])
+        .spawn()
+    {
+        Ok(_) => eprintln!("ninja: 打开 ghostty 配置 {path}"),
+        Err(e) => eprintln!("ninja: 打开 ghostty 配置失败：{e}"),
+    }
+}
+
+fn ghostty_config_edit_path() -> Option<String> {
+    let s = unsafe { ghostty_config_open_path() };
+    let path = if s.ptr.is_null() || s.len == 0 {
+        None
+    } else if s.sentinel {
+        Some(unsafe { CStr::from_ptr(s.ptr) }.to_string_lossy().into_owned())
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(s.ptr as *const u8, s.len) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    };
+    unsafe { ghostty_string_free(s) };
+    path.filter(|p| !p.is_empty())
+}
+
 /// NSSearchPathForDirectoriesInDomains(.applicationSupportDirectory,
 /// .userDomainMask) —— ghostty macos.appSupportDir 同源 API。
 fn macos_app_support_dir() -> Option<PathBuf> {
