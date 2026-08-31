@@ -452,8 +452,10 @@ pub fn read_text(surface: ghostty_surface_t, x0: u32, y0: u32, x1: u32, y1: u32)
 
 pub unsafe extern "C" fn wakeup_cb(_userdata: *mut c_void) {
     // 可能从 IO/渲染线程调用：只唤醒主 RunLoop，主线程 timer 里 app_tick
-    //（CFRunLoop 唤醒线程安全）。
-    objc2_core_foundation::CFRunLoop::main().unwrap().wake_up();
+    //（CFRunLoop 唤醒线程安全）。edition 2024：unsafe fn 体不是 unsafe 上下文。
+    unsafe {
+        objc2_core_foundation::CFRunLoop::main().unwrap().wake_up();
+    }
 }
 
 /// action 全分发（q1 的 window/tab/split 上下文回调接布局树）。
