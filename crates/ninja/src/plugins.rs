@@ -1527,16 +1527,10 @@ define_class!(
                 origin: objc2_core_foundation::CGPoint::new(0.0, 0.0),
                 size: objc2_core_foundation::CGSize::new(b.size.width, b.size.height),
             };
-            // SAFETY: flipped 视图的 CG 上下文已按左上原点准备；draw_image
-            // 平凡（rect 与 bounds 一致）。
-            // SAFETY: flipped 视图的 CG 上下文已按左上原点准备。
             // AppKit flipped 视图的 CG 上下文对原生 CG 调用仍是 y-up
-            //（AppKit 的翻转只作用于自家绘制 API）——先翻 CTM 再画，
-            // 否则图像上下颠倒（实测）。
-            unsafe {
-                objc2_core_graphics::CGContext::translate_ctm(Some(&ctx), 0.0, rect.size.height);
-                objc2_core_graphics::CGContext::scale_ctm(Some(&ctx), 1.0, -1.0);
-            }
+            //（翻转只作用于 AppKit 绘制 API）——先翻 CTM 再画，否则上下颠倒。
+            objc2_core_graphics::CGContext::translate_ctm(Some(&ctx), 0.0, rect.size.height);
+            objc2_core_graphics::CGContext::scale_ctm(Some(&ctx), 1.0, -1.0);
             objc2_core_graphics::CGContext::draw_image(Some(&ctx), rect, Some(&image));
         }
     }
@@ -1873,7 +1867,8 @@ fn spawn_pending_active() -> bool {
 }
 
 /// 泵回调（CFRunLoopTimer callout，主线程）。
-unsafe extern "C-unwind" fn pump_tick(
+/// 安全 fn 可强制转换成 CFRunLoopTimerCallBack 的 unsafe 函数指针。
+extern "C-unwind" fn pump_tick(
     _timer: *mut objc2_core_foundation::CFRunLoopTimer,
     _info: *mut std::ffi::c_void,
 ) {
@@ -1972,11 +1967,10 @@ static SESSION_CFG: Mutex<Option<PluginsConfig>> = Mutex::new(None);
 /// 快照供面板首开用）；非空 = 绑定 + 登记（拉起发生在 runloop 就绪后，
 /// [`spawn_startup_plugins`]）。
 pub fn init(cfg: PluginsConfig) {
-    if let Some(host) = PluginHost::start(&cfg) {
-        if let Ok(mut slot) = DISPATCHER.lock() {
+    if let Some(host) = PluginHost::start(&cfg)
+        && let Ok(mut slot) = DISPATCHER.lock() {
             *slot = Some(Arc::new(Mutex::new(host)));
         }
-    }
     if let Ok(mut slot) = SESSION_CFG.lock() {
         *slot = Some(cfg);
     }
@@ -2147,7 +2141,7 @@ pub fn click_end(view: &SurfaceHostView) -> Option<(u32, u32, u32, Vec<Modifier>
     }
     ctx.mods
         .contains(&Modifier::Cmd)
-        .then(|| (ctx.pane, ctx.row, ctx.col, ctx.mods))
+        .then_some((ctx.pane, ctx.row, ctx.col, ctx.mods))
 }
 
 /// OPEN_URL action 的宿主半边（host.rs dispatch 调；点击同步栈内）：
