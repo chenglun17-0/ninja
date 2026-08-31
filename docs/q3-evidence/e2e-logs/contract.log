@@ -1,4 +1,4 @@
-    Finished `release` profile [optimized] target(s) in 0.02s
+    Finished `release` profile [optimized] target(s) in 0.03s
      Running unittests src/lib.rs (target/release/deps/ninja_protocol-3ced96b962ebdcec)
 
 running 0 tests
@@ -8,18 +8,18 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
      Running tests/contract.rs (target/release/deps/contract-bccd2039bc29c763)
 
 running 12 tests
+test known_types_match_enum ... ok
+test host_decode_ignores_unknown_fields ... ok
 test error_classification ... ok
 test frame_prefix_is_u32le_of_payload_only ... ok
-test host_decode_ignores_unknown_fields ... ok
-test known_types_match_enum ... ok
-test version_gate_rejects_future_and_past ... ok
-test six_classes_all_covered ... ok
-test wrong_version_message_refuses_to_encode ... ok
 test theme_set_decode_contract ... ok
+test six_classes_all_covered ... ok
+test version_gate_rejects_future_and_past ... ok
 test frame_decoder_handles_byte_at_a_time_and_back_to_back ... ok
 test roundtrip_every_message ... ok
-test golden_files_pin_wire_format ... ok
+test wrong_version_message_refuses_to_encode ... ok
 test frame_rejects_oversized_and_empty ... ok
+test golden_files_pin_wire_format ... ok
 
 test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
@@ -37,6 +37,6 @@ running 2 tests
 test crates/ninja-protocol/src/lib.rs - (line 128) ... ok
 test crates/ninja-protocol/src/frame.rs - frame::FrameDecoder (line 51) ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-all doctests ran in 0.55s; merged doctests compilation took 0.15s
+all doctests ran in 0.84s; merged doctests compilation took 0.43s

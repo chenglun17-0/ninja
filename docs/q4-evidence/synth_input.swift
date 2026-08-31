@@ -60,6 +60,21 @@ func postKey(pid: pid_t, keycode: Int, flags: CGEventFlags) {
     usleep(60_000)
 }
 
+/// postKey 的带文本版：keyDown 事件附 Unicode 字符串（kCGKeyboardEventKeyboardType
+/// 保持，但 AppKit 走 characters → insertText，不进输入法组合）。
+func postTextKey(pid: pid_t, keycode: Int, text: String, flags: CGEventFlags) {
+    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keycode), keyDown: true),
+          let up = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keycode), keyDown: false)
+    else { FileHandle.standardError.write("event create failed\n".data(using: .utf8)!); exit(1) }
+    down.keyboardSetUnicodeString(stringLength: text.utf16.count, unicodeString: text.utf16.map { $0 })
+    down.flags = flags.union(CGEventFlags(rawValue: 0x100))
+    up.flags = flags.union(CGEventFlags(rawValue: 0x100))
+    down.postToPid(pid)
+    usleep(30_000)
+    up.postToPid(pid)
+    usleep(60_000)
+}
+
 // 鼠标走全局 HID tap（坐标即目标）；flags 携带修饰（⌘+click 的 hit
 // 门禁：ghostty 的链接 hover/点击判定读 mouse mods）。
 func postMouse(_ type: CGEventType, x: Double, y: Double, flags: CGEventFlags) {
@@ -111,8 +126,11 @@ case "type":
             postKey(pid: pid, keycode: 36, flags: [])
             continue
         }
+        // 带 Unicode 字符串直投（绕 IME）：裸 keycode 事件会进 TSM/输入法
+        // 组合（本机装了豆包拼音，焦点窗口沾到它时合成键全被组合吞），
+        // 事件自带 text → AppKit interpret 直接 insertText。
         guard let (code, needsShift) = keycodes[ch] else { continue }
-        postKey(pid: pid, keycode: code, flags: needsShift ? shiftFlag : [])
+        postTextKey(pid: pid, keycode: code, text: String(ch), flags: needsShift ? shiftFlag : [])
     }
 case "click":
     guard args.count >= 5, let pid = pid_t(args[2]), let x = Double(args[3]), let y = Double(args[4]) else { exit(2) }

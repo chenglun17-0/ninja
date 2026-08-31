@@ -1,14 +1,5 @@
 ==> [1/6] cargo build --release -p ninja（仅宿主；ninja-preview/ninja-theme 不进 bundle）
-warning: unnecessary `unsafe` block
-    --> crates/ninja/src/plugins.rs:1536:13
-     |
-1536 |             unsafe {
-     |             ^^^^^^ unnecessary `unsafe` block
-     |
-     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
-
-warning: `ninja` (bin "ninja") generated 1 warning
-    Finished `release` profile [optimized] target(s) in 0.14s
+    Finished `release` profile [optimized] target(s) in 0.13s
     LSMinimumSystemVersion = 11.0（二进制 minos，见脚本注释）
 ==> [2/6] 组 /Users/jal/my_repos/ninja/dist/Ninja.app 骨架 + 程序化图标（Resources/AppIcon.icns）
 ==> [1/4] 源图 → iconset（Swift/CoreGraphics）→ /Users/jal/my_repos/ninja/target/AppIcon.iconset
@@ -19,6 +10,9 @@ iconset-done /Users/jal/my_repos/ninja/target/AppIcon.iconset
 完成：/Users/jal/my_repos/ninja/dist/Ninja.app/Contents/Resources/AppIcon.icns（10 尺寸，16…1024）
 ==> [3/6] ghostty 主题资源随包 → Contents/Resources/ghostty
     themes：574 个文件（开发树同源）
+    shell-integration：bash elvish fish nushell README.md zsh 
+"/Users/jal/my_repos/ninja/vendor/ghostty/xterm-ghostty.terminfo", line 4, col 31, terminal 'xterm-ghostty': older tic versions may treat the description field as an alias
+install-terminfo: /Users/jal/my_repos/ninja/dist/Ninja.app/Contents/Resources/terminfo (xterm-ghostty + ghostty alias)
 ==> [4/6] Info.plist（最小键集 + CFBundleIconFile）
 ==> [5/6] 解析签名身份（security find-identity；缺真实身份 = 失败）
     身份：Apple Development: zhan zong (35SLXS3LTS)
@@ -36,16 +30,18 @@ origin=Apple Development: zhan zong (35SLXS3LTS)
 /Users/jal/my_repos/ninja/dist/Ninja.app/Contents/Info.plist
 /Users/jal/my_repos/ninja/dist/Ninja.app/Contents/MacOS/ninja
 /Users/jal/my_repos/ninja/dist/Ninja.app/Contents/Resources/AppIcon.icns
+/Users/jal/my_repos/ninja/dist/Ninja.app/Contents/Resources/terminfo/67/ghostty
+/Users/jal/my_repos/ninja/dist/Ninja.app/Contents/Resources/terminfo/78/xterm-ghostty
 完成：/Users/jal/my_repos/ninja/dist/Ninja.app（version=0.1.0，身份：Apple Development: zhan zong (35SLXS3LTS)）
 ==> 组 staging（Ninja.app + /Applications 链接，拖拽安装）
 ==> hdiutil create（UDZO）
 ==> 自检：挂载 → 验签 → 清点 → 卸载
-/tmp/ninja-dmg-check.84053.mnt/Ninja.app: valid on disk
-/tmp/ninja-dmg-check.84053.mnt/Ninja.app: satisfies its Designated Requirement
-/tmp/ninja-dmg-check.84053.mnt/Applications
-/tmp/ninja-dmg-check.84053.mnt/Ninja.app
+/tmp/ninja-dmg-check.53038.mnt/Ninja.app: valid on disk
+/tmp/ninja-dmg-check.53038.mnt/Ninja.app: satisfies its Designated Requirement
+/tmp/ninja-dmg-check.53038.mnt/Applications
+/tmp/ninja-dmg-check.53038.mnt/Ninja.app
     DMG 内 themes：574 个文件
 ==> 再生 tap cask（scripts/tap/Casks/ninja.rb：version+sha256+file:// url 钉死）
-    version=0.1.0 sha256=20d9a212dbec2411… url=file:///Users/jal/my_repos/ninja/dist/Ninja-0.1.0-arm64.dmg
+    version=0.1.0 sha256=2b7aee79abefba65… url=file:///Users/jal/my_repos/ninja/dist/Ninja-0.1.0-arm64.dmg
 完成：/Users/jal/my_repos/ninja/dist/Ninja-0.1.0-arm64.dmg
 安装：双击挂载 → 把 Ninja.app 拖进 Applications → 弹出卷；或本地 tap：brew install --cask ninja（见 DISTRIBUTION.md）

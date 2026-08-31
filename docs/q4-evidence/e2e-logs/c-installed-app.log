@@ -1,2 +1,20 @@
 ninja: 配置已重载（用户 theme=false ODP=true 监视 2 文件）
 2026-08-31 17:09:40.797 ninja[88524:17179639] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+2026-08-31 17:46:09.868 ninja[92643:17595032] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+ninja: 配置已重载（用户 theme=false ODP=true 监视 2 文件）
+ninja: 配置已重载（用户 theme=false ODP=true 监视 2 文件）
+2026-08-31 20:04:37.383 ninja[36233:18610128] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+ninja: 配置已重载（用户 theme=false ODP=true 监视 2 文件）
+2026-08-31 20:25:32.854 ninja[13328:18748827] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+2026-08-31 20:25:33.423 ninja[13328:18748827] error messaging the mach port for IMKCFRunLoopWakeUpReliable
+ninja: 配置已重载（用户 theme=false ODP=true 监视 2 文件）
+2026-08-31 21:23:35.084 ninja[4797:19288590] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+ninja: 配置已重载（用户 theme=false ODP=true 监视 2 文件）
+2026-08-31 21:29:15.139 ninja[47182:19366483] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+ninja: 配置已重载（用户 theme=false ODP=true 监视 2 文件）
+2026-08-31 21:50:36.552 ninja[68030:19592997] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+2026-08-31 21:50:37.099 ninja[68030:19592997] error messaging the mach port for IMKCFRunLoopWakeUpReliable
+ninja: 配置已重载（用户 theme=false ODP=true 监视 2 文件）
+2026-08-31 22:02:27.522 ninja[29704:19708110] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+ninja: 配置已重载（用户 theme=false ODP=true 监视 2 文件）
+2026-08-31 22:06:49.725 ninja[56922:19760030] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit

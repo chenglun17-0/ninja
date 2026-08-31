@@ -1,16 +1,16 @@
 ninja q2 shell — libghostty 1.3.2-master-+b63cfa0；配置：用户 theme=false ODP=true 监视 2 文件；资源目录 "/Users/jal/my_repos/ninja/vendor/ghostty/out/share/ghostty"
-ninja: 清扫陈旧 ADE socket /var/folders/72/fpn_ck6d125094kqmc72q1bm0000gn/T/ninja-ade-28304.sock（pid 28304 已死）
+ninja: 清扫陈旧 ADE socket /var/folders/72/fpn_ck6d125094kqmc72q1bm0000gn/T/ninja-ade-61035.sock（pid 61035 已死）
 ninja: ninja.toml 启用插件 ["ninja-preview"]（启用即拉起，监督器见 plugins.rs）
-screen: NINJA_E2E_SCREEN=50（虚拟屏取证）
+screen: NINJA_E2E_SCREEN=105（虚拟屏取证）
 ninja: action tag=41 has_view=false
 ninja: action tag=25 has_view=true
 ninja: action tag=22 has_view=true
-ninja: push_size pane=1 bounds=(590.0,422.0) scale=1
+ninja: push_size pane=1 bounds=(800.0,632.0) scale=1
 ninja: push_size pane=1 bounds=(640.0,408.0) scale=1
 ninja: push_size pane=1 bounds=(640.0,440.0) scale=1
 ninja: push_size pane=1 bounds=(640.0,440.0) scale=1
-screen: NINJA_E2E_SCREEN=50（虚拟屏取证）
-ninja: 已拉起插件 "ninja-preview"（pid 34198，socket "/var/folders/72/fpn_ck6d125094kqmc72q1bm0000gn/T/ninja-ade-34193.sock"）
+screen: NINJA_E2E_SCREEN=105（虚拟屏取证）
+ninja: 已拉起插件 "ninja-preview"（pid 69367，socket "/var/folders/72/fpn_ck6d125094kqmc72q1bm0000gn/T/ninja-ade-69362.sock"）
 ninja: action tag=26 has_view=true
 ninja: action tag=26 has_view=true
 ninja[ade]: pump tick（layers=false theme=false pending=true）
@@ -26,15 +26,15 @@ ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
+ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: action tag=32 has_view=true
 ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
-ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: keyDown code=6 flags=0x100 chars=Some("z") unmod=Some("z")
-2026-08-31 15:44:22.978 ninja[34193:16294314] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+2026-08-31 22:08:11.059 ninja[69362:19784258] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
 ninja: surface_key code=6 text="z" mods=0x0 consumed=true
 ninja: surface_key code=6 text=None mods=0x0 consumed=false
 ninja[ade]: pump tick（layers=false theme=false pending=true）
@@ -47,9 +47,9 @@ ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja[ade]: pump tick（layers=false theme=false pending=true）
-ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: keyDown code=14 flags=0x100 chars=Some("e") unmod=Some("e")
 ninja: surface_key code=14 text="e" mods=0x0 consumed=true
+ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: surface_key code=14 text=None mods=0x0 consumed=false
 ninja: keyDown code=8 flags=0x100 chars=Some("c") unmod=Some("c")
 ninja: surface_key code=8 text="c" mods=0x0 consumed=true
@@ -60,8 +60,8 @@ ninja: surface_key code=4 text="h" mods=0x0 consumed=true
 ninja: surface_key code=4 text=None mods=0x0 consumed=false
 ninja: keyDown code=31 flags=0x100 chars=Some("o") unmod=Some("o")
 ninja: surface_key code=31 text="o" mods=0x0 consumed=true
-ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: surface_key code=31 text=None mods=0x0 consumed=false
+ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: keyDown code=49 flags=0x100 chars=Some(" ") unmod=Some(" ")
 ninja: surface_key code=49 text=" " mods=0x0 consumed=true
 ninja: surface_key code=49 text=None mods=0x0 consumed=false
@@ -71,25 +71,25 @@ ninja: surface_key code=44 text="/" mods=0x0 consumed=true
 ninja: surface_key code=44 text=None mods=0x0 consumed=false
 ninja: keyDown code=17 flags=0x100 chars=Some("t") unmod=Some("t")
 ninja: surface_key code=17 text="t" mods=0x0 consumed=true
-ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: surface_key code=17 text=None mods=0x0 consumed=false
+ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: keyDown code=46 flags=0x100 chars=Some("m") unmod=Some("m")
 ninja: surface_key code=46 text="m" mods=0x0 consumed=true
 ninja: surface_key code=46 text=None mods=0x0 consumed=false
-ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: keyDown code=35 flags=0x100 chars=Some("p") unmod=Some("p")
 ninja: surface_key code=35 text="p" mods=0x0 consumed=true
+ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: surface_key code=35 text=None mods=0x0 consumed=false
 ninja: keyDown code=44 flags=0x100 chars=Some("/") unmod=Some("/")
 ninja: surface_key code=44 text="/" mods=0x0 consumed=true
-ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: surface_key code=44 text=None mods=0x0 consumed=false
+ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: keyDown code=45 flags=0x100 chars=Some("n") unmod=Some("n")
 ninja: surface_key code=45 text="n" mods=0x0 consumed=true
 ninja: surface_key code=45 text=None mods=0x0 consumed=false
-ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: keyDown code=12 flags=0x100 chars=Some("q") unmod=Some("q")
 ninja: surface_key code=12 text="q" mods=0x0 consumed=true
+ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: surface_key code=12 text=None mods=0x0 consumed=false
 ninja: keyDown code=20 flags=0x100 chars=Some("3") unmod=Some("3")
 ninja: surface_key code=20 text="3" mods=0x0 consumed=true
@@ -98,9 +98,9 @@ ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: keyDown code=35 flags=0x100 chars=Some("p") unmod=Some("p")
 ninja: surface_key code=35 text="p" mods=0x0 consumed=true
 ninja: surface_key code=35 text=None mods=0x0 consumed=false
-ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: keyDown code=44 flags=0x100 chars=Some("/") unmod=Some("/")
 ninja: surface_key code=44 text="/" mods=0x0 consumed=true
+ninja[ade]: pump tick（layers=false theme=false pending=true）
 ninja: surface_key code=44 text=None mods=0x0 consumed=false
 ninja: keyDown code=1 flags=0x100 chars=Some("s") unmod=Some("s")
 ninja: surface_key code=1 text="s" mods=0x0 consumed=true
@@ -139,7 +139,7 @@ ninja: action tag=32 has_view=true
 ninja: action tag=32 has_view=true
 ninja: surface_key code=36 text=None mods=0x0 consumed=false
 ninja: mouseDown pane=1 loc=CGPoint { x: 28.4000244140625, y: 61.600006103515625 } win=CGPoint { x: 28.4000244140625, y: 378.3999938964844 }
-ninja[ade]: grid: 点击处非 token（row=3 col=3，行内容 "~                                                                             "）
+ninja[ade]: grid: 点击处非 token（row=3 col=3，行内容 "~ "）
 ninja: mouseDown pane=1 loc=CGPoint { x: 28.4000244140625, y: 79.20001220703125 } win=CGPoint { x: 28.4000244140625, y: 360.79998779296875 }
 ninja[ade]: grid: 点击处非 token（row=4 col=3，行内容 ""）
 ninja: action tag=36 has_view=true
@@ -147,13 +147,14 @@ ninja: action tag=38 has_view=true
 ninja[ade]: hover link "/tmp/nq3p/sample.txt"
 ninja: mouseDown pane=1 loc=CGPoint { x: 28.4000244140625, y: 44.0 } win=CGPoint { x: 28.4000244140625, y: 396.0 }
 ninja: action tag=55 has_view=true
-ninja-preview: hit id=1 kind=Path text="/tmp/nq3p/sample.txt" cwd=""
+ninja-preview: hit id=1 kind=Path text="/tmp/nq3p/sample.txt" cwd="/Users/jal"
 ninja-preview: claim /tmp/nq3p/sample.txt（行 1 起）
 ninja[ade]: dispatch: claim priority=100 conn=1
-ninja[ade]: layer.open → ready handle=1 616x220px dpi=72 iosurface=87
+ninja[ade]: layer.open → ready handle=1 616x220px dpi=72 iosurface=85
 ninja-preview: present 层 1（616x220 @72dpi）
 ninja[ade]: layer.present handle=1（像素拷贝 → CGImage，重画中）
-ninja[ade]: hit id=1 kind=Path text="/tmp/nq3p/sample.txt" → Claimed { priority: 100 }
+ninja[ade]: hit id=1 kind=Path text="/tmp/nq3p/sample.txt" cwd="/Users/jal" → Claimed { priority: 100 }
+ninja[ade]: pump tick（layers=true theme=false pending=false）
 ninja[ade]: pump tick（layers=true theme=false pending=false）
 ninja[ade]: pump tick（layers=true theme=false pending=false）
 ninja[ade]: pump tick（layers=true theme=false pending=false）

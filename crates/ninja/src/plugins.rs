@@ -1843,10 +1843,19 @@ fn layer_close(handle: u64) -> bool {
 
 /// 把合成视图从父视图摘掉（主线程）。
 fn remove_overlay(e: &LayerEntry) {
+    // 先丢帧像素（CGImage 全尺寸拷贝，≈层面积×4B）再摘视图——不等
+    // dealloc：AppKit 对摘下的 layer-backed 视图保留不确定时长，
+    // 「关掉即轻」门禁（q3 C14）要求收层时立即归还层内存。
+    e.view.discard_frame();
     e.view.removeFromSuperview();
 }
 
 impl LayerView {
+    /// 收层时立即丢弃帧像素（CGImage）——不等 AppKit dealloc 视图。
+    fn discard_frame(&self) {
+        *self.ivars().image.borrow_mut() = None;
+    }
+
     /// 建视图（ivars 先就位再 super init；无自定义 initWithFrame 需求）。
     fn new(mtm: objc2::MainThreadMarker) -> Retained<Self> {
         let this = LayerView::alloc(mtm).set_ivars(LayerViewIvars {

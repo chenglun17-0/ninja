@@ -127,15 +127,25 @@ pub fn make_window(
     let first = container.first_leaf();
     let parent = parent.filter(|p| p.surface_opt().is_some());
     host::attach_surface(&first, context, parent);
-    // Ghostty：window-width 与 window-height 都 >0 才发 INITIAL_SIZE（格子
-    // × cell + padding）。都为 0（缺省）时 AppKit 本尊用 SurfaceView
-    // 800×600，不按 80×24 缩窗。Ninja 同款：有 INITIAL_SIZE 才覆盖。
-    if !window.isVisible()
-        && let Some((w, h)) = first.ivars().initial_pt.get()
-        && w > 0
-        && h > 0
-    {
-        window.setContentSize(objc2_foundation::NSSize::new(w as f64, h as f64));
+    // INITIAL_SIZE action（surface_new 期间已到）：window-width/height 都
+    // >0 才发（Ghostty 同款）。缺省时回 CELL_SIZE × 80×24 默认窗（q3 语义）。
+    // 注：曾试 800×600（对齐 AppKit SurfaceView 观感），但 Tahoe 下
+    // NSTitlebarView 上色层（apply_chrome/paint_titlebar）令 CA 的窗口级
+    // 色彩 drawable（Whippet A008→RGhA）随窗口面积线性变——800×600 时
+    // theme.set 一轮就 +7MiB，把 q3 门禁三「关掉即轻」的 8MiB 容差打穿
+    //（docs/q3-evidence/run-e2e.sh C14，vmmap 实测 IOSurface 13M→20M）。
+    // 回到格子默认窗＝回到门禁校准基线；观感差异用户可用
+    // window-width/height 配置。
+    if !window.isVisible() {
+        let size = first
+            .ivars()
+            .initial_pt
+            .get()
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .or_else(|| default_initial_pt(&window, &first));
+        if let Some((w, h)) = size {
+            window.setContentSize(objc2_foundation::NSSize::new(w as f64, h as f64));
+        }
     }
     place_on_e2e_screen(&window);
     window
@@ -154,7 +164,9 @@ pub fn present_window(window: &NSWindow) {
 
 fn apply_open_policy(window: &NSWindow) {
     let cfg = host::config();
-    let maximize = cfg.and_then(|c| crate::config::get_bool(c, "maximize")).unwrap_or(false);
+    let maximize = cfg
+        .and_then(|c| crate::config::get_bool(c, "maximize"))
+        .unwrap_or(false);
     let pos = match (
         cfg.and_then(|c| crate::config::get_i16(c, "window-position-x")),
         cfg.and_then(|c| crate::config::get_i16(c, "window-position-y")),
@@ -222,8 +234,12 @@ fn apply_config_position(window: &NSWindow, x: i16, y: i16) {
         vf.origin.x + f64::from(x),
         vf.origin.y + vf.size.height - f64::from(y) - size.height,
     );
-    origin.x = origin.x.clamp(vf.origin.x, vf.origin.x + vf.size.width - size.width);
-    origin.y = origin.y.clamp(vf.origin.y, vf.origin.y + vf.size.height - size.height);
+    origin.x = origin
+        .x
+        .clamp(vf.origin.x, vf.origin.x + vf.size.width - size.width);
+    origin.y = origin
+        .y
+        .clamp(vf.origin.y, vf.origin.y + vf.size.height - size.height);
     window.setFrameOrigin(origin);
 }
 
@@ -232,8 +248,14 @@ fn clamp_to_visible(window: &NSWindow, frame: &mut NSRect) {
         return;
     };
     let vf = screen.visibleFrame();
-    frame.origin.x = frame.origin.x.clamp(vf.origin.x, vf.origin.x + vf.size.width - frame.size.width);
-    frame.origin.y = frame.origin.y.clamp(vf.origin.y, vf.origin.y + vf.size.height - frame.size.height);
+    frame.origin.x = frame
+        .origin
+        .x
+        .clamp(vf.origin.x, vf.origin.x + vf.size.width - frame.size.width);
+    frame.origin.y = frame.origin.y.clamp(
+        vf.origin.y,
+        vf.origin.y + vf.size.height - frame.size.height,
+    );
 }
 
 fn apply_cascade(window: &NSWindow, has_fixed_pos: bool) {
@@ -373,6 +395,19 @@ fn place_on_e2e_screen(window: &NSWindow) {
         }
     }
     println!("screen: NINJA_E2E_SCREEN={target}（虚拟屏取证）");
+}
+
+/// CELL_SIZE(px) × (80, 24) → 内容 points（INITIAL_SIZE 缺省时；q3 基线）。
+fn default_initial_pt(
+    window: &objc2_app_kit::NSWindow,
+    first: &crate::surface::SurfaceHostView,
+) -> Option<(u32, u32)> {
+    let (cw, ch) = first.ivars().cell_px.get()?;
+    let scale = window.backingScaleFactor().max(1.0);
+    Some((
+        (f64::from(cw) * 80.0 / scale).ceil() as u32,
+        (f64::from(ch) * 24.0 / scale).ceil() as u32,
+    ))
 }
 
 /// Ghostty 默认 `macos-titlebar-style = transparent`：标题栏透明、底色 =

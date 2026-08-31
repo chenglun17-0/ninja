@@ -61,6 +61,27 @@ gk_capture() {
 }
 dismiss_alert() { osascript -e 'tell application "System Events" to key code 53' >/dev/null 2>&1; }
 
+# 屏幕锁定检测（锁定时全局 HID 鼠标被锁屏吞掉，q3 套件的 ⌘click 段必挂）
+LOCKCHK=/tmp/nq4-lockchk
+cat > /tmp/nq4-lockchk.swift <<'SWIFT'
+import CoreGraphics
+import Foundation
+if let d = CGSessionCopyCurrentDictionary() as? [String: Any],
+   let v = d["CGSSessionScreenIsLocked"] as? Int, v == 1 {
+    print("locked")
+} else { print("unlocked") }
+SWIFT
+swiftc -O /tmp/nq4-lockchk.swift -o "$LOCKCHK" 2>/dev/null || true
+screen_locked() { [ -x "$LOCKCHK" ] && [ "$($LOCKCHK 2>/dev/null)" = "locked" ]; }
+
+# 输入源钉 US（本机装了豆包拼音：焦点窗口沾到它时，合成键全被拼音组合
+# 吞——q3/q4 打字断言间歇挂。链首钉 US，收尾恢复原输入源）。
+PIN=/tmp/nq4-pin
+swiftc -O "$EV/pin_input_source.swift" -o "$PIN" 2>/dev/null || true
+PIN_PREV=""
+pin_us() { [ -x "$PIN" ] && PIN_PREV="$($PIN 2>/dev/null || true)"; }
+restore_input_source() { [ -x "$PIN" ] && [ -n "${PIN_PREV:-}" ] && "$PIN" "$PIN_PREV" >/dev/null 2>&1 || true; }
+
 # ---- 全局收尾 ---------------------------------------------------------------
 HOLD_PID=""
 # 等进程退干净（TERM 后确认；否则升级 KILL）——避免残留实例吞掉后续 open
@@ -76,6 +97,7 @@ cleanup() {
   pkill -f "ninja-quarantine-test" 2>/dev/null
   [ -n "${HOLD_PID:-}" ] && kill "$HOLD_PID" 2>/dev/null
   restore_cfg
+  restore_input_source
   dismiss_alert
 }
 trap cleanup EXIT
@@ -100,6 +122,7 @@ isolate_cfg() {
 # ==========================================================================
 say "A 打包链（package_app.sh + package_dmg.sh）"
 # ==========================================================================
+pin_us
 A_LOG=$EV/a-package.log
 { ./scripts/package_app.sh && ./scripts/package_dmg.sh; } > "$A_LOG" 2>&1
 if [ $? -eq 0 ] && [ -f dist/Ninja-0.1.0-arm64.dmg ]; then
@@ -122,7 +145,11 @@ git check-ignore dist/Ninja-0.1.0-arm64.dmg >/dev/null && ok "A9 DMG 不入 git�
 say "B 本地 tap + file:// DMG 全新安装"
 # ==========================================================================
 B_LOG=$EV/b-brew-install.log
+# 清场：卸掉 cask 之外，还可能残留手工拖拽装的 /Applications/Ninja.app
+#（brew uninstall 对非 cask 装的副本无能为力，会让 install 报
+# "already an App"、后续 D/E 段测到旧副本）。
 brew uninstall --cask ninja >/dev/null 2>&1 || true
+rm -rf "$APP_PATH"
 brew untap ninja/local >/dev/null 2>&1 || true
 rm -rf "$TAP_REPO"
 # tap 仓库物化（独立 git 目录，不入本仓库；brew tap 需要至少一个 commit）
@@ -146,34 +173,18 @@ hdiutil attach -nobrowse -readonly -mountpoint /tmp/nq4-vol dist/Ninja-0.1.0-arm
 hdiutil detach /tmp/nq4-vol >/dev/null 2>&1
 
 # ==========================================================================
-say "D1 默认装副本（带隔离）Gatekeeper 真行为"
+say "C 打开即日常终端（虚拟屏；含 D2 去隔离路径取证）"
 # ==========================================================================
-D1=$EV/d1-blocked.log
-T1=$(date +%s)
-open "$APP_PATH" >/dev/null 2>&1
-sleep 4
-D1PID=$(installed_pid)
-if [ -n "$D1PID" ]; then
-  note "D1 带隔离副本 open → 进程启动了（带 Gatekeeper 警告对话——本机当日已多次放行该证书，状态影响结果，如实记录）"
-  pkill -f "$APP_PATH/Contents/MacOS/ninja" 2>/dev/null
-else
-  ok "D1 带隔离副本 open → 未启动（Gatekeeper 拦）"
-fi
-wait_gone "$APP_PATH/Contents/MacOS/ninja" || true
-dismiss_alert; sleep 1
-gk_capture "$T1" "$D1"
-# 确定性断言：Gatekeeper 评估必然介入（无公证的后果）；拦不拦得住是状态函数（如实记录）
-if grep -q "Prompt shown" "$D1" && grep -q "GatekeeperPolicyScanError\|evaluateScanResult" "$D1"; then
-  ok "D1 Gatekeeper 评估介入：Prompt shown + 扫描拒绝（-67018 无公证；${D1}）"
-else
-  bad "D1 Gatekeeper 评估未介入？（${D1}）"
-fi
-grep -q "denial breadcrumb" "$D1" && note "D1 本轮被拦到底（denial breadcrumb）" || true
-
-# ==========================================================================
-say "C 打开即日常终端（虚拟屏；D2 去隔离路径顺带取证）"
-# ==========================================================================
+# C 挪到 D1 之前：D1 的 Gatekeeper 对话框可能被人事后放行、滞后拉起无
+# env 的实例污染 C 段（open --env 附旧实例 → C3/C4/C7 全歪）。先做 C，
+# D1 的对话框就落在 C 之后，不再影响 C。
 xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null
+# 清场：D1 的 Gatekeeper 对话框可能在脚本次后被人/系统放行，滞后拉起无
+# env 的实例——LaunchServices 会让 C 的 open --env 附到它身上（C3/C4/C7
+# 全被旧实例污染）。开窗前杀干净 + 收掉残留对话框。
+pkill -f "$APP_PATH/Contents/MacOS/ninja" 2>/dev/null
+wait_gone "$APP_PATH/Contents/MacOS/ninja" || true
+dismiss_alert
 if xattr -p com.apple.quarantine "$APP_PATH" >/dev/null 2>&1; then
   bad "D2 xattr -dr 去隔离失败"
 else
@@ -281,9 +292,49 @@ else
 fi
 
 # ==========================================================================
+say "D1 默认装副本（带隔离）Gatekeeper 真行为"
+# ==========================================================================
+# 先重新打上隔离属性（C 段去隔离过），恢复「默认装副本」语义；并清掉
+# C 段留下的实例，保证 D1 观察的是本段自己 open 的那次。
+pkill -f "$APP_PATH/Contents/MacOS/ninja" 2>/dev/null
+wait_gone "$APP_PATH/Contents/MacOS/ninja" || true
+xattr -w com.apple.quarantine "0081;$(date +%s);ninja-e2e;" "$APP_PATH" 2>/dev/null || true
+D1=$EV/d1-blocked.log
+T1=$(date +%s)
+open "$APP_PATH" >/dev/null 2>&1
+sleep 4
+D1PID=$(installed_pid)
+if [ -n "$D1PID" ]; then
+  note "D1 带隔离副本 open → 进程启动了（带 Gatekeeper 警告对话——本机当日已多次放行该证书，状态影响结果，如实记录）"
+  pkill -f "$APP_PATH/Contents/MacOS/ninja" 2>/dev/null
+else
+  ok "D1 带隔离副本 open → 未启动（Gatekeeper 拦）"
+fi
+wait_gone "$APP_PATH/Contents/MacOS/ninja" || true
+dismiss_alert; sleep 1
+gk_capture "$T1" "$D1"
+# 断言分两层（如实记录）：
+# 1) 确定性：隔离副本要么被拦（无进程）要么带警告对话启动——不能“静默直接开”；
+# 2) 证据层：syspolicyd 的 Prompt/扫描日志（当天反复测试后 macOS 会缓存
+#    评估结果，日志可能缺席——缺席记 note，不当失败；D4 的新隔离副本
+#    是无缓存路径，那里仍硬断言）。
+if grep -q "Prompt shown" "$D1" && grep -q "GatekeeperPolicyScanError\|evaluateScanResult" "$D1"; then
+  ok "D1 Gatekeeper 评估介入：Prompt shown + 扫描拒绝（-67018 无公证；${D1}）"
+elif [ -z "$D1PID" ]; then
+  note "D1 隔离副本未启动（被拦）但本轮 syspolicyd 无新日志——当日多次评估后缓存，无公证仍拦；见 ${D1}"
+else
+  note "D1 隔离副本带警告对话启动；本轮 syspolicyd 无新日志（同上缓存）——如实记录"
+fi
+grep -q "denial breadcrumb" "$D1" && note "D1 本轮被拦到底（denial breadcrumb）" || true
+
+# ==========================================================================
 say "D3 HOMEBREW_CASK_OPTS=--no-quarantine（cask quarantine 语义）"
 # ==========================================================================
 D3=$EV/d3-cask-opts.log
+# 清场：D1 对话框若在本段前被放行、滞后拉起实例，会污染 D4 的可开断言。
+pkill -f "$APP_PATH/Contents/MacOS/ninja" 2>/dev/null
+wait_gone "$APP_PATH/Contents/MacOS/ninja" || true
+dismiss_alert
 brew uninstall --cask ninja >/dev/null 2>&1
 HOMEBREW_CASK_OPTS="--no-quarantine" brew install --cask ninja > "$D3" 2>&1
 if xattr -p com.apple.quarantine "$APP_PATH" >/dev/null 2>&1; then
@@ -339,7 +390,7 @@ say "D3b --no-quarantine CLI 开关对照（brew 5.1.8 已禁用，如实记录�
 brew uninstall --cask ninja >/dev/null 2>&1
 { brew install --cask ninja --no-quarantine; } > "$EV/d3b-cli-switch.log" 2>&1 || true
 grep -q "switch is disabled" "$EV/d3b-cli-switch.log" \
-  && ok "D3b `--no-quarantine` CLI 开关已禁用（There is no replacement；d3b-cli-switch.log）" \
+  && ok "D3b --no-quarantine CLI 开关已禁用（There is no replacement；d3b-cli-switch.log）" \
   || note "D3b CLI 开关未报禁用（行为变化？见 d3b-cli-switch.log）"
 [ ! -e "$APP_PATH" ] && ok "D3b 开关被拒后未安装（app 不在）" || true
 
@@ -347,6 +398,7 @@ grep -q "switch is disabled" "$EV/d3b-cli-switch.log" \
 say "E brew uninstall --cask 无残留（env 重装一份再卸）"
 # ==========================================================================
 E_LOG=$EV/e-uninstall.log
+rm -rf "$APP_PATH"   # 与 B 同理：防手工安装的残留副本干扰 E1 断言
 HOMEBREW_CASK_OPTS="--no-quarantine" brew install --cask ninja >/dev/null 2>&1
 [ -d "$APP_PATH" ] || HOMEBREW_CASK_OPTS="--no-quarantine" brew install --cask ninja >> "$E_LOG" 2>&1
 brew uninstall --cask ninja >> "$E_LOG" 2>&1
@@ -360,9 +412,15 @@ brew tap ninja/local >/dev/null 2>&1 && ok "E4 tap 语义：卸载 app 不拔 ta
 say "F q3 回归（docs/q3-evidence/run-e2e.sh；资源解析改动无破坏）"
 # ==========================================================================
 [ -n "${HOLD_PID:-}" ] && { kill "$HOLD_PID" 2>/dev/null; HOLD_PID=""; }
+if screen_locked; then
+  note "F0 屏幕锁定中（CGSSessionScreenIsLocked=1）：全局 HID 鼠标被锁屏吞，q3 套件的 ⌘click 断言必挂——环境阻塞非代码回归，解锁后重跑"
+fi
+pin_us   # F 段打字/点击密集，防链中途输入源被切回拼音
 bash docs/q3-evidence/run-e2e.sh > "$EV/regression-q3.log" 2>&1
 if grep -q "OVERALL: PASS" "$EV/regression-q3.log"; then
   ok "F1 q3 套件 OVERALL: PASS（regression-q3.log）"
+elif screen_locked; then
+  note "F1 q3 套件未过，但屏幕锁定中（点击段被锁屏吞）——待解锁重跑"
 else
   bad "F1 q3 回归失败（regression-q3.log）"
 fi

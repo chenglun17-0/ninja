@@ -24,7 +24,7 @@ git -C ~/my_repos/ninja-tap commit -qm "ninja tap"
 
 # 2) 接入 brew 并安装（cask 走 file:// DMG）
 brew tap ninja/local ~/my_repos/ninja-tap
-brew install --cask ninja --no-quarantine   # 见下：默认装会带隔离属性、被拦
+HOMEBREW_CASK_OPTS="--no-quarantine" brew install --cask ninja   # 为何用 env：见下
 # 卸载无残留：brew uninstall --cask ninja（会带走 /Applications/Ninja.app）
 # 拔 tap：brew untap ninja/local
 ```
@@ -41,9 +41,12 @@ brew install --cask ninja --no-quarantine   # 见下：默认装会带隔离属�
 - 带隔离属性时 `open` 被 Gatekeeper 拦：弹确认框、进程不启动
   （syspolicyd：scan `Code did not match any currently allowed policy`
   → `Prompt shown` → `denial breadcrumb`；`spctl -a -vv` = rejected）。
-- 两条可用路径：
-  - 安装时 `brew install --cask ninja --no-quarantine`
-    （或 `HOMEBREW_CASK_OPTS="--no-quarantine"`，同效）→ 无隔离属性，直接可开；
+- 两条可用路径（**注意**：`--no-quarantine` **CLI 开关在本机 brew 5.1.8
+  已禁用**——实测 `brew install --cask ninja --no-quarantine` 报
+  "Calling the `--[no-]quarantine` switch is disabled! There is no replacement."，
+  证据 docs/q4-evidence/d3b-cli-switch.log）：
+  - 安装时用环境变量 `HOMEBREW_CASK_OPTS="--no-quarantine"`（有效开关，实测
+    装出的副本无隔离属性、直接可开，证据 d3-cask-opts.log）；
   - 装完去属性：`xattr -dr com.apple.quarantine /Applications/Ninja.app`。
 - 本机自打 DMG 手工拖拽安装（不经 brew）**不带**隔离属性，直接可开。
 - 公开分发（他人下载）之前必须补 Developer ID + notarization——见

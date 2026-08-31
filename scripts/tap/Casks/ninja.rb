@@ -5,7 +5,7 @@
 #   Gatekeeper/隔离语义见本 tap 的 README.md 与 DISTRIBUTION.md。）
 cask "ninja" do
   version "0.1.0"
-  sha256 "20d9a212dbec2411149abaae14d0d0cefb6d7572967c48414ca55051ecc90944"
+  sha256 "2b7aee79abefba652cfb787554f494fcc55738e1bd5ed87fa72274a1279444bc"
 
   url "file:///Users/jal/my_repos/ninja/dist/Ninja-0.1.0-arm64.dmg"
   name "Ninja"
