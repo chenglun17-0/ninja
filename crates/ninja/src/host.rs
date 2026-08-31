@@ -1,0 +1,659 @@
+//! q1 宿主单例：ghostty app/config 句柄、运行时回调（wakeup/action/
+//! clipboard/close_surface）、surface 生命周期（建/拆）与 action 全分发。
+//!
+//! 所有回调都发生在主线程（action 由 app_tick 的邮箱排空或
+//! surface_key 同步触发；wakeup 只唤醒 RunLoop），与 q0 的
+//! AtomicPtr 单例同纪律：ghostty_app_tick 会同步重入 action_cb，不能用
+//! Mutex（重入死锁），用裸指针单例。
+
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+
+use objc2::rc::Retained;
+use objc2::{DefinedClass, MainThreadMarker};
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+use objc2_foundation::NSString;
+
+use ghostty_sys::*;
+
+use crate::pane;
+use crate::shell;
+use crate::surface::SurfaceHostView;
+
+/// 焦点环颜色（q1 静态：v1 ODP 光标蓝 #528bff；主题系统 q2 接）。
+pub const RING_COLOR: (u8, u8, u8) = (0x52, 0x8b, 0xff);
+/// 分隔条线色（bg 提亮 ~25%）。
+const DIVIDER_LIFT: f64 = 0.25;
+
+struct Host {
+    app: ghostty_app_t,
+    config: ghostty_config_t,
+    /// 活 surface → 其视图（Retained 持引用直到 surface_free 完成，
+    /// 防 use-after-free；ghostty 回调可能晚到一拍）。
+    live: Vec<(ghostty_surface_t, Retained<SurfaceHostView>)>,
+    /// 待释放 surface（close_surface_cb 可能在 ghostty 调用栈深处触发，
+    /// 立即 surface_free 会重入拆栈——延迟一拍 free，macOS 本尊
+    /// Task.detached 同款纪律）。元素带视图 Retained，free 完才放。
+    pending_free: Vec<(ghostty_surface_t, Retained<SurfaceHostView>)>,
+    free_scheduled: bool,
+    /// ghostty config 的 background 色（容器/分隔条/窗口 chrome 同源）。
+    bg: (u8, u8, u8),
+}
+
+static HOST: AtomicPtr<Host> = AtomicPtr::new(std::ptr::null_mut());
+static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
+
+fn host_opt() -> Option<&'static mut Host> {
+    let p = HOST.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *p })
+    }
+}
+
+pub fn next_pane_id() -> u32 {
+    NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 建宿主（进程一次；main 里 ghostty_init 后调）。
+pub fn init(app: ghostty_app_t, config: ghostty_config_t) {
+    assert!(HOST.load(Ordering::Acquire).is_null(), "host already init");
+    // 背景色读一次（容器/分隔条/窗口 chrome；q1 静态，q2 主题系统接）。
+    let mut bg = ghostty_config_color_s { r: 0x16, g: 0x16, b: 0x1e };
+    unsafe {
+        ghostty_config_get(
+            config,
+            &mut bg as *mut ghostty_config_color_s as *mut c_void,
+            c"background".as_ptr(),
+            10,
+        );
+    }
+    let host = Box::new(Host {
+        app,
+        config,
+        live: Vec::new(),
+        pending_free: Vec::new(),
+        free_scheduled: false,
+        bg: (bg.r, bg.g, bg.b),
+    });
+    HOST.store(Box::into_raw(host), Ordering::Release);
+}
+
+/// 进程收尾（app.run 返回后）：同步 free 剩余 surface（延迟队列可能没
+/// 跑完——RunLoop 已停），再 app/config free。调用后进程退出。
+pub fn shutdown() {
+    let p = HOST.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    if p.is_null() {
+        return;
+    }
+    let mut host = unsafe { Box::from_raw(p) };
+    let mut all = std::mem::take(&mut host.live);
+    all.append(&mut host.pending_free);
+    for (surface, _view) in all {
+        unsafe { ghostty_surface_free(surface) };
+    }
+    unsafe {
+        ghostty_app_free(host.app);
+        ghostty_config_free(host.config);
+    }
+}
+
+/// 容器/分隔条底色（NSColor；pane.rs drawRect 用）。
+pub fn bg_color() -> Retained<objc2_app_kit::NSColor> {
+    let Some(h) = host_opt() else {
+        return gray(0x16, 0x16, 0x1e);
+    };
+    gray(h.bg.0, h.bg.1, h.bg.2)
+}
+
+/// 分隔条 1px 线色（bg 提亮）。
+pub fn divider_color() -> Retained<objc2_app_kit::NSColor> {
+    let Some(h) = host_opt() else {
+        return gray(0x3e, 0x44, 0x52);
+    };
+    let (r, g, b) = h.bg;
+    let lift = |c: u8| ((f64::from(c) / 255.0 + DIVIDER_LIFT).min(1.0) * 255.0) as u8;
+    gray(lift(r), lift(g), lift(b))
+}
+
+fn gray(r: u8, g: u8, b: u8) -> Retained<objc2_app_kit::NSColor> {
+    objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(
+        f64::from(r) / 255.0,
+        f64::from(g) / 255.0,
+        f64::from(b) / 255.0,
+        1.0,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// surface 生命周期
+// ---------------------------------------------------------------------------
+
+/// 建面统一入口：nsview/userdata 交 ghostty，context（WINDOW/TAB/SPLIT）
+/// + 父面走 inherited_config（继承字号/工作目录）。
+pub fn attach_surface(
+    view: &SurfaceHostView,
+    context: ghostty_surface_context_e,
+    parent: Option<&SurfaceHostView>,
+) -> ghostty_surface_t {
+    let host = host_opt().expect("host init");
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let scale = view
+        .window()
+        .map(|w| w.backingScaleFactor())
+        .or_else(|| {
+            objc2_app_kit::NSScreen::mainScreen(mtm).map(|s| s.backingScaleFactor())
+        })
+        .unwrap_or(2.0);
+
+    // SAFETY: 结构体按 ABI 组装；inherited_config 返回值的字符串指针仅
+    // 在本函数内有效（surface_new 同步消费），macOS 本尊同款。
+    unsafe {
+        let mut scfg = match parent.and_then(|p| p.surface_opt()) {
+            Some(p) => ghostty_surface_inherited_config(p, context),
+            None => ghostty_surface_config_new(),
+        };
+        scfg.platform_tag = GHOSTTY_PLATFORM_MACOS;
+        scfg.platform.macos.nsview = std::ptr::from_ref(view) as *mut c_void;
+        scfg.userdata = std::ptr::from_ref(view) as *mut c_void;
+        scfg.scale_factor = scale;
+        // command/initial_input 不设（默认 shell；q0 取证机的显式
+        // /bin/bash 只属 demo 模式）。
+        scfg.initial_input = std::ptr::null();
+        scfg.wait_after_command = false;
+        scfg.context = context;
+        let surface = ghostty_surface_new(host.app, &scfg);
+        assert!(!surface.is_null(), "ghostty_surface_new failed");
+        view.ivars().surface.set(surface);
+        // SAFETY: 同类指针 retain（AppKit 引用计数安全）。
+        let retained =
+            Retained::retain(std::ptr::from_ref(view) as *mut SurfaceHostView).expect("view alive");
+        host.live.push((surface, retained));
+        view.push_size();
+        surface
+    }
+}
+
+/// 拆一个叶子（树操作在 pane::close_leaf；这里只做 surface 延迟 free
+/// 登记）。幂等。
+pub fn close_leaf_deferred(view: &SurfaceHostView) {
+    if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+        eprintln!("ninja: close_leaf_deferred pane={}", view.pane_id());
+    }
+    let Some(surface) = view.surface_opt() else {
+        return;
+    };
+    // 先断开（view 不再收事件），再从 live 摘、进延迟队列。
+    view.ivars().surface.set(std::ptr::null_mut());
+    let Some(host) = host_opt() else { return };
+    if let Some(pos) = host.live.iter().position(|(s, _)| *s == surface) {
+        let (_, v) = host.live.remove(pos);
+        host.pending_free.push((surface, v));
+        schedule_free();
+    }
+}
+
+/// 立即拆（不走延迟队列；防御路径用——split 失败回收）。
+pub fn close_leaf_now(view: &SurfaceHostView) {
+    let Some(surface) = view.surface_opt() else {
+        return;
+    };
+    view.ivars().surface.set(std::ptr::null_mut());
+    let Some(host) = host_opt() else { return };
+    host.live.retain(|(s, _)| *s != surface);
+    unsafe { ghostty_surface_free(surface) };
+}
+
+/// 延迟 free 的执行拍（NSTimer 一拍后；close_surface_cb 栈已退）。
+fn schedule_free() {
+    let Some(host) = host_opt() else { return };
+    if host.free_scheduled || host.pending_free.is_empty() {
+        return;
+    }
+    host.free_scheduled = true;
+    run_free_tick_soon();
+}
+
+fn run_free_tick_soon() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    // 借 app delegate 的选择器（ninjaFreeTick:）起一次性 timer；delegate
+    // 常活（进程生命期），timer 触发即失效。
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let delegate: Option<Retained<objc2::runtime::ProtocolObject<dyn objc2_app_kit::NSApplicationDelegate>>> =
+        app.delegate();
+    let Some(delegate) = delegate else { return };
+    // SAFETY: -self 按约定返回 retain 过的引用。
+    let target: Retained<objc2::runtime::AnyObject> = unsafe { objc2::msg_send![&*delegate, self] };
+    // SAFETY: scheduledTimer 平凡；selector 由 app.rs 定义。
+    let timer = unsafe {
+        objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+            0.05,
+            &target,
+            objc2::sel!(ninjaFreeTick:),
+            None,
+            false,
+        )
+    };
+    std::mem::forget(timer); // 一次性；触发即失效
+}
+
+/// ninjaFreeTick: 的实现体（app.rs 转发到这里）。
+pub fn free_tick() {
+    let Some(host) = host_opt() else { return };
+    host.free_scheduled = false;
+    let pending = std::mem::take(&mut host.pending_free);
+    for (surface, _view) in pending {
+        // SAFETY: 此刻不在任何 ghostty 调用栈内（timer 拍）。
+        unsafe { ghostty_surface_free(surface) };
+    }
+}
+
+/// surface → 视图（action/close 回调翻面用）。
+///
+/// 经 `ghostty_surface_userdata`（建面时挂的 view 指针）取，而非 live 表：
+/// surface_new 期间就会同步触发 CELL_SIZE/SIZE_LIMIT/INITIAL_SIZE 等
+/// action（那时还没进 live 表）。retain 保证调用期间视图存活；已拆面
+/// 的 ivars.surface 为 null，各分发分支自然 no-op。
+pub fn view_of_surface(surface: ghostty_surface_t) -> Option<Retained<SurfaceHostView>> {
+    // SAFETY: userdata 是建面时挂的本进程指针；retain 防已拆面在调用
+    // 期间释放（pending_free 持有的 Retained 也参与保活）。
+    unsafe {
+        let ud = ghostty_surface_userdata(surface);
+        if ud.is_null() {
+            return None;
+        }
+        Retained::retain(ud as *mut SurfaceHostView)
+    }
+}
+
+/// VIEWPORT 坐标精确区域读取（zoom dump 的 last 行取证；q0 demo 同款）。
+pub fn read_text(surface: ghostty_surface_t, x0: u32, y0: u32, x1: u32, y1: u32) -> String {
+    unsafe {
+        let sel = ghostty_selection_s {
+            top_left: ghostty_point_s {
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_EXACT,
+                x: x0,
+                y: y0,
+            },
+            bottom_right: ghostty_point_s {
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_EXACT,
+                x: x1,
+                y: y1,
+            },
+            rectangle: true,
+        };
+        let mut text = ghostty_text_s {
+            tl_px_x: 0.0,
+            tl_px_y: 0.0,
+            offset_start: 0,
+            offset_len: 0,
+            text: std::ptr::null(),
+            text_len: 0,
+        };
+        let ok = ghostty_surface_read_text(surface, sel, &mut text);
+        let out = if ok && !text.text.is_null() {
+            let bytes = std::slice::from_raw_parts(text.text as *const u8, text.text_len);
+            String::from_utf8_lossy(bytes).to_string()
+        } else {
+            String::new()
+        };
+        ghostty_surface_free_text(surface, &mut text);
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ghostty runtime 回调
+// ---------------------------------------------------------------------------
+
+pub unsafe extern "C" fn wakeup_cb(_userdata: *mut c_void) {
+    // 可能从 IO/渲染线程调用：只唤醒主 RunLoop，主线程 timer 里 app_tick
+    //（CFRunLoop 唤醒线程安全）。
+    objc2_core_foundation::CFRunLoop::main().unwrap().wake_up();
+}
+
+/// action 全分发（q1 的 window/tab/split 上下文回调接布局树）。
+unsafe extern "C" fn action_cb(
+    _app: ghostty_app_t,
+    target: ghostty_target_s,
+    action: ghostty_action_s,
+) -> bool {
+    // SAFETY: action 是联合体，按 tag 取字段；target.surface 经 userdata
+    // 翻回视图（不在 live 表 = 已拆面，忽略）。
+    unsafe {
+        let view: Option<Retained<SurfaceHostView>> = (target.tag == GHOSTTY_TARGET_SURFACE)
+            .then(|| view_of_surface(target.target.surface))
+            .flatten();
+        dispatch_action(view, action)
+    }
+}
+
+unsafe fn dispatch_action(
+    view: Option<Retained<SurfaceHostView>>,
+    action: ghostty_action_s,
+) -> bool {
+    if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+        eprintln!("ninja: action tag={} has_view={}", action.tag as i32, view.is_some());
+    }
+    unsafe {
+        match action.tag {
+            // ---- 窗/tab/split 布局树 ----
+            GHOSTTY_ACTION_NEW_WINDOW => {
+                let mtm = MainThreadMarker::new().unwrap();
+                shell::new_window(mtm, view.as_deref()); // make_window 内 wire_window
+                true
+            }
+            GHOSTTY_ACTION_NEW_TAB => {
+                let mtm = MainThreadMarker::new().unwrap();
+                shell::new_tab(mtm, view.as_deref()); // 同上
+                true
+            }
+            GHOSTTY_ACTION_NEW_SPLIT => {
+                let Some(v) = view.as_ref() else { return false };
+                let Some(w) = v.window() else { return false };
+                let Some(container) = pane::container_of(&w) else {
+                    return false;
+                };
+                let Some((dir, before)) = shell::split_dir_of(action.action.new_split) else {
+                    return false;
+                };
+                container.split_beside(v, dir, before);
+                true
+            }
+            GHOSTTY_ACTION_CLOSE_TAB => {
+                let Some(w) = window_of(&view) else { return false };
+                shell::close_tab(&w, action.action.close_tab_mode);
+                true
+            }
+            GHOSTTY_ACTION_CLOSE_WINDOW => {
+                let Some(w) = window_of(&view) else { return false };
+                w.close(); // 整窗关（非裸⌘W 路径）
+                true
+            }
+            GHOSTTY_ACTION_CLOSE_ALL_WINDOWS => {
+                let Some(mtm) = MainThreadMarker::new() else { return false };
+                let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+                for w in app.windows().iter() {
+                    if pane::container_of(&w).is_some() {
+                        w.close();
+                    }
+                }
+                true
+            }
+            GHOSTTY_ACTION_GOTO_TAB => {
+                let Some(w) = window_of(&view) else { return false };
+                shell::goto_tab(&w, action.action.goto_tab);
+                true
+            }
+            GHOSTTY_ACTION_MOVE_TAB => {
+                let Some(w) = window_of(&view) else { return false };
+                shell::move_tab(&w, action.action.move_tab.amount);
+                true
+            }
+            GHOSTTY_ACTION_GOTO_WINDOW => {
+                let Some(mtm) = MainThreadMarker::new() else { return false };
+                shell::goto_window(mtm, action.action.goto_window);
+                true
+            }
+            GHOSTTY_ACTION_GOTO_SPLIT => {
+                let Some(v) = view.as_ref() else { return false };
+                let Some(w) = v.window() else { return false };
+                let Some(container) = pane::container_of(&w) else { return false };
+                match action.action.goto_split {
+                    GHOSTTY_GOTO_SPLIT_PREVIOUS => container.cycle_focus(-1),
+                    GHOSTTY_GOTO_SPLIT_NEXT => container.cycle_focus(1),
+                    GHOSTTY_GOTO_SPLIT_UP => container.focus_dir(crate::pane::Dir::Vertical, false),
+                    GHOSTTY_GOTO_SPLIT_DOWN => container.focus_dir(crate::pane::Dir::Vertical, true),
+                    GHOSTTY_GOTO_SPLIT_LEFT => {
+                        container.focus_dir(crate::pane::Dir::Horizontal, false)
+                    }
+                    GHOSTTY_GOTO_SPLIT_RIGHT => {
+                        container.focus_dir(crate::pane::Dir::Horizontal, true)
+                    }
+                    _ => {}
+                }
+                true
+            }
+            GHOSTTY_ACTION_RESIZE_SPLIT => {
+                let Some(v) = view.as_ref() else { return false };
+                let Some(w) = v.window() else { return false };
+                let Some(container) = pane::container_of(&w) else { return false };
+                let rs = action.action.resize_split;
+                let dir = match rs.direction {
+                    GHOSTTY_RESIZE_SPLIT_UP => pane::ResizeDir::Up,
+                    GHOSTTY_RESIZE_SPLIT_DOWN => pane::ResizeDir::Down,
+                    GHOSTTY_RESIZE_SPLIT_LEFT => pane::ResizeDir::Left,
+                    GHOSTTY_RESIZE_SPLIT_RIGHT => pane::ResizeDir::Right,
+                    _ => return false,
+                };
+                container.resize_split(dir, f64::from(rs.amount));
+                true
+            }
+            GHOSTTY_ACTION_EQUALIZE_SPLITS => {
+                let Some(v) = view.as_ref() else { return false };
+                let Some(w) = v.window() else { return false };
+                let Some(container) = pane::container_of(&w) else { return false };
+                container.equalize();
+                true
+            }
+            GHOSTTY_ACTION_TOGGLE_SPLIT_ZOOM => {
+                let Some(v) = view.as_ref() else { return false };
+                let Some(w) = v.window() else { return false };
+                let Some(container) = pane::container_of(&w) else { return false };
+                container.toggle_zoom(); // ⌘⇧Enter 三态状态机（v1 同款）
+                true
+            }
+            GHOSTTY_ACTION_TOGGLE_MAXIMIZE => {
+                let Some(w) = window_of(&view) else { return false };
+                w.zoom(None);
+                true
+            }
+
+            // ---- 窗口几何/标题/PWD ----
+            GHOSTTY_ACTION_SIZE_LIMIT => {
+                let Some(view) = &view else { return false };
+                let s = action.action.size_limit;
+                view.set_size_limit(
+                    Some((s.min_width, s.min_height)),
+                    Some((s.max_width, s.max_height)),
+                );
+                true
+            }
+            GHOSTTY_ACTION_INITIAL_SIZE => {
+                let Some(view) = &view else { return false };
+                let s = action.action.initial_size;
+                view.ivars().initial_pt.set(Some((s.width, s.height)));
+                // 只对未显示窗口生效（建窗流程 make_window 消费；运行中
+                // 的窗口不被字体/配置变化重置——macOS 本尊同款只管新窗）。
+                if let Some(w) = view.window()
+                    && !w.isVisible()
+                {
+                    w.setContentSize(objc2_foundation::NSSize::new(
+                        s.width as f64,
+                        s.height as f64,
+                    ));
+                }
+                true
+            }
+            GHOSTTY_ACTION_SET_TITLE => {
+                let title = CStr::from_ptr(action.action.set_title.title)
+                    .to_string_lossy()
+                    .to_string();
+                if let Some(w) = window_of(&view) {
+                    w.setTitle(&NSString::from_str(&title));
+                }
+                true
+            }
+            GHOSTTY_ACTION_SET_TAB_TITLE => {
+                // 原生 tab 的标题 = 各自 window 的 title。
+                let title = CStr::from_ptr(action.action.set_tab_title.title)
+                    .to_string_lossy()
+                    .to_string();
+                if let Some(w) = window_of(&view) {
+                    w.setTitle(&NSString::from_str(&title));
+                }
+                true
+            }
+            GHOSTTY_ACTION_PWD => {
+                let pwd = CStr::from_ptr(action.action.pwd.pwd)
+                    .to_string_lossy()
+                    .to_string();
+                if let Some(v) = &view {
+                    *v.ivars().pwd.borrow_mut() = Some(pwd);
+                }
+                true
+            }
+
+            GHOSTTY_ACTION_CELL_SIZE => {
+                let Some(view) = &view else { return false };
+                let c = action.action.cell_size;
+                view.ivars().cell_px.set(Some((c.width, c.height)));
+                true
+            }
+
+            // ---- 渲染/其余（q1 不需要；q2/q3 的面）----
+            GHOSTTY_ACTION_RENDER => {
+                // 嵌入 apprt 无 must_draw_from_app_thread（渲染线程自画），
+                // 该 action 不应到；防御性补一帧无害。
+                if let Some(v) = &view
+                    && let Some(s) = v.surface_opt()
+                {
+                    ghostty_surface_draw(s);
+                }
+                true
+            }
+            _ => false, // MOUSE_OVER_LINK/MOUSE_SHAPE/CONFIG_CHANGE/OPEN_URL… 留 q2/q3
+        }
+    }
+}
+
+fn window_of(view: &Option<Retained<SurfaceHostView>>) -> Option<Retained<objc2_app_kit::NSWindow>> {
+    view.as_ref().and_then(|v| v.window())
+}
+
+unsafe extern "C" fn read_clipboard_cb(
+    _userdata: *mut c_void,
+    _clipboard: ghostty_clipboard_e,
+    request: *mut c_void,
+) -> bool {
+    // 主线程（app_tick 处理中）同步回粘贴板内容（q0 demo 同款）。
+    let Some(view) = current_surface_view() else { return false };
+    let Some(surface) = view.surface_opt() else {
+        return false;
+    };
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        match pb.stringForType(NSPasteboardTypeString) {
+            None => {
+                ghostty_surface_complete_clipboard_request(
+                    surface,
+                    c"".as_ptr(),
+                    request,
+                    false,
+                )
+            }
+            Some(s) => {
+                let c = CString::new(s.to_string()).unwrap_or_default();
+                ghostty_surface_complete_clipboard_request(surface, c.as_ptr(), request, true);
+            }
+        }
+    }
+    true
+}
+
+/// 剪贴板回调没有 surface 上下文（userdata 是 app 级）——取当前 key
+/// window 的焦点面（q0 demo 单面直取的推广；q1 主用法成立）。
+fn current_surface_view() -> Option<Retained<SurfaceHostView>> {
+    let mtm = MainThreadMarker::new()?;
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let w = app.keyWindow().or_else(|| app.mainWindow())?;
+    let container = pane::container_of(&w)?;
+    container.focused_leaf().or_else(|| container.leaves().first().cloned())
+}
+
+unsafe extern "C" fn confirm_read_clipboard_cb(
+    _userdata: *mut c_void,
+    _data: *const c_char,
+    request: *mut c_void,
+    _kind: ghostty_clipboard_request_e,
+) {
+    // q1 无确认 UI：以空内容放行，避免粘贴挂起（q0 demo 同款）。
+    let Some(view) = current_surface_view() else { return };
+    if let Some(surface) = view.surface_opt() {
+        unsafe {
+            ghostty_surface_complete_clipboard_request(surface, c"".as_ptr(), request, false);
+        }
+    }
+}
+
+unsafe extern "C" fn write_clipboard_cb(
+    _userdata: *mut c_void,
+    clipboard: ghostty_clipboard_e,
+    contents: *const ghostty_clipboard_content_s,
+    count: usize,
+    _confirmed: bool,
+) {
+    unsafe {
+        if clipboard != GHOSTTY_CLIPBOARD_STANDARD || count == 0 || contents.is_null() {
+            return;
+        }
+        let data = std::slice::from_raw_parts(
+            (*contents).data as *const u8,
+            libc::strlen((*contents).data),
+        );
+        let Ok(s) = std::str::from_utf8(data) else { return };
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        pb.setString_forType(&NSString::from_str(s), NSPasteboardTypeString);
+    }
+}
+
+/// ghostty close_surface（⌘W 默认绑定）/EOF 的宿主入口：
+/// process_alive 语义不影响决策（v1 ⌘W/EOF 同途：多 pane 拆焦点叶、
+/// 单 pane performClose；确认对话框不是 v1 语义）。
+pub unsafe extern "C" fn close_surface_cb(userdata: *mut c_void, process_alive: bool) {
+    // userdata = 建 surface 时挂的 view 指针。幂等：ivars.surface 已被
+    // close_leaf_deferred 清空的面（重复 EOF/⌘W）直接忽略。
+    let view: &SurfaceHostView = unsafe { &*(userdata as *const SurfaceHostView) };
+    if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+        eprintln!("ninja: close_surface_cb alive={} process_alive={process_alive}", view.surface_opt().is_some());
+    }
+    if view.surface_opt().is_none() {
+        return;
+    }
+    shell::handle_surface_close(view, process_alive);
+}
+
+/// 组运行时回调表（main 里 ghostty_app_new 用）。
+pub fn runtime_config() -> ghostty_runtime_config_s {
+    ghostty_runtime_config_s {
+        userdata: std::ptr::null_mut(),
+        supports_selection_clipboard: false,
+        wakeup_cb: Some(wakeup_cb),
+        action_cb: Some(action_cb),
+        read_clipboard_cb: Some(read_clipboard_cb),
+        confirm_read_clipboard_cb: Some(confirm_read_clipboard_cb),
+        write_clipboard_cb: Some(write_clipboard_cb),
+        close_surface_cb: Some(close_surface_cb),
+    }
+}
+
+/// 主 RunLoop tick（16ms timer）：app_tick 驱动 action/邮箱（渲染线程
+/// 自画，不在此 draw；q0 demo 的 timer+draw 是 demo 模式）。
+pub unsafe extern "C-unwind" fn tick_cb(
+    _timer: *mut objc2_core_foundation::CFRunLoopTimer,
+    _info: *mut c_void,
+) {
+    let Some(host) = host_opt() else { return };
+    unsafe { ghostty_app_tick(host.app) };
+}
+
+/// 短句柄访问（app 级操作：app_set_focus 等）。
+pub fn with_app(f: impl FnOnce(ghostty_app_t)) {
+    if let Some(h) = host_opt() {
+        f(h.app);
+    }
+}

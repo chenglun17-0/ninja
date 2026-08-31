@@ -1,0 +1,93 @@
+ninja q1 shell — libghostty 1.3.2-master-+7c92cd6
+ninja: action tag=41 has_view=false
+ninja: action tag=25 has_view=true
+ninja: action tag=22 has_view=true
+screen: NINJA_E2E_SCREEN=27（虚拟屏取证）
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=41 has_view=false
+ninja: action tag=25 has_view=true
+ninja: action tag=22 has_view=true
+ninja: action tag=25 has_view=true
+screen: NINJA_E2E_SCREEN=27（虚拟屏取证）
+ninja: action tag=25 has_view=true
+ninja: action tag=25 has_view=true
+ninja: action tag=41 has_view=false
+ninja: action tag=25 has_view=true
+ninja: action tag=22 has_view=true
+ninja: action tag=25 has_view=true
+ninja: action tag=25 has_view=true
+ninja: action tag=25 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=32 has_view=true
+ninja: keyDown code=6 flags=0x100 chars=Some("z") unmod=Some("z")
+2026-08-31 12:58:24.163 ninja[67507:14969634] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit
+ninja: surface_key code=6 text="z" mods=0x0 consumed=true
+ninja: surface_key code=6 text=None mods=0x0 consumed=false
+ninja: action tag=32 has_view=true
+ninja: keyDown code=51 flags=0x100 chars=Some("\u{7f}") unmod=Some("\u{8}")
+ninja: surface_key code=51 text="\u{7f}" mods=0x0 consumed=true
+ninja: surface_key code=51 text=None mods=0x0 consumed=false
+ninja: action tag=32 has_view=true
+ninja: action tag=20 has_view=true
+ninja: action tag=20 has_view=true
+ninja: mouseDown pane=2 loc=CGPoint { x: 160.0, y: 191.60000610351563 } win=CGPoint { x: 160.0, y: 212.39999389648438 }
+ninja: keyDown code=14 flags=0x100 chars=Some("e") unmod=Some("e")
+ninja: surface_key code=14 text="e" mods=0x0 consumed=true
+ninja: surface_key code=14 text=None mods=0x0 consumed=false
+ninja: keyDown code=8 flags=0x100 chars=Some("c") unmod=Some("c")
+ninja: surface_key code=8 text="c" mods=0x0 consumed=true
+ninja: surface_key code=8 text=None mods=0x0 consumed=false
+ninja: keyDown code=4 flags=0x100 chars=Some("h") unmod=Some("h")
+ninja: surface_key code=4 text="h" mods=0x0 consumed=true
+ninja: surface_key code=4 text=None mods=0x0 consumed=false
+ninja: keyDown code=31 flags=0x100 chars=Some("o") unmod=Some("o")
+ninja: surface_key code=31 text="o" mods=0x0 consumed=true
+ninja: surface_key code=31 text=None mods=0x0 consumed=false
+ninja: keyDown code=37 flags=0x20100 chars=Some("L") unmod=Some("l")
+ninja: surface_key code=37 text="L" mods=0x1 consumed=true
+ninja: surface_key code=37 text=None mods=0x1 consumed=false
+ninja: action tag=36 has_view=true
+ninja: action tag=36 has_view=true
+ninja: keyDown code=14 flags=0x100 chars=Some("e") unmod=Some("e")
+ninja: surface_key code=14 text="e" mods=0x0 consumed=true
+ninja: surface_key code=14 text=None mods=0x0 consumed=false
+ninja: keyDown code=8 flags=0x100 chars=Some("c") unmod=Some("c")
+ninja: surface_key code=8 text="c" mods=0x0 consumed=true
+ninja: surface_key code=8 text=None mods=0x0 consumed=false
+ninja: keyDown code=4 flags=0x100 chars=Some("h") unmod=Some("h")
+ninja: surface_key code=4 text="h" mods=0x0 consumed=true
+ninja: surface_key code=4 text=None mods=0x0 consumed=false
+ninja: keyDown code=31 flags=0x100 chars=Some("o") unmod=Some("o")
+ninja: surface_key code=31 text="o" mods=0x0 consumed=true
+ninja: surface_key code=31 text=None mods=0x0 consumed=false
+ninja: keyDown code=15 flags=0x20100 chars=Some("R") unmod=Some("r")
+ninja: surface_key code=15 text="R" mods=0x1 consumed=true
+ninja: surface_key code=15 text=None mods=0x1 consumed=false
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: action tag=26 has_view=true
+ninja: keyDown code=123 flags=0x940100 chars=Some("\u{f702}") unmod=Some("\u{1c}")
+ninja: action tag=18 has_view=true
+ninja: action tag=44 has_view=true
+ninja: surface_key code=123 text=None mods=0xa consumed=true
+ninja: keyDown code=24 flags=0x140100 chars=Some("=") unmod=Some("=")
+ninja: action tag=19 has_view=true
+ninja: action tag=44 has_view=true
+ninja: surface_key code=24 text="=" mods=0xa consumed=true
