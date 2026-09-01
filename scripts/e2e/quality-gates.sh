@@ -27,15 +27,24 @@ FAIL=0
 APP_PID=""
 HOLD_PID=""
 
-say()  { printf '\n== %s\n' "$*"; }
-ok()   { PASS=$((PASS + 1)); echo "  [PASS] $*"; }
-bad()  { FAIL=$((FAIL + 1)); echo "  [FAIL] $*"; }
+say() { printf '\n== %s\n' "$*"; }
+ok() {
+  PASS=$((PASS + 1))
+  echo "  [PASS] $*"
+}
+bad() {
+  FAIL=$((FAIL + 1))
+  echo "  [FAIL] $*"
+}
 note() { echo "  [note] $*"; }
 
 cleanup() {
   if [ -n "${APP_PID:-}" ]; then
     kill "$APP_PID" 2>/dev/null
-    for _ in $(seq 30); do kill -0 "$APP_PID" 2>/dev/null || break; sleep 0.1; done
+    for _ in $(seq 30); do
+      kill -0 "$APP_PID" 2>/dev/null || break
+      sleep 0.1
+    done
     kill -9 "$APP_PID" 2>/dev/null
     wait "$APP_PID" 2>/dev/null
   fi
@@ -118,7 +127,10 @@ fi
 # GUI 前置：构建 + 清残留 + 虚拟屏
 # ---------------------------------------------------------------------------
 say "G3–G5 前置（构建 + 虚拟屏）"
-cargo build -p ninja >/dev/null 2>&1 || { echo "FATAL: cargo build -p ninja 失败"; exit 1; }
+cargo build -p ninja >/dev/null 2>&1 || {
+  echo "FATAL: cargo build -p ninja 失败"
+  exit 1
+}
 scripts/e2e/reap.sh >/dev/null 2>&1 || true
 
 VD_JSON=$WORK/vd.json
@@ -144,7 +156,7 @@ fi
 start_host() { # tag → APP_PID / $LOGS/$tag.log；就绪探子 = 「q2 shell」启动行（恒打印）
   local tag=$1
   mkdir -p "$WORK/$tag-xdg"
-  : > "$WORK/$tag-panel"
+  : >"$WORK/$tag-panel"
   env \
     XDG_CONFIG_HOME="$WORK/$tag-xdg" \
     NINJA_CONFIG="$WORK/$tag-ninja.toml" \
@@ -172,7 +184,10 @@ dump_tail() { # tag —— 失败诊断：日志尾部不随退出消失
 stop_host() {
   [ -n "${APP_PID:-}" ] || return 0
   kill "$APP_PID" 2>/dev/null
-  for _ in $(seq 30); do kill -0 "$APP_PID" 2>/dev/null || break; sleep 0.1; done
+  for _ in $(seq 30); do
+    kill -0 "$APP_PID" 2>/dev/null || break
+    sleep 0.1
+  done
   kill -9 "$APP_PID" 2>/dev/null
   wait "$APP_PID" 2>/dev/null
   APP_PID=""
@@ -183,7 +198,7 @@ stop_host() {
 # G3 空载不变量
 # ---------------------------------------------------------------------------
 say "G3 空载不变量（enabled 空）"
-printf '[plugins]\nenabled = []\n' > "$WORK/g3-ninja.toml"
+printf '[plugins]\nenabled = []\n' >"$WORK/g3-ninja.toml"
 rm -f "$WORK/g3-ade.sock"
 if start_host g3; then
   sleep 1.2
@@ -206,7 +221,7 @@ fi
 say "G4 启用即拉起 / 关掉即轻（gatefake 全生命周期）"
 PDIR=$WORK/g4-plugins
 mkdir -p "$PDIR"
-cat > "$PDIR/gatefake" <<'PY'
+cat >"$PDIR/gatefake" <<'PY'
 #!/usr/bin/env python3
 import os, socket, sys, time
 sock = os.environ.get("NINJA_ADE_SOCK")
@@ -226,7 +241,7 @@ while True:
         sys.exit(0)  # 宿主关socket（EOF）= 正常退出
 PY
 chmod +x "$PDIR/gatefake"
-printf '[plugins]\nenabled = ["gatefake"]\n' > "$WORK/g4-ninja.toml"
+printf '[plugins]\nenabled = ["gatefake"]\n' >"$WORK/g4-ninja.toml"
 SOCK="$WORK/g4-ade.sock"
 PANEL="$WORK/g4-panel"
 
@@ -235,7 +250,7 @@ if NINJA_PLUGIN_DIR="$PDIR" start_host g4; then
   wait_for "socket 出现" 8 [ -e "$SOCK" ] && ok "启用即绑定 socket" || bad "socket 未出现"
   wait_for "插件进程拉起" 8 pgrep -f "$PDIR/gatefake" && ok "启用即拉起（gatefake 在跑）" || bad "插件未拉起"
 
-  echo "gatefake off" > "$PANEL"
+  echo "gatefake off" >"$PANEL"
   wait_for "off 后进程回收" 8 sh -c "! pgrep -f '$PDIR/gatefake'" &&
     ok "关掉即轻：进程回收" || bad "off 后进程仍在"
   wait_for "off 后 socket 删除" 5 sh -c "[ ! -e '$SOCK' ]" &&
@@ -243,7 +258,7 @@ if NINJA_PLUGIN_DIR="$PDIR" start_host g4; then
   grep -q "插件已禁用" "$LOGS/g4.log" && ok "宿主记录禁用收口（层/连接/子进程/socket）" ||
     note "日志未见「插件已禁用」行"
 
-  echo "gatefake on" > "$PANEL"
+  echo "gatefake on" >"$PANEL"
   wait_for "重开后 socket 重绑" 8 [ -e "$SOCK" ] && ok "再启用：重绑 socket" || bad "on 后 socket 未回"
   wait_for "重开后插件重拉" 8 pgrep -f "$PDIR/gatefake" && ok "再启用：重新拉起" || bad "on 后未重拉"
 
