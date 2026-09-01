@@ -364,7 +364,8 @@ PY
     # prompt，echo 输出 ≈ 第 3 行，梯子 3/4/2/5/6 负责兼容）。
     echo dump >"$WORK/g6-zoom"
     sleep 0.8
-    GEOM=$(python3 - "$WORK/g6-zoomdump.json" "$APP_PID" "$SYNTH" <<'EOF'
+    GEOM=$(
+      python3 - "$WORK/g6-zoomdump.json" "$APP_PID" "$SYNTH" <<'EOF'
 import json, subprocess, sys
 dump = json.load(open(sys.argv[1]))
 leaf = [l for l in dump["leaves"] if not l["hidden"]][0]
@@ -375,7 +376,7 @@ ch = leaf["h"] / leaf["rows"]
 tb = wh - leaf["h"]
 print(f"{leaf['x']:.1f} {leaf['y']:.1f} {cw:.2f} {ch:.2f} {wx:.1f} {wy:.1f} {tb:.1f}")
 EOF
-)
+    )
     CLAIMED=0
     if [ -n "$GEOM" ]; then
       set -- $GEOM
