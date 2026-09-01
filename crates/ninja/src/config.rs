@@ -331,11 +331,13 @@ pub fn user_sets_theme(files: &[PathBuf]) -> bool {
 // ninja.toml 收缩（宿主/插件特有）
 // ---------------------------------------------------------------------------
 
-/// `[plugins]`：只解析不拉起（监督器 q3；空载零插件进程/零 socket）。
+/// `[plugins]`：只解析不拉起（监督器消费；空载零插件进程/零 socket）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginsConfig {
     pub enabled: Vec<String>,
     pub paths: Vec<(String, String)>,
+    /// 单插件内存上限（MiB）。None = 宿主默认（512）；0 = 不限。
+    pub memory_limit_mb: Option<u64>,
 }
 
 /// ninja.toml 收缩后的宿主配置（q2 只有 [plugins]）。
@@ -432,6 +434,12 @@ fn parse_plugins(val: &toml::Value, cfg: &mut HostConfig) {
                     }
                 }
             }
+            "memory_limit_mb" => match v.as_integer() {
+                Some(n) if n >= 0 => {
+                    cfg.plugins.memory_limit_mb = Some(n as u64);
+                }
+                _ => eprintln!("ninja: [plugins] memory_limit_mb 不是非负整数，忽略"),
+            },
             other => eprintln!("ninja: ninja.toml [plugins] 未知键 `{other}`，忽略"),
         }
     }
@@ -1312,6 +1320,16 @@ x = 1
     // ------------------------------------------------------------------
     // 热重载快照
     // ------------------------------------------------------------------
+
+    #[test]
+    fn plugins_memory_limit_mb_parses() {
+        let cfg = parse_host_config("[plugins]\nenabled = []\nmemory_limit_mb = 256\n");
+        assert_eq!(cfg.plugins.memory_limit_mb, Some(256));
+        let cfg = parse_host_config("[plugins]\nenabled = []\n");
+        assert_eq!(cfg.plugins.memory_limit_mb, None);
+        let cfg = parse_host_config("[plugins]\nmemory_limit_mb = -1\n");
+        assert_eq!(cfg.plugins.memory_limit_mb, None, "负值应忽略");
+    }
 
     #[test]
     fn watch_state_detects_change_and_new_file() {

@@ -55,6 +55,8 @@ The supervisor binds `${TMPDIR}/ninja-ade-{pid}.sock` only when at least one plu
 
 Replacing an enabled binary (mtime change) restarts that child. Dropping a new file into the plugin directory makes it visible in the panel; it does not auto-enable.
 
+The supervisor samples each child's physical footprint (`ri_phys_footprint`) at ~1s and kills over-limit plugins, surfacing the reason in the panel. Default 512 MiB per plugin; `[plugins] memory_limit_mb` overrides, `0` disables the cap.
+
 The panel (`⌘,`, Ghostty action `toggle_visibility`) lists installed names plus enabled/error names. Toggle writes `ninja.toml` and starts or stops the process. The panel does not steal terminal focus.
 
 ## What is not here

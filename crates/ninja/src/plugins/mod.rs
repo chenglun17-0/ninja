@@ -124,21 +124,31 @@ use crate::surface::SurfaceHostView;
 // 配置
 // ---------------------------------------------------------------------------
 
-/// 监督器视角的 `[plugins]` 配置（q2 起在 crate::config 解析；这里换
-/// HashMap 便于按名解析二进制）。
+/// 监督器视角的 `[plugins]` 配置（crate::config 解析；这里换 HashMap
+/// 便于按名解析二进制）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginsConfig {
     /// 启用的插件名列表。空 = 关（空载门禁）。启用即拉起。
     pub enabled: Vec<String>,
     /// 插件名 → 二进制路径（缺省时按名多段解析，见 [`resolve_plugin_binary`]）。
     pub paths: std::collections::HashMap<String, String>,
+    /// 单插件物理足迹上限（字节）。0 = 不限；缺省取
+    /// [`DEFAULT_PLUGIN_MEMORY_LIMIT_MB`]（PRODUCT：「内存有上限」）。
+    pub memory_limit_bytes: u64,
 }
+
+/// 缺省单插件内存上限（MiB）。超大值只约束失控插件，不碰正常 pager。
+pub const DEFAULT_PLUGIN_MEMORY_LIMIT_MB: u64 = 512;
 
 impl From<&crate::config::PluginsConfig> for PluginsConfig {
     fn from(c: &crate::config::PluginsConfig) -> Self {
         Self {
             enabled: c.enabled.clone(),
             paths: c.paths.iter().cloned().collect(),
+            memory_limit_bytes: match c.memory_limit_mb {
+                Some(mb) => mb * 1024 * 1024,
+                None => DEFAULT_PLUGIN_MEMORY_LIMIT_MB * 1024 * 1024,
+            },
         }
     }
 }
@@ -305,6 +315,8 @@ pub struct PluginHost {
     bin_mtime: std::collections::BTreeMap<String, Option<std::time::SystemTime>>,
     /// 上次广播时的活面签名（pane:pid:cwd）。变了才发 pane.snapshot。
     last_pane_sig: Option<String>,
+    /// 上次内存采样时刻（1s 冷却，避免 150ms 泵拍每拍 syscall）。
+    last_mem_check: Option<Instant>,
 }
 
 /// 一条已授予的热键。
@@ -400,6 +412,7 @@ impl PluginHost {
                     hotkeys: Vec::new(),
                     bin_mtime: std::collections::BTreeMap::new(),
                     last_pane_sig: None,
+                    last_mem_check: None,
                 })
             }
             Err(e) => {
@@ -577,10 +590,59 @@ impl PluginHost {
         }
     }
 
+    /// 内存上限执行（PRODUCT「内存有上限」）：按 [`footprint_bytes`] 口径
+    /// 采样每个子进程物理足迹，超限即 kill + wait + 记
+    /// [`PluginHost::spawn_errors`]（面板显示「已停止（超内存上限…）」）。
+    /// 层/色板回收走插件死亡同一条路（EOF → 泵 → drop_conn）。
+    /// `memory_limit_bytes == 0` = 不限。`force` 绕过 1s 采样冷却
+    /// （面板刷新/测试用；常规调用方：泵拍与配置监视拍，频率 150ms/0.5s
+    /// 都被冷却压到 ~1s 一次，`proc_pid_rusage` 成本可忽略）。
+    fn enforce_memory_limits(&mut self, force: bool) {
+        if self.cfg.memory_limit_bytes == 0 || self.children.is_empty() {
+            return;
+        }
+        if !force
+            && self
+                .last_mem_check
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_mem_check = Some(Instant::now());
+        let limit = self.cfg.memory_limit_bytes;
+        let offenders: Vec<(String, u64)> = self
+            .children
+            .iter()
+            .filter_map(|(name, child)| {
+                footprint_bytes(child.id()).filter(|&u| u > limit).map(|u| (name.clone(), u))
+            })
+            .collect();
+        if offenders.is_empty() {
+            return;
+        }
+        for (name, usage) in offenders {
+            let reason = format!(
+                "超内存上限（{:.1} MB > 限 {:.0} MB）",
+                usage as f64 / 1e6,
+                limit as f64 / 1e6
+            );
+            eprintln!("ninja: 插件 {name:?} {reason}，已杀");
+            if let Some(i) = self.children.iter().position(|(n, _)| *n == name) {
+                let (_, mut c) = self.children.remove(i);
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            self.spawn_errors.insert(name, reason);
+        }
+        // 同步排干死亡连接：层/色板当场回收，不等下一拍。
+        self.pump_plugins();
+    }
+
     /// 状态快照（面板/测试）：enabled 名单 ∪ 有子进程 ∪ 有错误记录的
     /// 名字，逐名报告 启用/在跑/pid/内存/最后错误。顺带收割已退出的
     /// 子进程（try_wait）并把异常退出记进 last_error。
     pub fn snapshot(&mut self) -> Vec<PluginStatus> {
+        self.enforce_memory_limits(true);
         let mut i = 0;
         while i < self.children.len() {
             match self.children[i].1.try_wait() {
@@ -1329,6 +1391,7 @@ pub fn pump_now() {
             // try_lock：点击握手若正握着同一把锁，嵌套 timer 不能再阻塞。
             if let Ok(mut h) = host.try_lock() {
                 h.pump_plugins();
+                h.enforce_memory_limits(false);
                 let keep = any_layers()
                     || plugin_theme_override().is_some()
                     || spawn_pending_active()
@@ -1398,12 +1461,14 @@ pub fn spawn_startup_plugins() {
     }
 }
 
-/// 配置监视拍顺带看插件二进制 mtime：`cp` 新文件后热重载，不必退宿主。
+/// 配置监视拍顺带看插件二进制 mtime（`cp` 新文件后热重载，不必退宿主）
+/// 与内存上限（1s 冷却；覆盖未连上 socket 的子进程——泵只看连接）。
 pub fn watch_plugin_binaries() {
     if let Some(host) = take_dispatcher()
         && let Ok(mut h) = host.try_lock()
     {
         h.respawn_stale_plugins();
+        h.enforce_memory_limits(false);
     }
 }
 
@@ -2048,6 +2113,71 @@ mod tests {
     }
 
     #[test]
+    fn memory_limit_kills_runaway_plugin() {
+        // /usr/bin/yes：向 null stdout 狂写，常驻、footprint 远超 64KB。
+        let dir = sandbox("memlimit");
+        let mut cfg = PluginsConfig {
+            memory_limit_bytes: 64 * 1024,
+            ..Default::default()
+        };
+        cfg.enabled.push("hog".into());
+        cfg.paths.insert("hog".into(), "/usr/bin/yes".into());
+        let mut host = PluginHost::bind(dir.join("m.sock"), cfg).expect("bind");
+        host.spawn_enabled_now();
+        let pid = host
+            .children
+            .iter()
+            .find(|(n, _)| n == "hog")
+            .map(|(_, c)| c.id())
+            .expect("hog 应已拉起");
+        // 等 footprint 可采样（进程刚起时内核账本可能还没就位）。
+        for _ in 0..50 {
+            if footprint_bytes(pid).is_some_and(|u| u > 0) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        host.enforce_memory_limits(true);
+        assert!(
+            !host.children.iter().any(|(n, _)| n == "hog"),
+            "超限子进程应被收割"
+        );
+        let err = host
+            .spawn_errors
+            .get("hog")
+            .cloned()
+            .unwrap_or_default();
+        assert!(err.contains("超内存上限"), "面板应能看到原因：{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_limit_zero_means_unlimited() {
+        let dir = sandbox("memunlim");
+        let mut cfg = PluginsConfig {
+            memory_limit_bytes: 0,
+            ..Default::default()
+        };
+        cfg.enabled.push("hog".into());
+        cfg.paths.insert("hog".into(), "/usr/bin/yes".into());
+        let mut host = PluginHost::bind(dir.join("m.sock"), cfg).expect("bind");
+        host.spawn_enabled_now();
+        std::thread::sleep(Duration::from_millis(300));
+        host.enforce_memory_limits(true);
+        assert!(
+            host.children.iter().any(|(n, _)| n == "hog"),
+            "limit=0 不限：子进程应存活"
+        );
+        // 清场（enforce 不会碰它）。
+        while let Some(i) = host.children.iter().position(|(n, _)| n == "hog") {
+            let (_, mut c) = host.children.remove(i);
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn footprint_reads_own_pid() {
         // 口径冒烟：本进程能读出非零 footprint（尺寸坑的回归防线——
         // 缓冲短了内核写穿是 SIGBUS，读出非零说明布局对）。
@@ -2128,6 +2258,7 @@ while True:
                 "fake".into(),
                 script.to_string_lossy().to_string(),
             )]),
+            memory_limit_bytes: 0,
         };
         let mut host = PluginHost::bind(sock.clone(), cfg.clone()).expect("bind");
         // 首击冷启动：无连接 → 兜底拉起 → claim priority 7。
@@ -2215,6 +2346,7 @@ time.sleep(30)
                 "bad".into(),
                 script.to_string_lossy().to_string(),
             )]),
+            memory_limit_bytes: 0,
         };
         let mut host = PluginHost::bind(sock.clone(), cfg).expect("bind");
         let hit = Hit::new(1, HitKind::Path, "/tmp/x", "", 0, 0, 1, vec![]);
