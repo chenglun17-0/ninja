@@ -10,6 +10,12 @@
 //! 嵌入 API pre-1.0：破坏性升级必须显式改钉点（vendor/ghostty/fetch.sh 的
 //! COMMIT + SHA256）与本 crate 的 bindgen allowlist。
 
-#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, clippy::all)]
+#![allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code,
+    clippy::all
+)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

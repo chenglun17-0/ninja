@@ -95,7 +95,10 @@ pub(crate) fn resolve_plugin_binary_in(
         if p.is_file() {
             return Some(p);
         }
-        eprintln!("ninja: plugins.paths.{name} = {} 不存在，跳过该路径", p.display());
+        eprintln!(
+            "ninja: plugins.paths.{name} = {} 不存在，跳过该路径",
+            p.display()
+        );
     }
     if let Some(dir) = std::env::var_os("NINJA_PLUGIN_DIR") {
         let p = Path::new(&dir).join(name);
