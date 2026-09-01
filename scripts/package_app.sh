@@ -171,14 +171,11 @@ else
 	echo "    spctl 不通过（Apple Development 签名，非 Developer ID）：按决策如实记录"
 fi
 
-echo "==> bundle 内容清点（零插件断言：无 ninja-preview/ninja-theme）"
+echo "==> bundle 内容清点（零插件断言：MacOS/ 只有宿主二进制）"
 find "$APP" -type f -not -path '*/Resources/ghostty/*' | sort
-[[ ! -e "$APP/Contents/MacOS/ninja-preview" ]] || {
-	echo "错误：bundle 进了 ninja-preview" >&2
-	exit 1
-}
-[[ ! -e "$APP/Contents/MacOS/ninja-theme" ]] || {
-	echo "错误：bundle 进了 ninja-theme" >&2
+MACOS_N="$(find "$APP/Contents/MacOS" -type f | wc -l | tr -d ' ')"
+[[ "$MACOS_N" -eq 1 && -f "$APP/Contents/MacOS/ninja" ]] || {
+	echo "错误：MacOS/ 应只有宿主二进制 ninja（实得 ${MACOS_N} 个文件）" >&2
 	exit 1
 }
 [[ "$THEME_N" -gt 500 ]] || {

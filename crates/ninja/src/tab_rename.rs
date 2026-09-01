@@ -9,7 +9,7 @@ use std::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, Sel};
 use objc2::runtime::Bool;
-use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message as _};
+use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly, Message as _};
 use objc2_app_kit::{
     NSButton, NSControl, NSEvent, NSEventMask, NSFocusRingType, NSResponder, NSTextField, NSView,
     NSWindow,
@@ -106,7 +106,7 @@ fn begin_on_button(target: &NSWindow, button: &NSView) -> bool {
         ),
         &current,
     );
-    let nsfield: &NSTextField = (&*field).as_super();
+    let nsfield: &NSTextField = (*field).as_super();
     button.addSubview(nsfield);
     let control: &NSControl = nsfield.as_super();
     let view: &NSView = control.as_super();

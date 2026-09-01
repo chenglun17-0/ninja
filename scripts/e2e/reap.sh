@@ -24,7 +24,5 @@ kill_pat() {
 kill_pat 'Contents/MacOS/ninja'
 kill_pat 'target/release/ninja'
 kill_pat 'target/debug/ninja'
-kill_pat 'ninja-preview'
-kill_pat 'ninja-theme'
 kill_pat '/.config/ninja/plugins/'
 exit 0

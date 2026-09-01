@@ -1,6 +1,6 @@
 [package]
 name = "ninja"
-description = "q1: libghostty 嵌入壳——多窗/原生标签/分屏布局树接 surface，焦点/关闭/resize 全链；q0 取证模式保留可重跑"
+description = "Ninja 宿主：libghostty 嵌入壳（多窗/标签/分屏）+ ADE 插件系统"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

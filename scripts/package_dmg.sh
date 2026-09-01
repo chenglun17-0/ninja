@@ -44,12 +44,9 @@ find "$MNT" -mindepth 1 -maxdepth 1 | sort
   echo "错误：DMG 内缺宿主二进制" >&2
   exit 1
 }
-[[ ! -e "$MNT/Ninja.app/Contents/MacOS/ninja-preview" ]] || {
-  echo "错误：DMG 内进了 ninja-preview（违反默认零插件）" >&2
-  exit 1
-}
-[[ ! -e "$MNT/Ninja.app/Contents/MacOS/ninja-theme" ]] || {
-  echo "错误：DMG 内进了 ninja-theme（违反默认零插件；T2 主题插件也不随分发物）" >&2
+MACOS_N="$(find "$MNT/Ninja.app/Contents/MacOS" -type f | wc -l | tr -d ' ')"
+[[ "$MACOS_N" -eq 1 ]] || {
+  echo "错误：DMG 的 MacOS/ 进了除宿主外的二进制（违反默认零插件，实得 ${MACOS_N} 个文件）" >&2
   exit 1
 }
 # 图标卷内生效断言（回归）：icns 资源与 plist 引用都要在拖拽安装的

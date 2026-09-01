@@ -1021,7 +1021,7 @@ pub fn dump_effective_config(
     s.push_str("  },\n");
     s.push_str(&format!("  \"diagnostics\": {},\n", info.diagnostics));
     // q0 审计遗留记录：app 级句柄读 link-previews 恒 false 的怪象
-    //（surface 层动作实际放行；见 docs/Q0-CAPABILITY-AUDIT.md #2）。
+    //（surface 层动作实际放行）。
     s.push_str(&format!(
         "  \"link_previews_readback\": {},\n",
         get_bool(cfg, "link-previews")

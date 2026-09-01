@@ -12,7 +12,7 @@
 //!   enabled 插件（spawn 注入 `NINJA_ADE_SOCK`）。
 //! - 二进制解析：`[plugins.paths]` 显式路径 → `$NINJA_PLUGIN_DIR/<name>`
 //!   → `~/.config/ninja/plugins/<name>` → 宿主二进制同目录（开发布局：
-//!   cargo 把 ninja 与 ninja-preview 放同一 target 目录）。
+//!   宿主与插件同置一个 target 目录）。
 //! - 禁用（面板 off / [`PluginHost::session_disable`] / [`shutdown`]）走
 //!   同一条幂等生命周期：杀子进程 + 收层 + 主题覆盖回退 + 断连接 +
 //!   名单空则删 socket——「关掉即轻」。
@@ -100,7 +100,7 @@ use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
-use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, Message as _};
+use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class};
 use objc2_core_foundation::{
     CFBoolean, CFData, CFDictionary, CFNumber, CFNumberType, CFRetained,
 };
@@ -263,8 +263,8 @@ fn resolve_plugin_binary_in(
             return Some(p);
         }
     }
-    // 宿主二进制同目录（开发布局：cargo 把 ninja 与 ninja-preview 放
-    // 同一 target 目录）。只探测存在性，不写。
+    // 宿主二进制同目录（开发布局：宿主与插件同置一个 target
+    // 目录）。只探测存在性，不写。
     if let Ok(exe) = std::env::current_exe() {
         let p = exe.parent()?.join(name);
         if p.is_file() {
@@ -377,7 +377,7 @@ pub fn classify_token(token: &str) -> Option<HitKind> {
     looks_path.then_some(HitKind::Path)
 }
 
-/// OPEN_URL 载荷分类（适配器取舍，证据见 q3-evidence）：
+/// OPEN_URL 载荷分类（适配器取舍）：
 /// - `file://`：剥成文件系统路径，归 `path`（pager 只认领 path；
 ///   把 file URL 当 `url` 会落到 `/usr/bin/open`，预览永远不触发）；
 /// - 带其它 `scheme://`：常见 scheme（http/https/mailto/ftp）→ `url`，
@@ -2057,7 +2057,7 @@ impl LayerWebView {
         let ucc = unsafe { config.userContentController() };
         let proto = ProtocolObject::from_ref(&*handler);
         unsafe {
-            ucc.addScriptMessageHandler_name(&proto, &NSString::from_str("layer"));
+            ucc.addScriptMessageHandler_name(proto, &NSString::from_str("layer"));
         }
         let this = LayerWebView::alloc(mtm).set_ivars(LayerWebIvars {
             handle: Cell::new(0),
@@ -3382,7 +3382,7 @@ impl PluginHost {
 }
 
 // ---------------------------------------------------------------------------
-// 单元测试（纯函数 + 隔离目录的 socket 级集成；GUI 面走 docs/q3-evidence）
+// 单元测试（纯函数 + 隔离目录的 socket 级集成）
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

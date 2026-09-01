@@ -1,13 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    # q0：libghostty 嵌入路径。宿主产品 crate（crates/ninja）随 q1 壳阶段进来。
     "crates/ghostty-sys",
+    # 产品宿主（AppKit 壳 + libghostty 嵌入 + ADE 插件系统）。
     "crates/ninja",
-    # q3：ADE 协议 v0（纯数据类型 + 帧编解码）与两个官方示例插件。
+    # ADE 协议 v0（纯数据类型 + 帧编解码）。官方示例插件在独立仓库
+    # ninja-plugins（本仓库不分发任何插件）。
     "crates/ninja-protocol",
-    "crates/ninja-preview",
-    "crates/ninja-theme",
 ]
 
 [workspace.package]

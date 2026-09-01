@@ -186,7 +186,7 @@
 //! assert_eq!(Message::decode_host(&payload).unwrap(), msg);
 //! ```
 //!
-//! 依赖方向：宿主 `ninja` 与示例插件 `ninja-preview`/`ninja-theme`
+//! 依赖方向：宿主 `ninja` 与 ninja-plugins 仓库的插件
 //! 可以依赖本 crate（纯 serde 数据类型），本 crate 永不依赖它们；
 //! 插件永不依赖宿主 `ninja`（验收：`cargo tree -p <插件>` 无宿主
 //! crate、无 ghostty-sys）。
