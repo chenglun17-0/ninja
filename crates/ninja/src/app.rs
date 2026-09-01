@@ -30,8 +30,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSApplicationTerminateReply,
-    NSEventModifierFlags, NSMenu, NSMenuItem, NSWindow, NSWindowDelegate,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSApplicationTerminateReply, NSEventModifierFlags, NSMenu, NSMenuItem, NSWindow,
+    NSWindowDelegate,
 };
 use objc2_foundation::{NSNotification, NSObject, NSString};
 

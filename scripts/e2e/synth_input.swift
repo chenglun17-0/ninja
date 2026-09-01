@@ -21,6 +21,7 @@
 //   swiftc -O scripts/e2e/synth_input.swift -o /tmp/ninja-synth
 
 import Foundation
+import Carbon // TIS：E2E 打字前切 ASCII 输入源（IME 会吞键）
 import CoreGraphics
 import ApplicationServices
 
@@ -87,6 +88,39 @@ guard args.count >= 2 else {
 }
 
 switch args[1] {
+case "im":
+    // 切/恢复输入源。IME（如拼音）活跃时：字母进候选框、回车只提交
+    // 候选不换行——PostToPid 打的命令永远不执行。打字前切 ASCII，
+    // 结束后用返回的原 id 恢复。
+    if args.count >= 3, args[2].hasPrefix("back:") {
+        let id = String(args[2].dropFirst(5)) as CFString
+        if let list = TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource] {
+            for src in list {
+                if let propPtr = TISGetInputSourceProperty(src, kTISPropertyInputSourceID),
+                   (Unmanaged<CFString>.fromOpaque(propPtr).takeUnretainedValue() as String) == (id as String) {
+                    TISSelectInputSource(src)
+                    print("restored: \(id)")
+                    exit(0)
+                }
+            }
+        }
+        print("restore-failed")
+        exit(1)
+    }
+    if let prior = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+       let priorID = TISGetInputSourceProperty(prior, kTISPropertyInputSourceID) {
+        let priorStr = Unmanaged<CFString>.fromOpaque(priorID).takeUnretainedValue() as String
+        let filter = [kTISPropertyInputSourceIsASCIICapable: true,
+                      kTISPropertyInputSourceCategory: kTISCategoryKeyboardInputSource!] as CFDictionary
+        if let list = TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource],
+           let first = list.first {
+            TISSelectInputSource(first)
+            print(priorStr)
+        } else {
+            print("no-ascii-source")
+            exit(1)
+        }
+    }
 case "trust":
     print(AXIsProcessTrusted() ? "trusted" : "not-trusted")
 case "key":

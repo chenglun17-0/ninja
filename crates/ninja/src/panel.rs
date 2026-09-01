@@ -27,19 +27,19 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSButtonType, NSColor, NSFont, NSScrollView, NSTabView,
-    NSTabViewItem, NSTabPosition, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSButtonType, NSColor, NSFont, NSScrollView, NSTabPosition,
+    NSTabView, NSTabViewItem, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 /// 行高（含行距）。
 const ROW_H: f64 = 28.0;
-/// 可见行数上限——超出出滚动条。
-const MAX_VISIBLE_ROWS: usize = 8;
 /// 页脚高（路径 + 打开按钮）。
 const FOOTER_H: f64 = 44.0;
 /// 设置窗总宽（tab 列 + 内容区；固定尺寸工具窗）。
 const SETTINGS_W: f64 = 660.0;
+/// 设置窗总高（固定：行少留白、行多滚动——不再贴内容长高）。
+const SETTINGS_H: f64 = 460.0;
 /// 内容区宽的假定值（tab 布局完成前的兜底；完成后按实际 frame 布局）。
 const HOST_W: f64 = 486.0;
 
@@ -276,8 +276,26 @@ impl PluginPanel {
         let n = statuses.len();
         let w = self.host_w();
 
-        // 文档视图（行容器）：底朝上排（NSView 原点在左下）。
-        let content_h = (n.max(1) as f64 * ROW_H) + 12.0;
+        // 固定窗尺寸 + 骨架（tab 占满内容、滚动区 = 内容高 - 页脚）。
+        if let Some(win) = self.ivars().window.borrow().as_ref() {
+            let f = win.frame();
+            win.setFrame_display(
+                NSRect::new(f.origin, NSSize::new(SETTINGS_W, SETTINGS_H)),
+                false,
+            );
+        }
+        self.layout_chrome(w);
+        let area_h = self
+            .ivars()
+            .scroll
+            .borrow()
+            .as_ref()
+            .map(|s| s.frame().size.height)
+            .unwrap_or(SETTINGS_H - FOOTER_H);
+
+        // 文档视图（行容器）：底朝上排（NSView 原点在左下）。行多时高于
+        // 可视区 → 滚动；行少时窗口留白，不再收缩。
+        let content_h = (n.max(1) as f64 * ROW_H + 12.0).max(area_h);
         let doc = NSView::new(mtm);
         doc.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
@@ -286,43 +304,31 @@ impl PluginPanel {
 
         let mut rows = Vec::new();
         if statuses.is_empty() {
-            let hint = label(mtm, "无已安装插件", 16.0, content_h - 34.0, w - 48.0, 20.0);
+            // 空态在大内容区里居中偏上，指向页脚目录。
+            let hint = label(mtm, "无已安装插件", 16.0, content_h * 0.58, w - 48.0, 20.0);
             hint.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, 0.0)));
             doc.addSubview(&hint);
             let sub = label(
                 mtm,
                 "把插件二进制放进下面的目录，回来开关启用",
                 16.0,
-                content_h - 56.0,
+                content_h * 0.58 - 24.0,
                 w - 48.0,
                 18.0,
             );
             sub.setTextColor(Some(&NSColor::secondaryLabelColor()));
             doc.addSubview(&sub);
         } else {
+            // 非翻转坐标系（原点在左下）：行从顶部排——y = 高度 - (i+1) 行，
+            // 行少时留白在下方（符合阅读习惯），行多时滚动。
             for (i, st) in statuses.iter().enumerate() {
-                let y = 4.0 + (i as f64) * ROW_H;
+                let y = content_h - (i as f64 + 1.0) * ROW_H + 4.0;
                 let row = build_row(mtm, self, &doc, st, y, w);
                 rows.push(row);
             }
         }
 
-        // 挂文档视图 + 按可见行数收窗高（空态给两行的高度）。
         scroll.setDocumentView(Some(&doc));
-        let visible = if statuses.is_empty() {
-            2
-        } else {
-            n.min(MAX_VISIBLE_ROWS)
-        };
-        if let Some(win) = self.ivars().window.borrow().as_ref() {
-            let f = win.frame();
-            let inner_h = visible as f64 * ROW_H + 14.0;
-            win.setFrame_display(
-                NSRect::new(f.origin, NSSize::new(SETTINGS_W, inner_h + FOOTER_H)),
-                false,
-            );
-        }
-        self.layout_chrome(w, visible as f64 * ROW_H + 14.0);
         *self.ivars().rows.borrow_mut() = rows;
         self.ivars().last_w.set(w);
     }
@@ -345,7 +351,8 @@ impl PluginPanel {
             let Some(st) = statuses.iter().find(|s| s.name == row.name) else {
                 continue;
             };
-            row.status.setStringValue(&NSString::from_str(&status_text(st)));
+            row.status
+                .setStringValue(&NSString::from_str(&status_text(st)));
             row.status.setFont(Some(&mono));
             let (dot_color, text_color) = status_colors(st);
             row.dot.setTextColor(Some(&dot_color));
@@ -379,8 +386,8 @@ impl PluginPanel {
         std::mem::forget(timer); // 进程生命期常驻（refresh 轻量）
     }
 
-    /// 内容区骨架摆放：tab 占满窗口内容；滚动区/页脚落在 tab 内容区里。
-    fn layout_chrome(&self, w: f64, inner_h: f64) {
+    /// 内容区骨架摆放：tab 占满窗口内容；滚动区 = 内容高 - 页脚。
+    fn layout_chrome(&self, w: f64) {
         let cf = self.window_content().frame();
         if let Some(tab) = self.ivars().tab.borrow().as_ref() {
             tab.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), cf.size));
@@ -388,7 +395,7 @@ impl PluginPanel {
         if let Some(scroll) = self.ivars().scroll.borrow().as_ref() {
             scroll.setFrame(NSRect::new(
                 NSPoint::new(0.0, FOOTER_H),
-                NSSize::new(w, inner_h.max(ROW_H)),
+                NSSize::new(w, (cf.size.height - FOOTER_H).max(ROW_H)),
             ));
         }
     }
@@ -452,17 +459,24 @@ fn build_row(
 
     // 状态点：● 带色文本（自适应深浅模式；比 layer 圆点省一整套 CALayer 舞步）。
     let dot = NSTextField::labelWithString(&NSString::from_str("●"), mtm);
-    dot.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(12.0, 0.0)));
+    dot.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
+        12.0, 0.0,
+    )));
     let (dot_color, text_color) = status_colors(st);
     dot.setTextColor(Some(&dot_color));
-    dot.setFrame(NSRect::new(NSPoint::new(38.0, y + 5.0), NSSize::new(14.0, 18.0)));
+    dot.setFrame(NSRect::new(
+        NSPoint::new(38.0, y + 5.0),
+        NSSize::new(14.0, 18.0),
+    ));
 
     let name = label(mtm, &st.name, 58.0, y + 5.0, w - 58.0 - 190.0, 18.0);
     name.setFont(Some(&NSFont::systemFontOfSize(12.5)));
 
     let status = label(mtm, &status_text(st), w - 182.0, y + 5.0, 170.0, 18.0);
     status.setTextColor(Some(&text_color));
-    status.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(12.0, 0.0)));
+    status.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
+        12.0, 0.0,
+    )));
 
     doc.addSubview(&check);
     doc.addSubview(&dot);
@@ -493,7 +507,9 @@ fn build_footer(p: &PluginPanel, mtm: MainThreadMarker, host: &NSView) {
         .unwrap_or_else(|| "~/.config/ninja/plugins".to_string());
     let path = label(mtm, &dir_text, 14.0, 12.0, HOST_W - 130.0, 18.0);
     path.setTextColor(Some(&NSColor::secondaryLabelColor()));
-    path.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(11.0, 0.0)));
+    path.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
+        11.0, 0.0,
+    )));
     host.addSubview(&path);
     *p.ivars().footer_path.borrow_mut() = Some(path);
 

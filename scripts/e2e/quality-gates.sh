@@ -49,6 +49,8 @@ cleanup() {
     wait "$APP_PID" 2>/dev/null
   fi
   if [ -n "${HOLD_PID:-}" ]; then kill "$HOLD_PID" 2>/dev/null; fi
+  # 恢复 G6 打字前切走的输入源（IME 会吞键——见 G6 注释）。
+  [ -n "${IM_PREV:-}" ] && "$SYNTH" im "back:$IM_PREV" >/dev/null 2>&1
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -357,7 +359,23 @@ PY
   if NINJA_PLUGIN_DIR="$G6PDIR" start_host g6; then
     # 拉前台（PostToPid 键盘要窗口活跃）。
     osascript -e "tell application \"System Events\" to set frontmost of first application process whose unix id is $APP_PID to true" >/dev/null 2>&1
-    sleep 0.8
+    # 等 shell 真就绪再打字：冷机时 zsh 登录链 ~2s 才进 zle（tty 切 raw），
+    # 早打的字被内核 echo 进启动间隙、回车被丢——命令永远不执行。
+    # 探子 = 宿主→login→zsh 的 tty 是否 -icanon（zle 接管即 raw）。
+    for _ in $(seq 60); do
+      G6LOGIN=$(pgrep -P "$APP_PID" 2>/dev/null | head -1)
+      G6ZSH=$(pgrep -P "${G6LOGIN:-0}" 2>/dev/null | head -1)
+      G6TTY=$(ps -o tty= -p "${G6ZSH:-0}" 2>/dev/null | tr -d '[:space:]')
+      if [ -n "$G6TTY" ] && [ "$G6TTY" != "??" ] &&
+        stty -a -f "/dev/$G6TTY" 2>/dev/null | grep -q -- '-icanon'; then
+        break
+      fi
+      sleep 0.25
+    done
+    # 切 ASCII 输入源：IME（拼音）活跃时字母进候选、回车只提交不换行，
+    # 打的命令永远不执行（cleanup 里恢复原源）。
+    IM_PREV=$("$SYNTH" im ascii)
+    sleep 0.3
     $SYNTH type "$APP_PID" $'echo /tmp/ninja-g6/sample.txt\n' >/dev/null 2>&1
     sleep 0.8
     # 网格几何（zoom dump）+ 窗 bounds → 点击坐标；行梯子（zsh 多行

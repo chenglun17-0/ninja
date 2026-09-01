@@ -55,6 +55,8 @@ Screenshots use window IDs. Keyboard evidence prefers the embed API, not `CGEven
 
 E2E hook files (`NINJA_ZOOM_FILE`, `NINJA_PANEL_PLUGIN_FILE`) are polled with content-based dedup **per process**: a freshly launched host replays whatever the file contains on first read. Write a fresh (or empty) file every round - a stale `split` line from a previous round will split your new window.
 
+Synthesized typing goes through the active input source. With a CJK IME active (e.g. pinyin), letters land in the composition box and Return commits candidates instead of the line - typed commands never execute, while the kernel echo still shows them on screen. `synth_input.swift im ascii` switches to an ASCII-capable source before typing and `im back:<id>` restores it; `quality-gates.sh` does both around G6. Also wait for the shell to be zle-ready (`-icanon` on the pane's tty) before typing on a cold machine.
+
 ## Quality gates
 
 The five standing gates from [PLAN.md](../PLAN.md) run as one command:
