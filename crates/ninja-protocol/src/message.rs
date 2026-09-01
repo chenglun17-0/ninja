@@ -115,6 +115,8 @@ pub struct Hit {
     pub modifiers: Vec<Modifier>,
 }
 
+// 构造器逐字段对应线字段（协议合同：字段集即线形态），不引入构建器。
+#[allow(clippy::too_many_arguments)]
 impl Hit {
     pub fn new(
         id: u64,
@@ -605,6 +607,8 @@ pub struct ThemeSet {
     pub ansi: [String; 16],
 }
 
+// 同上：色板 20 色即线字段，逐参数对应。
+#[allow(clippy::too_many_arguments)]
 impl ThemeSet {
     pub fn new(
         name: impl Into<String>,
@@ -758,6 +762,8 @@ pub enum Direction {
 
 /// 消息本体。序列化时 serde 把判别字段并入顶层：`{"v":0,"type":"hit",...}`。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+// 消息即线载荷：逐条解码-分发-丢弃，短命栈值；装箱只多一次分配。
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type")]
 pub enum Message {
     #[serde(rename = "hit")]

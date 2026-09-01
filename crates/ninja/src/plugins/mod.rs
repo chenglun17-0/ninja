@@ -172,6 +172,8 @@ pub struct PluginStatus {
     pub last_error: Option<String>,
 }
 
+/// 当前所有 PTY 面：槽位顺序与 [`crate::session::save`] 一致（只计带
+/// PaneContainer 的标签；预览 chrome 标签不占号）。
 fn collect_pane_snapshot() -> PaneSnapshot {
     let mut panes = Vec::new();
     for (window_idx, group) in crate::session::tab_groups().into_iter().enumerate() {
@@ -237,6 +239,9 @@ fn handle_pane_input(m: &PaneInput) {
     }
 }
 
+/// 当前生效的插件主题覆盖（config.rs 装载管线消费；None = 无覆盖）。
+/// 内容 = (色板名, 层文件文本)。拥有者连接死亡/禁用 →
+/// [`revoke_theme_override`]。
 pub fn plugin_theme_override() -> Option<(String, String)> {
     THEME_OVERRIDE
         .lock()
@@ -518,9 +523,9 @@ impl PluginHost {
         true
     }
 
-    /// 面板开关「关」：名字出会话 enabled 名单 + 立即杀它名下的子进程
-    /// + 排干 EOF（收层/回退色板与插件死亡同一条通路：pump 摄连接
-    /// EOF → [`PluginHost::drop_conn`]）。名单清空 = 整个插件面关掉
+    /// 面板开关「关」：名字出会话 enabled 名单，立即杀它名下的子进程，
+    /// 并排干 EOF（收层/回退色板与插件死亡同一条通路：pump 摄连接
+    /// EOF → [`PluginHost::drop_conn`]）。名单清空即整个插件面关掉
     /// （[`PluginHost::shutdown`]：删 socket，回到空载形态）。
     pub fn session_disable(&mut self, name: &str) {
         self.cfg.enabled.retain(|n| n != name);
@@ -1518,8 +1523,9 @@ pub fn host_shutdown() {
 /// 幂等生命周期路径；写回 ninja.toml 由调用方 panel 模块做）。
 /// - on：名字进会话 enabled 名单 + 立即拉起；host 不在/已禁用时先
 ///   重绑（从零拉起用启动快照的 paths）。
-/// - off：名字出名单 + 立即杀进程/收层/断连/撤色板；名单空 → 整个
+/// - off：名字出名单，立即杀进程/收层/断连/撤色板；名单空即整个
 ///   关掉（shutdown：删 socket，回空载）。
+///
 /// 返回 false = 开且拉不起 host（绑定失败）；关恒 true。
 pub fn toggle_plugin(name: &str, on: bool) -> bool {
     if !on {
@@ -1982,7 +1988,7 @@ mod tests {
         // 锚点行在上半（下方放得下 1/4 屏）→ 往下开，至多半屏。
         let (x, y, w, h) = overlay_rect(10, 0, (8.0, 18.0), (590.0, 390.0));
         assert!((y - 10.0 * 18.0).abs() < 0.01, "y 锚在点击行");
-        assert!(h <= 195.0 + 0.01 && h >= 64.0, "至多半屏");
+        assert!((64.0..=195.0 + 0.01).contains(&h), "至多半屏");
         assert_eq!(w, 590.0);
         let _ = x;
 

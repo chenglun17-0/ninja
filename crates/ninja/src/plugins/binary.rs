@@ -232,7 +232,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("subdir")).unwrap(); // 目录：跳过
         let mut cfg = PluginsConfig::default();
         cfg.paths.insert("explicit".into(), "/opt/explicit".into());
-        let names = discover_plugin_names_in(&[dir.clone()], &cfg);
+        let names = discover_plugin_names_in(std::slice::from_ref(&dir), &cfg);
         assert_eq!(names, vec!["alpha".to_string(), "explicit".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }

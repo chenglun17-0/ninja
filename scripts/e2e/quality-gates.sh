@@ -68,11 +68,16 @@ wait_for() { # desc timeout_s cmd...（cmd 退出 0 = 达成）
 # ---------------------------------------------------------------------------
 # G0 纯逻辑
 # ---------------------------------------------------------------------------
-say "G0 纯逻辑（cargo test）"
+say "G0 纯逻辑（cargo test + clippy）"
 if cargo test -p ninja-protocol -p ninja >"$LOGS/cargo-test.log" 2>&1; then
   ok "cargo test（协议契约 + 宿主单测）"
 else
   bad "cargo test 失败（见 $LOGS/cargo-test.log，脚本退出后即清——重跑复现）"
+fi
+if cargo clippy --workspace --all-targets -- -D warnings >"$LOGS/clippy.log" 2>&1; then
+  ok "cargo clippy -D warnings（全 target 零告警）"
+else
+  bad "clippy 有告警（见 $LOGS/clippy.log，脚本退出后即清——重跑复现）"
 fi
 
 # ---------------------------------------------------------------------------

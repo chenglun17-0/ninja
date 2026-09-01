@@ -22,13 +22,11 @@ fn is_token_char(c: char) -> bool {
 pub fn line_token_at(line: &str, col: u32) -> Option<(String, u32)> {
     let chars: Vec<char> = line.chars().collect();
     let mut idx = None;
-    let mut col_now: u32 = 0;
-    for (i, _c) in chars.iter().enumerate() {
+    for (col_now, (i, _c)) in (0_u32..).zip(chars.iter().enumerate()) {
         if col_now >= col {
             idx = Some(i);
             break;
         }
-        col_now += 1;
     }
     let idx = idx.unwrap_or(chars.len());
     let c = *chars.get(idx)?;
@@ -191,9 +189,6 @@ fn macos_pid_cwd(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
-/// 当前所有 PTY 面：槽位顺序与 [`crate::session::save`] 一致（只计带
-/// PaneContainer 的标签；预览 chrome 标签不占号）。
-
 /// ghostty mods → 协议修饰键列表。
 pub fn modifiers_from_mods(mods: ghostty_sys::ghostty_input_mods_e) -> Vec<Modifier> {
     let mut out = Vec::new();
@@ -291,10 +286,6 @@ pub fn theme_conf_text(m: &ThemeSet) -> Option<String> {
     }
     Some(s)
 }
-
-/// 当前生效的插件主题覆盖（config.rs 装载管线消费；None = 无覆盖）。
-/// 内容 = (色板名, 层文件文本)。拥有者连接死亡/禁用 →
-/// [`revoke_theme_override`]。
 
 // ---------------------------------------------------------------------------
 // 键名 ↔ macOS 虚拟键码（input 适配器）

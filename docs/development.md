@@ -62,7 +62,7 @@ scripts/e2e/quality-gates.sh          # all gates, virtual display for GUI ones
 scripts/e2e/quality-gates.sh --no-gui # G0–G2 only (no GUI session needed)
 ```
 
-G0 unit tests, G1 protocol hygiene (dependency direction + goldens), G2 kernel-noun scan are pure logic. G3–G5 (idle invariants, enable/toggle lifecycle, crash isolation) launch the real host on the virtual display with an isolated config and a throwaway plugin, driving the panel through the same hook path as the UI (`NINJA_PANEL_PLUGIN_FILE`). Run it before pushing host or protocol changes.
+G0 unit tests + clippy (`-D warnings`, all targets), G1 protocol hygiene (dependency direction + goldens), G2 kernel-noun scan are pure logic. G3–G5 (idle invariants, enable/toggle lifecycle, crash isolation) launch the real host on the virtual display with an isolated config and a throwaway plugin, driving the panel through the same hook path as the UI (`NINJA_PANEL_PLUGIN_FILE`). Run it before pushing host or protocol changes.
 
 ## Hygiene
 
