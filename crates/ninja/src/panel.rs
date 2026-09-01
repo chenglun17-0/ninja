@@ -26,8 +26,8 @@ use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSBackingStoreType, NSBox, NSBoxType, NSButton, NSButtonType, NSColor, NSFont, NSImage,
-    NSImageView, NSScrollView, NSTextField, NSView, NSVisualEffectView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSWindow, NSWindowStyleMask,
+    NSImageView, NSScrollView, NSTextField, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectView, NSWindow, NSWindowStyleMask,
     NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -214,7 +214,10 @@ fn ensure_panel(mtm: MainThreadMarker) -> &'static PluginPanel {
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
         | NSWindowStyleMask::FullSizeContentView;
-    let frame = NSRect::new(NSPoint::new(160.0, 320.0), NSSize::new(SETTINGS_W, SETTINGS_H));
+    let frame = NSRect::new(
+        NSPoint::new(160.0, 320.0),
+        NSSize::new(SETTINGS_W, SETTINGS_H),
+    );
     // SAFETY: NSWindow 指定初始化器；参数平凡。
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -388,7 +391,9 @@ fn build_footer(p: &PluginPanel, mtm: MainThreadMarker, content: &NSView) {
         .unwrap_or_else(|| "~/.config/ninja/plugins".to_string());
     let path = NSTextField::labelWithString(&NSString::from_str(&dir_text), mtm);
     path.setTextColor(Some(&NSColor::secondaryLabelColor()));
-    path.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(11.0, 0.0)));
+    path.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
+        11.0, 0.0,
+    )));
     path.setFrame(NSRect::new(
         NSPoint::new(24.0, 13.0),
         NSSize::new(CONTENT_W - 150.0, 18.0),
@@ -483,7 +488,8 @@ impl PluginPanel {
             let Some(st) = statuses.iter().find(|s| s.name == row.name) else {
                 continue;
             };
-            row.status.setStringValue(&NSString::from_str(&status_text(st)));
+            row.status
+                .setStringValue(&NSString::from_str(&status_text(st)));
             row.status.setFont(Some(&mono));
             let (dot_color, _text_color) = status_colors(st);
             row.dot.setTextColor(Some(&dot_color));
@@ -533,7 +539,10 @@ fn build_row(
     let dot = NSTextField::labelWithString(&NSString::from_str("●"), mtm);
     dot.setFont(Some(&NSFont::systemFontOfSize_weight(10.0, 0.6)));
     dot.setTextColor(Some(&dot_color));
-    dot.setFrame(NSRect::new(NSPoint::new(24.0, top - 30.0), NSSize::new(14.0, 16.0)));
+    dot.setFrame(NSRect::new(
+        NSPoint::new(24.0, top - 30.0),
+        NSSize::new(14.0, 16.0),
+    ));
     hide_label_chrome(&dot);
     doc.addSubview(&dot);
 
@@ -548,7 +557,9 @@ fn build_row(
     doc.addSubview(&name);
 
     let status = NSTextField::labelWithString(&NSString::from_str(&status_text(st)), mtm);
-    status.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(11.0, 0.0)));
+    status.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
+        11.0, 0.0,
+    )));
     status.setTextColor(Some(&NSColor::secondaryLabelColor()));
     status.setFrame(NSRect::new(
         NSPoint::new(42.0, top - 50.0),
