@@ -53,6 +53,8 @@ Screenshots use window IDs. Keyboard evidence prefers the embed API, not `CGEven
 
 `scripts/e2e/reap.sh` kills leftover hold processes and host instances.
 
+E2E hook files (`NINJA_ZOOM_FILE`, `NINJA_PANEL_PLUGIN_FILE`) are polled with content-based dedup **per process**: a freshly launched host replays whatever the file contains on first read. Write a fresh (or empty) file every round - a stale `split` line from a previous round will split your new window.
+
 ## Quality gates
 
 The five standing gates from [PLAN.md](../PLAN.md) run as one command:
