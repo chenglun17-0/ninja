@@ -4,9 +4,11 @@
 //! （宿主 [`crate::plugins::toggle_plugin`] 的「启用即拉起/禁用即回收」
 //! 单一生命周期）+ 名单写回 ninja.toml（[`crate::config::write_plugins_enabled`]）。
 //!
-//! 行集 = 会话真值（enabled ∪ 在跑 ∪ 有错误记录；面板不做插件发现——
-//! 分发市场不是本阶段）。E2E 钩子 `NINJA_PANEL_PLUGIN_FILE`（app.rs 轮询
-//! 「<name> on|off」行，与 UI 开关同一条路径，免 CGEvent）。
+//! 行集 = 会话真值（enabled ∪ 在跑 ∪ 有错误记录）∪ 已安装发现
+//! （[`crate::plugins::discover_plugin_names`]：用户插件目录里能看到的
+//! 可执行裸名——列出本地已装插件不是插件市场）。E2E 钩子
+//! `NINJA_PANEL_PLUGIN_FILE`（app.rs 轮询「<name> on|off」行，与 UI
+//! 开关同一条路径，免 CGEvent）。
 
 #![allow(non_snake_case)] // ObjC selector 方法名
 
@@ -216,7 +218,7 @@ impl PluginPanel {
         if rows.is_empty() {
             let hint = label(
                 mtm,
-                "无插件（ninja.toml [plugins] enabled 配置）",
+                "无已安装插件（把插件二进制放进 ~/.config/ninja/plugins/）",
                 16.0,
                 y,
                 420.0,
@@ -244,12 +246,22 @@ impl PluginPanel {
                 continue;
             };
             let text = match (st.running, st.pid, st.memory_bytes) {
-                (true, Some(pid), Some(mb)) => format!("pid {pid} · {:.1} MB", mb as f64 / 1e6),
+                (true, Some(pid), Some(mb)) => {
+                    format!("pid {pid} · {:.1} MB", mb as f64 / 1e6)
+                }
                 (true, Some(pid), None) => format!("pid {pid}"),
-                _ => match &st.last_error {
-                    Some(e) => format!("已停止（{e}）"),
-                    None => "已停止".to_string(),
-                },
+                (true, None, _) => "运行中".to_string(),
+                (false, _, _) => {
+                    // 已装未启用（发现段里的新面孔）：不叫「已停止」。
+                    if !st.enabled {
+                        "未启用".to_string()
+                    } else {
+                        match &st.last_error {
+                            Some(e) => format!("已停止（{e}）"),
+                            None => "已停止".to_string(),
+                        }
+                    }
+                }
             };
             row.status.setStringValue(&NSString::from_str(&text));
             // 开关态与会话真值同步（外部禁用/死亡也反映）。

@@ -120,6 +120,50 @@ pub(crate) fn resolve_plugin_binary_in(
     None
 }
 
+/// 已安装插件的发现（面板行集的「已安装」部分）：扫描可发现段的
+/// 直接子项，只收可执行的常规文件裸名（隐藏项跳过；名字即文件系统
+/// 注入向量，与 [`resolve_plugin_binary`] 同一卫生规则），并入
+/// `[plugins.paths]` 显式键。宿主同目录段**不扫**（开发布局会捞进
+/// 无关二进制）。排序去重。空载路径同样可用（只读目录，不建 socket）。
+/// 这是「面板能看见已装插件」，不是插件市场。
+pub fn discover_plugin_names(cfg: &PluginsConfig) -> Vec<String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(d) = std::env::var_os("NINJA_PLUGIN_DIR") {
+        dirs.push(PathBuf::from(d));
+    }
+    if let Some(d) = user_plugin_dir() {
+        dirs.push(d);
+    }
+    discover_plugin_names_in(&dirs, cfg)
+}
+
+/// [`discover_plugin_names`] 的实现核心（目录可注入，单测用隔离目录）。
+fn discover_plugin_names_in(dirs: &[PathBuf], cfg: &PluginsConfig) -> Vec<String> {
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
+    let mut names: BTreeSet<String> = cfg.paths.keys().cloned().collect();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue; // 目录不存在 = 没装
+        };
+        for e in rd.flatten() {
+            let Some(name) = e.file_name().into_string().ok() else {
+                continue;
+            };
+            if name.starts_with('.') || name.contains('/') {
+                continue;
+            }
+            let Ok(md) = e.metadata() else {
+                continue;
+            };
+            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
+                names.insert(name);
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// env 门控的调度调试（stderr 一步一行；取证用，不设不打印）。
 pub(crate) fn ade_debug(msg: &str) {
     if std::env::var_os("NINJA_ADE_DEBUG").is_some() {
@@ -154,4 +198,39 @@ pub fn footprint_bytes(pid: u32) -> Option<u64> {
                 .expect("常量切片恰 8 字节"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discover_finds_executable_bare_names_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "ninja_disc_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mk = |name: &str, exec: bool| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(if exec { 0o755 } else { 0o644 });
+            std::fs::set_permissions(&p, perm).unwrap();
+        };
+        mk("alpha", true);
+        mk("beta", false); // 不可执行：不算已装插件
+        mk(".hidden", true); // 隐藏项：跳过
+        std::fs::create_dir_all(dir.join("subdir")).unwrap(); // 目录：跳过
+        let mut cfg = PluginsConfig::default();
+        cfg.paths.insert("explicit".into(), "/opt/explicit".into());
+        let names = discover_plugin_names_in(&[dir.clone()], &cfg);
+        assert_eq!(names, vec!["alpha".to_string(), "explicit".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

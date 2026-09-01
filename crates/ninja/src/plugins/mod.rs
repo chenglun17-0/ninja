@@ -85,7 +85,7 @@ mod binary;
 mod classify;
 mod layer;
 
-pub use binary::{footprint_bytes, resolve_plugin_binary, sweep_stale_sockets};
+pub use binary::{discover_plugin_names, footprint_bytes, resolve_plugin_binary, sweep_stale_sockets};
 pub use classify::{
     classify_token, classify_url, code_to_key_name, key_name_to_code, line_token_at,
     modifiers_from_mods, normalize_cwd, normalize_open_payload, theme_conf_text,
@@ -601,6 +601,7 @@ impl PluginHost {
             names.insert(n.clone());
         }
         names.extend(self.spawn_errors.keys().cloned());
+        names.extend(discover_plugin_names(&self.cfg));
         names
             .into_iter()
             .map(|name| {
@@ -1410,7 +1411,25 @@ pub fn watch_plugin_binaries() {
 pub fn status_snapshot() -> Vec<PluginStatus> {
     match take_dispatcher() {
         Some(host) => host.lock().map(|mut h| h.snapshot()).unwrap_or_default(),
-        None => Vec::new(),
+        // 空载（未启用任何插件）：面板仍能看见已装插件（发现只读目录，
+        // 不建 socket、不碰空载不变量）。
+        None => {
+            let cfg = session_cfg();
+            let mut names: std::collections::BTreeSet<String> =
+                cfg.enabled.iter().cloned().collect();
+            names.extend(discover_plugin_names(&cfg));
+            names
+                .into_iter()
+                .map(|name| PluginStatus {
+                    enabled: cfg.enabled.iter().any(|n| n == &name),
+                    running: false,
+                    pid: None,
+                    memory_bytes: None,
+                    last_error: None,
+                    name,
+                })
+                .collect()
+        }
     }
 }
 
