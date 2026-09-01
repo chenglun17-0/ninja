@@ -1,10 +1,16 @@
-//! 插件面板（⌘, → `toggle_visibility` 动作）：仪表读出式工具窗。
+//! 设置窗（⌘, → `toggle_visibility` 动作）：左侧 tab 源列表 + 右侧内容
+//! 区，现在只有一个 tab「Plugins」。
 //!
-//! 设计：每行 = 开关 / ● 状态点 / 名 / 等宽数字遥测（pid · MB）。
+//! 结构：NSTabView（left position，原生偏好设置窗样式）承载 tab 列表；
+//! 唯一 tab 的内容 = 插件仪表读出（见下）。将来宿主自有设置项再加 tab
+//! ——Ghostty 语义仍只属于 `~/.config/ghostty/config`（宿主不维护第二
+//! 份终端配置面），这里永远只放 ninja 自有的东西。
+//!
+//! 插件页：每行 = 开关 / ● 状态点 / 名 / 等宽数字遥测（pid · MB）。
 //! ● 绿=运行中、灰=未启用、橙=已停止（括号里带原因）——扫描代替读字；
-//! 遥测用 monospacedDigit 字体，1s 刷新不抖。超过 8 行出滚动条（不再
-//! 无限长高）。页脚 = 插件目录路径 + 「打开…」（Finder）——安装位置的
-//! 永久可发现性：丢文件即装，PRODUCT 语义不变。
+//! 遥测用 monospacedDigit 字体，1s 刷新不抖。超过 8 行出滚动条。页脚 =
+//! 插件目录路径 + 「打开…」（Finder）——安装位置的永久可发现性：丢文件
+//! 即装，PRODUCT 语义不变。
 //!
 //! 开关即启停（[`crate::plugins::toggle_plugin`] 的「启用即拉起/禁用即
 //! 回收」单一生命周期）+ 名单写回 ninja.toml（
@@ -15,25 +21,27 @@
 
 #![allow(non_snake_case)] // ObjC selector 方法名
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSButtonType, NSColor, NSFont, NSScrollView, NSTextField,
-    NSView, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSButtonType, NSColor, NSFont, NSScrollView, NSTabView,
+    NSTabViewItem, NSTabPosition, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 /// 行高（含行距）。
 const ROW_H: f64 = 28.0;
-/// 可见行数上限——超出出滚动条，窗口不再无限长高。
+/// 可见行数上限——超出出滚动条。
 const MAX_VISIBLE_ROWS: usize = 8;
 /// 页脚高（路径 + 打开按钮）。
 const FOOTER_H: f64 = 44.0;
-/// 内容宽（固定，工具面板）。
-const CONTENT_W: f64 = 520.0;
+/// 设置窗总宽（tab 列 + 内容区；固定尺寸工具窗）。
+const SETTINGS_W: f64 = 660.0;
+/// 内容区宽的假定值（tab 布局完成前的兜底；完成后按实际 frame 布局）。
+const HOST_W: f64 = 486.0;
 
 /// 一行 = 一个插件。
 struct Row {
@@ -45,10 +53,16 @@ struct Row {
 
 pub struct Ivars {
     window: RefCell<Option<Retained<NSWindow>>>,
+    /// tab 骨架（左 tab 列 + 内容区）。
+    tab: RefCell<Option<Retained<NSTabView>>>,
+    /// tab「Plugins」的内容宿主视图（滚动区 + 页脚都挂它下面）。
+    host: RefCell<Option<Retained<NSView>>>,
     scroll: RefCell<Option<Retained<NSScrollView>>>,
     /// 页脚路径标签（ensure 时定死；刷新不动它）。
     footer_path: RefCell<Option<Retained<NSTextField>>>,
     rows: RefCell<Vec<Row>>,
+    /// 行布局时的内容区宽（1s 拍里漂移 >1pt → 自愈重建）。
+    last_w: Cell<f64>,
     refresh_scheduled: RefCell<bool>,
 }
 
@@ -167,9 +181,12 @@ fn ensure_panel(mtm: MainThreadMarker) -> &'static PluginPanel {
     }
     let this = PluginPanel::alloc(mtm).set_ivars(Ivars {
         window: RefCell::new(None),
+        tab: RefCell::new(None),
+        host: RefCell::new(None),
         scroll: RefCell::new(None),
         footer_path: RefCell::new(None),
         rows: RefCell::new(Vec::new()),
+        last_w: Cell::new(0.0),
         refresh_scheduled: RefCell::new(false),
     });
     // SAFETY: super 的 init；ivars 已就位。
@@ -178,10 +195,9 @@ fn ensure_panel(mtm: MainThreadMarker) -> &'static PluginPanel {
     let raw = &**p as *const PluginPanel as *mut PluginPanel;
     PANEL.store(raw, std::sync::atomic::Ordering::Release);
 
-    // 窗口（无极小化；面板随用随显隐）。
-    let style =
-        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable;
-    let frame = NSRect::new(NSPoint::new(120.0, 480.0), NSSize::new(CONTENT_W, 240.0));
+    // 窗口（固定尺寸设置窗；面板随用随显隐）。
+    let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
+    let frame = NSRect::new(NSPoint::new(120.0, 480.0), NSSize::new(SETTINGS_W, 240.0));
     // SAFETY: NSWindow 指定初始化器；参数平凡。
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -192,25 +208,35 @@ fn ensure_panel(mtm: MainThreadMarker) -> &'static PluginPanel {
             false,
         )
     };
-    window.setTitle(&NSString::from_str("Plugins"));
+    window.setTitle(&NSString::from_str("Settings"));
     // SAFETY: 布尔 setter。
     unsafe { window.setReleasedWhenClosed(false) };
     p.ivars().window.replace(Some(window));
-
     let content = p.window_content();
 
-    // 滚动区（行区）：页脚之上，占满剩余高度。
+    // 设置窗骨架：左 tab 源列表 + 右内容区（现在只有 Plugins 一页）。
+    let tab = NSTabView::new(mtm);
+    tab.setTabPosition(NSTabPosition::Left);
+    let host = NSView::new(mtm);
+    let item = NSTabViewItem::new();
+    item.setLabel(&NSString::from_str("Plugins"));
+    item.setView(Some(&host));
+    tab.addTabViewItem(&item);
+    // SAFETY: 选中首 tab 让 AppKit 当场铺内容区尺寸（rebuild 依赖）。
+    unsafe { tab.selectFirstTabViewItem(None) };
+    content.addSubview(&tab);
+
+    // 插件页内容：滚动区（页脚之上占满）+ 页脚。
     let scroll = NSScrollView::new(mtm);
     scroll.setHasVerticalScroller(true);
     scroll.setHasHorizontalScroller(false);
-    // SAFETY: 布尔 setter。
     scroll.setAutohidesScrollers(true);
-    content.addSubview(&scroll);
+    host.addSubview(&scroll);
     p.ivars().scroll.replace(Some(scroll));
+    build_footer(p, mtm, &host);
 
-    // 页脚：分隔线 + 目录路径 + 「打开…」。
-    build_footer(p, mtm, &content);
-
+    p.ivars().tab.replace(Some(tab));
+    p.ivars().host.replace(Some(host));
     unsafe { &*raw }
 }
 
@@ -224,6 +250,22 @@ impl PluginPanel {
             .expect("面板内容视图")
     }
 
+    /// tab 内容区宽（布局未就绪时用假定值兜底；1s 拍自愈）。
+    fn host_w(&self) -> f64 {
+        let w = self
+            .ivars()
+            .host
+            .borrow()
+            .as_ref()
+            .map(|h| h.frame().size.width)
+            .unwrap_or(0.0);
+        if w < 100.0 {
+            HOST_W
+        } else {
+            w
+        }
+    }
+
     /// 按会话真值 + 已安装发现重建行集（每次打开重建；期间 1s 拍只刷
     /// 状态不重建）。
     fn rebuild(&self, mtm: MainThreadMarker) {
@@ -232,25 +274,19 @@ impl PluginPanel {
         };
         let statuses = crate::plugins::status_snapshot();
         let n = statuses.len();
+        let w = self.host_w();
 
         // 文档视图（行容器）：底朝上排（NSView 原点在左下）。
         let content_h = (n.max(1) as f64 * ROW_H) + 12.0;
         let doc = NSView::new(mtm);
         doc.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(CONTENT_W - 16.0, content_h), // 16 = 预留滚动条
+            NSSize::new(w - 16.0, content_h), // 16 = 预留滚动条
         ));
 
         let mut rows = Vec::new();
         if statuses.is_empty() {
-            let hint = label(
-                mtm,
-                "无已安装插件",
-                16.0,
-                content_h - 34.0,
-                CONTENT_W - 48.0,
-                20.0,
-            );
+            let hint = label(mtm, "无已安装插件", 16.0, content_h - 34.0, w - 48.0, 20.0);
             hint.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, 0.0)));
             doc.addSubview(&hint);
             let sub = label(
@@ -258,7 +294,7 @@ impl PluginPanel {
                 "把插件二进制放进下面的目录，回来开关启用",
                 16.0,
                 content_h - 56.0,
-                CONTENT_W - 48.0,
+                w - 48.0,
                 18.0,
             );
             sub.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -266,7 +302,7 @@ impl PluginPanel {
         } else {
             for (i, st) in statuses.iter().enumerate() {
                 let y = 4.0 + (i as f64) * ROW_H;
-                let row = build_row(mtm, self, &doc, st, y);
+                let row = build_row(mtm, self, &doc, st, y, w);
                 rows.push(row);
             }
         }
@@ -278,20 +314,30 @@ impl PluginPanel {
         } else {
             n.min(MAX_VISIBLE_ROWS)
         };
-        if let Some(w) = self.ivars().window.borrow().as_ref() {
-            let f = w.frame();
-            let content_h = visible as f64 * ROW_H + 14.0;
-            w.setFrame_display(
-                NSRect::new(f.origin, NSSize::new(CONTENT_W, content_h + FOOTER_H)),
+        if let Some(win) = self.ivars().window.borrow().as_ref() {
+            let f = win.frame();
+            let inner_h = visible as f64 * ROW_H + 14.0;
+            win.setFrame_display(
+                NSRect::new(f.origin, NSSize::new(SETTINGS_W, inner_h + FOOTER_H)),
                 false,
             );
         }
-        layout_chrome(self, content_h + FOOTER_H);
+        self.layout_chrome(w, visible as f64 * ROW_H + 14.0);
         *self.ivars().rows.borrow_mut() = rows;
+        self.ivars().last_w.set(w);
     }
 
-    /// 刷新状态列与状态点（不重建行——名字/开关目标不动）。
+    /// 刷新状态列与状态点；内容区宽漂移（首帧布局迟到/字体度量变化）
+    /// → 自愈重建一次。
     fn refresh(&self) {
+        let w = self.host_w();
+        if (w - self.ivars().last_w.get()).abs() > 1.0 {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            self.rebuild(mtm);
+            return;
+        }
         let statuses = crate::plugins::status_snapshot();
         let mono = NSFont::monospacedDigitSystemFontOfSize_weight(12.0, 0.0);
         let mut rows = self.ivars().rows.borrow_mut();
@@ -332,6 +378,20 @@ impl PluginPanel {
         };
         std::mem::forget(timer); // 进程生命期常驻（refresh 轻量）
     }
+
+    /// 内容区骨架摆放：tab 占满窗口内容；滚动区/页脚落在 tab 内容区里。
+    fn layout_chrome(&self, w: f64, inner_h: f64) {
+        let cf = self.window_content().frame();
+        if let Some(tab) = self.ivars().tab.borrow().as_ref() {
+            tab.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), cf.size));
+        }
+        if let Some(scroll) = self.ivars().scroll.borrow().as_ref() {
+            scroll.setFrame(NSRect::new(
+                NSPoint::new(0.0, FOOTER_H),
+                NSSize::new(w, inner_h.max(ROW_H)),
+            ));
+        }
+    }
 }
 
 /// 状态文本（右列）：运行中 = pid · MB（等宽数字刷新不抖）。
@@ -360,7 +420,10 @@ fn status_colors(st: &crate::plugins::PluginStatus) -> (Retained<NSColor>, Retai
     } else if st.enabled {
         (NSColor::systemOrangeColor(), NSColor::secondaryLabelColor())
     } else {
-        (NSColor::quaternaryLabelColor(), NSColor::secondaryLabelColor())
+        (
+            NSColor::quaternaryLabelColor(),
+            NSColor::secondaryLabelColor(),
+        )
     }
 }
 
@@ -371,8 +434,8 @@ fn build_row(
     doc: &NSView,
     st: &crate::plugins::PluginStatus,
     y: f64,
+    w: f64,
 ) -> Row {
-    let w = CONTENT_W - 16.0;
     let check = NSButton::new(mtm);
     check.setButtonType(NSButtonType::Switch);
     check.setTitle(&NSString::from_str(""));
@@ -414,24 +477,24 @@ fn build_row(
 }
 
 /// 页脚：分隔线 + 插件目录路径 + 「打开…」。安装位置常驻可发现。
-fn build_footer(p: &PluginPanel, mtm: MainThreadMarker, content: &NSView) {
+fn build_footer(p: &PluginPanel, mtm: MainThreadMarker, host: &NSView) {
     // 分隔线（NSBox separator，自适应深浅模式）。
     let line = objc2_app_kit::NSBox::new(mtm);
     line.setBoxType(objc2_app_kit::NSBoxType::Separator);
     line.setBorderWidth(1.0);
     line.setFrame(NSRect::new(
         NSPoint::new(12.0, FOOTER_H - 1.0),
-        NSSize::new(CONTENT_W - 24.0, 1.0),
+        NSSize::new(HOST_W - 24.0, 1.0),
     ));
-    content.addSubview(&line);
+    host.addSubview(&line);
 
     let dir_text = crate::plugins::user_plugin_dir()
         .map(|d| abbreviate_home(d.as_path()))
         .unwrap_or_else(|| "~/.config/ninja/plugins".to_string());
-    let path = label(mtm, &dir_text, 14.0, 12.0, CONTENT_W - 130.0, 18.0);
+    let path = label(mtm, &dir_text, 14.0, 12.0, HOST_W - 130.0, 18.0);
     path.setTextColor(Some(&NSColor::secondaryLabelColor()));
     path.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(11.0, 0.0)));
-    content.addSubview(&path);
+    host.addSubview(&path);
     *p.ivars().footer_path.borrow_mut() = Some(path);
 
     let open = NSButton::new(mtm);
@@ -442,20 +505,10 @@ fn build_footer(p: &PluginPanel, mtm: MainThreadMarker, content: &NSView) {
         open.setAction(Some(objc2::sel!(ninjaOpenPluginsDir:)));
     }
     open.setFrame(NSRect::new(
-        NSPoint::new(CONTENT_W - 92.0, 8.0),
+        NSPoint::new(HOST_W - 92.0, 8.0),
         NSSize::new(78.0, 26.0),
     ));
-    content.addSubview(&open);
-}
-
-/// 窗高变化后摆放滚动区/页脚（content 坐标系，底朝上）。
-fn layout_chrome(p: &PluginPanel, content_h: f64) {
-    if let Some(scroll) = p.ivars().scroll.borrow().as_ref() {
-        scroll.setFrame(NSRect::new(
-            NSPoint::new(0.0, FOOTER_H),
-            NSSize::new(CONTENT_W, (content_h - FOOTER_H).max(ROW_H)),
-        ));
-    }
+    host.addSubview(&open);
 }
 
 /// `~` 缩写家目录前缀（展示用）。

@@ -625,7 +625,7 @@ define_class!(
             shell::new_tab(mtm, None); // make_window 内 wire_window
         }
 
-        /// ⌘, / App 菜单「Plugins…」：驱动 toggle_visibility（q2 dispatch
+        /// ⌘, / App 菜单「Settings…」：驱动 toggle_visibility（q2 dispatch
         // 记日志；插件面板 UI 是 q3 交付）。键位语义来自宿主层认领。
         #[unsafe(method(ninjaPlugins:))]
         fn ninja_plugins(&self, _sender: Option<&objc2::runtime::AnyObject>) {
@@ -711,7 +711,7 @@ const APP_ITEMS: &[MenuSpec] = &[
     //（宿主层绑 ⌘,，用户可经 keybind 统一重绑；面板 UI 是 q3 交付，
     // q2 点击/按键驱动 dispatch 记日志）。
     MenuSpec {
-        title: "Plugins…",
+        title: "Settings…",
         selector: "ninjaPlugins:",
         action: "toggle_visibility",
     },
