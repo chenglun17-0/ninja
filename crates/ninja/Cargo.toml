@@ -95,6 +95,8 @@ objc2-core-graphics = { version = "0.3", features = [
 objc2-core-foundation = { version = "0.3", features = [
     "CFBase",
     "CFRunLoop",
+    # 读事件源（插件 socket 事件驱动泵）。
+    "CFSocket",
     "CFString",
     # q3 层原语：IOSurface 属性字典 + present 像素拷贝（CFData）。
     "CFDictionary",

@@ -1079,7 +1079,3 @@ pub(crate) fn layer_foreground(pane: u32) -> Option<(u64, u64)> {
             .map(|e| (e.handle, e.conn))
     })
 }
-
-pub(crate) fn any_layers() -> bool {
-    REGISTRY.lock().map(|reg| !reg.layers.is_empty()).unwrap_or(false)
-}

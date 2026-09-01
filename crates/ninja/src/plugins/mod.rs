@@ -79,8 +79,10 @@
 //!
 //! 同步短超时，绝不卡死主 runloop：claim 汇集 [`HIT_REPLY_TIMEOUT`]
 //! （500ms）、层握手 [`LAYER_HANDSHAKE_TIMEOUT`]（1.5s，只在有人认领时
-//! 进入）、冷启动 connect（2s，只发生在首击兜底）。层打开/主题覆盖/
-//! 有插件连接期间主 runloop 挂 150ms 泵 timer（空载零开销）。
+//! 进入）、冷启动 connect（2s，只发生在首击兜底）。异步消息走
+//! **读事件源**（CFSocket 挂 listener 与每条连接，主 runloop）：fd
+//! 可读才唤醒，空闲零轮询；配置监视拍（0.5s）作全量排干与 pane
+//! 快照/内存上限的慢拍兜底。
 mod binary;
 mod classify;
 mod layer;
@@ -94,7 +96,7 @@ pub use layer::{layer_tab_closed, LayerGeom};
 pub(crate) use binary::{ade_debug, effective_socket_path};
 pub(crate) use classify::{cwd_for_view, hotkey_to_key_event};
 pub(crate) use layer::{
-    any_layers, layer_close, layer_close_all, layer_close_by_conn, layer_close_pane,
+    layer_close, layer_close_all, layer_close_by_conn, layer_close_pane,
     layer_foreground, layer_load_html, layer_open, layer_post_msg, layer_present,
 };
 #[cfg(test)]
@@ -259,7 +261,6 @@ fn handle_theme_set(m: &ThemeSet, conn_id: u64) {
                 *slot = Some((m.name.clone(), text, conn_id));
             }
             eprintln!("ninja: 主题插件已换色板 {:?}（conn {conn_id}）", m.name);
-            ensure_pump_timer();
             crate::host::schedule_reload("theme.set");
         }
         None => {
@@ -341,6 +342,9 @@ struct Conn {
     id: u64,
     stream: UnixStream,
     decoder: FrameDecoder,
+    /// 该连接的读事件源（accept 时挂、断连时摘；仅主线程）。非主线程
+    /// 场景（单测）为 None——靠直调泵。
+    src: Option<ConnSource>,
 }
 
 /// 命中分发的结果。
@@ -364,12 +368,8 @@ pub const HIT_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 const COLD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// claim 后层握手（open→ready→present）的同步预算。只在认领方要层的
-/// 路径上花；预算耗尽 = 放弃等 present（层仍开着，靠泵 timer 兜）。
+/// 路径上花；预算耗尽 = 放弃等 present（层仍开着，靠读源/慢拍兜）。
 pub const LAYER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
-
-/// 层打开/主题覆盖期间插件连接的轮询周期（主 runloop timer；无层无
-/// 覆盖时不存在）。
-const PUMP_INTERVAL: f64 = 0.15;
 
 impl PluginHost {
     /// 唯一入口：按配置决定绑不绑 socket。
@@ -427,6 +427,12 @@ impl PluginHost {
         &self.path
     }
 
+    /// 监听 fd（读事件源挂载用）。
+    fn listener_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.listener.as_raw_fd()
+    }
+
     /// 配置快照（会话真值：面板开关已反映进去）。
     pub fn cfg(&self) -> &PluginsConfig {
         &self.cfg
@@ -475,9 +481,9 @@ impl PluginHost {
 
     /// **启用即拉起**：拉起全部 enabled 且尚未尝试过的插件。宿主启动
     /// （runloop 就绪后，[`spawn_startup_plugins`]）、面板开
-    /// （[`PluginHost::session_enable`]）都汇聚到这里。拉起后开一个
-    /// 「等首个连接」窗口（[`SPAWN_CONNECT_WINDOW`]）钉住泵 timer：
-    /// 插件 connect + 连接即推的 theme.set 靠泵消化。
+    /// （[`PluginHost::session_enable`]）都汇聚到这里。拉起前挂监听
+    /// 读源（[`ensure_socket_sources`]）：插件 connect 即唤醒 accept，
+    /// 连接即推的 theme.set 由读源消化。
     pub fn spawn_enabled_now(&mut self) {
         if self.disabled {
             return;
@@ -491,8 +497,7 @@ impl PluginHost {
             spawned_any = true;
         }
         if spawned_any {
-            spawn_pending_arm();
-            ensure_pump_timer();
+            ensure_socket_sources();
         }
     }
 
@@ -509,8 +514,7 @@ impl PluginHost {
         }
         self.spawned.remove(name); // 面板显式操作：重置重试标记
         self.spawn_one(name);
-        spawn_pending_arm();
-        ensure_pump_timer();
+        ensure_socket_sources();
         true
     }
 
@@ -558,8 +562,7 @@ impl PluginHost {
         }
         self.pump_plugins();
         self.spawn_one(name);
-        spawn_pending_arm();
-        ensure_pump_timer();
+        ensure_socket_sources();
     }
 
     fn respawn_stale_plugins(&mut self) {
@@ -721,10 +724,15 @@ impl PluginHost {
                     let _ = stream.set_read_timeout(Some(HIT_REPLY_TIMEOUT));
                     self.next_conn_id += 1;
                     ade_debug(&format!("插件连接 conn={} 进来", self.next_conn_id));
+                    let src = {
+                        use std::os::unix::io::AsRawFd;
+                        add_read_source(stream.as_raw_fd())
+                    };
                     self.conns.push(Conn {
                         id: self.next_conn_id,
                         stream,
                         decoder: FrameDecoder::new(),
+                        src,
                     });
                     // 新连接立刻推一份快照（agent-restore 靠它恢复）。
                     self.last_pane_sig = None;
@@ -1005,7 +1013,6 @@ impl PluginHost {
                         } else if html {
                             // html 表面：建 WKWebView 可能重入 runloop。不要握着
                             // PluginHost 锁再等 layer.html，否则泵/监视 try 同一把锁会卡死主线程。
-                            ensure_pump_timer();
                             HandshakeStep::Presented
                         } else {
                             HandshakeStep::Continue
@@ -1021,17 +1028,14 @@ impl PluginHost {
             }
             Ok(Some(Message::LayerPresent(m))) => {
                 layer_present(m.layer);
-                ensure_pump_timer();
                 HandshakeStep::Presented
             }
             Ok(Some(Message::LayerHtml(m))) => {
                 layer_load_html(m.layer, &m.html);
-                ensure_pump_timer();
                 HandshakeStep::Presented
             }
             Ok(Some(Message::LayerClose(m))) => {
                 layer_close(m.layer);
-                stop_pump_timer_if_idle();
                 HandshakeStep::Continue
             }
             Ok(Some(other)) => {
@@ -1057,7 +1061,6 @@ impl PluginHost {
             }
             Message::LayerClose(m) => {
                 layer_close(m.layer);
-                stop_pump_timer_if_idle();
             }
             Message::LayerHtml(m) => layer_load_html(m.layer, &m.html),
             Message::LayerMsg(m) => layer_post_msg(m.layer, &m.name, &m.body),
@@ -1143,7 +1146,6 @@ impl PluginHost {
                                 }
                                 Ok(Some(Message::LayerClose(m))) => {
                                     layer_close(m.layer);
-                                    stop_pump_timer_if_idle();
                                 }
                                 Ok(Some(other)) => {
                                     deferred.push((other, conn_id));
@@ -1178,9 +1180,6 @@ impl PluginHost {
             }
         }
         self.maybe_broadcast_pane_snapshot(false);
-        if !any_layers() && self.conns.is_empty() {
-            stop_pump_timer_if_idle();
-        }
     }
 
     fn maybe_broadcast_pane_snapshot(&mut self, force: bool) {
@@ -1206,10 +1205,13 @@ impl PluginHost {
     /// 全部层（插件死了它的层就是无主陈旧 overlay：不摘则层永久残留且
     /// 泵 timer 永不停转）+ 撤销其热键 + 色板覆盖回退基线。
     fn drop_conn(&mut self, idx: usize) {
-        let Some(c) = self.conns.get(idx) else {
+        let Some(c) = self.conns.get_mut(idx) else {
             return;
         };
         let conn_id = c.id;
+        if let Some(src) = c.src.take() {
+            remove_conn_source(&src);
+        }
         self.conns.remove(idx);
         self.hotkeys.retain(|g| g.conn != conn_id);
         if layer_close_by_conn(conn_id) {
@@ -1219,7 +1221,6 @@ impl PluginHost {
             eprintln!("ninja: 主题插件连接 {conn_id} 死亡，色板回退内置/用户基线");
             crate::host::schedule_reload("theme-revoke");
         }
-        stop_pump_timer_if_idle();
     }
 
     /// 幂等关闭（同会话禁用；退出收口复用同一实现）。顺序敏感：
@@ -1245,7 +1246,12 @@ impl PluginHost {
         for (handle, conn) in layer_close_all() {
             let _ = self.send_message(conn, &Message::LayerClose(LayerClose::new(handle)));
         }
-        stop_pump_timer_if_idle();
+        for c in &mut self.conns {
+            if let Some(src) = c.src.take() {
+                remove_conn_source(&src);
+            }
+        }
+        remove_listener_source();
         self.conns.clear();
         std::thread::sleep(Duration::from_millis(80));
         for (_name, c) in self.children.iter_mut() {
@@ -1253,7 +1259,6 @@ impl PluginHost {
             let _ = c.wait();
         }
         self.children.clear();
-        spawn_pending_disarm();
         let _ = std::fs::remove_file(&self.path);
         eprintln!(
             "ninja: 插件已禁用（层已收、连接已断、子进程已收割、socket {:?} 已删）",
@@ -1274,135 +1279,132 @@ enum HandshakeStep {
 // 泵 timer（层/主题覆盖/等连接期间存在；主 runloop）
 // ---------------------------------------------------------------------------
 
-/// CFRunLoopTimer 的存储（CF 类型不自动 Send；只在主线程碰，手工标注
-/// 满足 static 要求）。
-struct TimerSlot(
-    Option<
-        objc2_core_foundation::CFRetained<objc2_core_foundation::CFRunLoopTimer>,
-    >,
+// ---------------------------------------------------------------------------
+// 读事件源（CFSocket；事件驱动，空闲零唤醒）
+// ---------------------------------------------------------------------------
+
+/// 一对 CF 引用（socket + 它的 runloop source）。CF 类型不自动 Send；
+/// 只在主线程创建/移除，static 与 Conn 字段要求手工标注。
+struct ConnSource(
+    objc2_core_foundation::CFRetained<objc2_core_foundation::CFSocket>,
+    objc2_core_foundation::CFRetained<objc2_core_foundation::CFRunLoopSource>,
 );
-unsafe impl Send for TimerSlot {}
 
-static PUMP_TIMER: Mutex<TimerSlot> = Mutex::new(TimerSlot(None));
+unsafe impl Send for ConnSource {}
 
-/// 拉起后「等首个连接」的窗口：插件被拉起后，它的 connect + 连接即推
-/// 的 theme.set 要靠泵消化；但此时可能既无层也无色板覆盖（泵的常规
-/// 启停条件都不满足），泵会自停 → 连接永远没人 accept。窗口内泵不自
-/// 停；首个连接进来（或窗口过期——拉不起/挂死的插件不该拖住空转红线）
-/// 即恢复常规规则。
-const SPAWN_CONNECT_WINDOW: Duration = Duration::from_secs(5);
-
-static SPAWN_PENDING: Mutex<Option<Instant>> = Mutex::new(None);
-
-fn spawn_pending_arm() {
-    if let Ok(mut s) = SPAWN_PENDING.lock() {
-        *s = Some(Instant::now() + SPAWN_CONNECT_WINDOW);
+impl std::fmt::Debug for ConnSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnSource").finish_non_exhaustive()
     }
 }
 
-fn spawn_pending_disarm() {
-    if let Ok(mut s) = SPAWN_PENDING.lock() {
-        *s = None;
-    }
-}
+/// 监听器读源（新连接事件）。挂在主 runloop：只在有插件 connect 时醒。
+static LISTENER_SRC: Mutex<Option<ConnSource>> = Mutex::new(None);
 
-fn spawn_pending_active() -> bool {
-    SPAWN_PENDING
-        .lock()
-        .map(|s| s.map(|dl| Instant::now() < dl).unwrap_or(false))
-        .unwrap_or(false)
-}
-
-/// 泵回调（CFRunLoopTimer callout，主线程）。
-/// 安全 fn 可强制转换成 CFRunLoopTimerCallBack 的 unsafe 函数指针。
-extern "C-unwind" fn pump_tick(
-    _timer: *mut objc2_core_foundation::CFRunLoopTimer,
+/// 读回调（listener 与每条 conn 共用；主 runloop）。与旧 150ms 泵同一
+/// 条入口 [`pump_now`]：accept + 全量排干，幂等，try_lock 防嵌套死锁。
+extern "C-unwind" fn socket_readable(
+    _sock: *mut objc2_core_foundation::CFSocket,
+    _kind: objc2_core_foundation::CFSocketCallBackType,
+    _addr: *const objc2_core_foundation::CFData,
+    _data: *const std::ffi::c_void,
     _info: *mut std::ffi::c_void,
 ) {
     pump_now();
 }
 
-/// 起泵（幂等）：首个层打开/主题覆盖/拉起后由各路径调用。
-pub(crate) fn ensure_pump_timer() {
-    let Some(main) = objc2_core_foundation::CFRunLoop::main() else {
-        return;
-    };
-    let mut slot = match PUMP_TIMER.lock() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if slot.0.is_some() {
-        return;
-    }
-    let mut context = objc2_core_foundation::CFRunLoopTimerContext {
+/// 给 fd 挂 CFSocket 读源并加进主 runloop。只在主线程挂（非主线程
+/// 调用 → None：单测走直调泵，不依赖 runloop）。flags 只带自动重挂
+/// （kCFSocketAutomaticallyReenableReadCallBack）；**不带**
+/// kCFSocketCloseOnInvalidate——fd 由 Rust 侧的 UnixStream/UnixListener
+/// 独占持有，CFSocket 不许代关。
+fn add_read_source(fd: std::os::unix::io::RawFd) -> Option<ConnSource> {
+    let mtm = objc2::MainThreadMarker::new()?;
+    let _ = mtm;
+    use objc2_core_foundation::{CFRunLoop, CFSocket, CFSocketContext};
+    let main = CFRunLoop::main()?;
+    let ctx = CFSocketContext {
         version: 0,
         info: std::ptr::null_mut(),
         retain: None,
         release: None,
         copyDescription: None,
     };
-    // SAFETY: context 布局正确；callout 只跑在主 runloop。
-    let timer = unsafe {
-        objc2_core_foundation::CFRunLoopTimer::new(
+    // SAFETY: ctx 布局正确；callout 只调 pump_now（try_lock，主线程）；
+    // fd 归调用方所有（flags 不带 CloseOnInvalidate）。
+    let sock = unsafe {
+        CFSocket::with_native(
             None,
-            0.0, // 立即首发
-            PUMP_INTERVAL,
-            0,
-            0,
-            Some(pump_tick),
-            &raw mut context,
+            fd,
+            objc2_core_foundation::CFSocketCallBackType::ReadCallBack.bits(),
+            Some(socket_readable),
+            &ctx,
         )
-    };
-    if let Some(t) = timer {
-        // SAFETY: t 合法；加入主 runloop common modes。
-        unsafe { main.add_timer(Some(&t), objc2_core_foundation::kCFRunLoopCommonModes) };
-        slot.0 = Some(t);
+    }?;
+    sock.set_socket_flags(
+        objc2_core_foundation::kCFSocketAutomaticallyReenableReadCallBack,
+    );
+    let src = CFSocket::new_run_loop_source(None, Some(&sock), 0)?;
+    // SAFETY: 读 extern 常量字符串静态（CF 已随进程初始化）。
+    let mode = unsafe { objc2_core_foundation::kCFRunLoopCommonModes };
+    main.add_source(Some(&src), mode);
+    Some(ConnSource(sock, src))
+}
+
+/// 摘源 + 失效（fd 仍归 Rust 所有；与 add 的主线程分支对称）。
+fn remove_conn_source(src: &ConnSource) {
+    use objc2_core_foundation::CFRunLoop;
+    if objc2::MainThreadMarker::new().is_none() {
+        return; // 非主线程没挂过源
     }
+    if let Some(main) = CFRunLoop::main() {
+        // SAFETY: 同上。
+        let mode = unsafe { objc2_core_foundation::kCFRunLoopCommonModes };
+        main.remove_source(Some(&src.1), mode);
+    }
+    src.0.invalidate();
 }
 
-fn has_plugin_conns() -> bool {
-    take_dispatcher()
-        .and_then(|h| h.try_lock().ok().map(|g| !g.conns.is_empty()))
-        .unwrap_or(false)
-}
-
-/// 停泵（幂等）：层/覆盖/等待窗口/插件连接都没了才停。
-pub(crate) fn stop_pump_timer_if_idle() {
-    if any_layers()
-        || plugin_theme_override().is_some()
-        || spawn_pending_active()
-        || has_plugin_conns()
-    {
+/// 起监听读源（幂等）：拉起插件前由各路径调用（旧泵 timer 的替代）。
+/// 空闲成本为零——没有 connect 就没有唤醒。
+pub(crate) fn ensure_socket_sources() {
+    let mut slot = match LISTENER_SRC.lock() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if slot.is_some() {
         return;
     }
-    if let Ok(mut slot) = PUMP_TIMER.lock()
-        && let Some(t) = slot.0.take()
-            && let Some(main) = objc2_core_foundation::CFRunLoop::main()
+    let Some(host) = take_dispatcher() else {
+        return;
+    };
+    let Ok(h) = host.try_lock() else {
+        return;
+    };
+    let fd = h.listener_fd();
+    drop(h);
+    if let Some(pair) = add_read_source(fd) {
+        *slot = Some(pair);
+    }
+}
+
+/// 摘监听源（shutdown：host 关闭/重绑时）。
+fn remove_listener_source() {
+    if let Ok(mut slot) = LISTENER_SRC.lock()
+        && let Some(pair) = slot.take()
     {
-        // SAFETY: t 曾加入主 runloop。
-        unsafe { main.remove_timer(Some(&t), objc2_core_foundation::kCFRunLoopCommonModes) };
+        remove_conn_source(&pair);
     }
 }
 
 /// 泵入口（timer 回调直调；测试可直调）。
 pub fn pump_now() {
-    match take_dispatcher() {
-        Some(host) => {
-            // try_lock：点击握手若正握着同一把锁，嵌套 timer 不能再阻塞。
-            if let Ok(mut h) = host.try_lock() {
-                h.pump_plugins();
-                h.enforce_memory_limits(false);
-                let keep = any_layers()
-                    || plugin_theme_override().is_some()
-                    || spawn_pending_active()
-                    || !h.conns.is_empty();
-                drop(h);
-                if !keep {
-                    stop_pump_timer_if_idle();
-                }
-            }
-        }
-        None => stop_pump_timer_if_idle(),
+    // try_lock：点击握手若正握着同一把锁，嵌套回调不能再阻塞。
+    if let Some(host) = take_dispatcher()
+        && let Ok(mut h) = host.try_lock()
+    {
+        h.pump_plugins();
+        h.enforce_memory_limits(false);
     }
 }
 
@@ -1461,12 +1463,14 @@ pub fn spawn_startup_plugins() {
     }
 }
 
-/// 配置监视拍顺带看插件二进制 mtime（`cp` 新文件后热重载，不必退宿主）
-/// 与内存上限（1s 冷却；覆盖未连上 socket 的子进程——泵只看连接）。
+/// 配置监视拍（0.5s，恒在跑）兼任监督器慢拍：全量排干兜底 + mtime
+/// 热重载 + 内存上限（1s 冷却）。事件源管即时性，这里管保底与覆盖
+/// 未连上 socket 的子进程——正确性不依赖它，延迟兜底靠它。
 pub fn watch_plugin_binaries() {
     if let Some(host) = take_dispatcher()
         && let Ok(mut h) = host.try_lock()
     {
+        h.pump_plugins();
         h.respawn_stale_plugins();
         h.enforce_memory_limits(false);
     }
@@ -1583,7 +1587,6 @@ pub fn host_close_layers_of_pane(pane: u32) {
             let _ = h.send_layer_close(conn, handle);
         }
     }
-    stop_pump_timer_if_idle();
 }
 
 // ---------------------------------------------------------------------------
