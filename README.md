@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon-source.png" width="128" alt="Ninja" />
+</p>
+
 <h1 align="center">Ninja</h1>
 
 <p align="center">
