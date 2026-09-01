@@ -3,8 +3,8 @@
 //! 本 crate 只做两件事：
 //!
 //! 1. build.rs 确保钉版 vendored 构建存在（`vendor/ghostty/`，钉
-//!    ghostty commit a887df42…、zig 0.15.2，详见 vendor/ghostty/build.sh
-//!    与 docs/Q0-CAPABILITY-AUDIT.md），静态链 `libghostty-internal.a`；
+//!    ghostty commit a887df42…、zig 0.15.2，详见 vendor/ghostty/build.sh），
+//!    静态链 `libghostty-internal.a`；
 //! 2. bindgen 对安装出的 `include/ghostty.h` 生成绑定（仅公开嵌入面）。
 //!
 //! 嵌入 API pre-1.0：破坏性升级必须显式改钉点（vendor/ghostty/fetch.sh 的

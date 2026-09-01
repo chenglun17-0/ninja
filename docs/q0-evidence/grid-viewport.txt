@@ -1,8 +1,0 @@
-LJH:ninja jal$ printf 'GRID-READ-LINE-1\nGRID-READ-LINE-2\n'
-GRID-READ-LINE-1
-GRID-READ-LINE-2
-LJH:ninja jal$ printf '\e]8;;https://ghostty.org/q0\e\\CLICKABLE-LINK\e]8;;\e\\\n'
-CLICKABLE-LINK
-LJH:ninja jal$ echo TYPED-VIA-SURFACE-TEXT
-TYPED-VIA-SURFACE-TEXT
-LJH:ninja jal$ 

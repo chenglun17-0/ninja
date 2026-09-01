@@ -1,9 +1,0 @@
-ninja q2 shell — libghostty 1.3.2-master-+b63cfa0；配置：用户 theme=false ODP=true 监视 2 文件；资源目录 "/Users/jal/my_repos/ninja/vendor/ghostty/out/share/ghostty"
-ninja: ninja.toml `font-family` 已收缩——终端配置（shell/字体/主题色）走 ghostty 配置文件，忽略
-ninja: ninja.toml `font-size` 已收缩——终端配置（shell/字体/主题色）走 ghostty 配置文件，忽略
-ninja: ninja.toml [keys] 已收缩（键位全量继承 ghostty keybind 系统），忽略——重绑请写 ghostty 配置 `keybind = super+x=action`（config 路径见启动日志）
-ninja: ninja.toml `shell` 已收缩——终端配置（shell/字体/主题色）走 ghostty 配置文件，忽略
-ninja: ninja.toml `theme` 已收缩——终端配置（shell/字体/主题色）走 ghostty 配置文件，忽略
-ninja: ninja.toml 启用插件 ["preview", "theme"]（q2 仅解析，监督器在 q3 拉起）
-screen: NINJA_E2E_SCREEN=35（虚拟屏取证）
-2026-08-31 13:44:36.191 ninja[61475:15392177] TSM AdjustCapsLockLEDForKeyTransitionHandling - _ISSetPhysicalKeyboardCapsLockLED Inhibit

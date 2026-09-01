@@ -1,2 +1,0 @@
-  children: login login login 
-  unix sockets in host: 0

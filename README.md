@@ -102,8 +102,12 @@ Layers are `placement` × `surface` (`overlay` \| `side` \| `tab`) × (`pixels` 
 | Doc | What it is |
 | --- | --- |
 | [PRODUCT.md](PRODUCT.md) | Product definition — what Ninja is and is not |
-| [PLAN.md](PLAN.md) | Implementation contract |
+| [PLAN.md](PLAN.md) | Implementation contract: ownership, tech lock, quality gates |
 | [DISTRIBUTION.md](DISTRIBUTION.md) | Packaging, signing, Gatekeeper |
+| [docs/architecture.md](docs/architecture.md) | How the host and the ADE protocol compose |
+| [docs/development.md](docs/development.md) | Checkout, build, test, package |
+| [docs/cookbook/write-a-plugin.md](docs/cookbook/write-a-plugin.md) | Ship a process plugin, step by step |
+| [`crates/ninja-protocol`](crates/ninja-protocol/src/lib.rs) | The wire contract: frames, `v`/`type`, message table, goldens |
 
 ## Status
 

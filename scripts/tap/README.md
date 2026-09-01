@@ -31,8 +31,8 @@ HOMEBREW_CASK_OPTS="--no-quarantine" brew install --cask ninja   # 为何用 env
 
 ## Gatekeeper / 隔离语义（无公证——2026-08-31 用户决策：不购 Developer ID）
 
-实测结论（macOS 26.6.1 arm64，Homebrew 5.1.8；完整实测记录见
-[../../docs/q4-evidence/](../../docs/q4-evidence/) 与 DISTRIBUTION.md）：
+实测结论（macOS 26.6.1 arm64，Homebrew 5.1.8；语义记录在
+[../../DISTRIBUTION.md](../../DISTRIBUTION.md)）：
 
 - 本 `.app` 用 **Apple Development** 身份签名（本机真实身份；无身份打包即
   失败，绝不 adhoc），**未经公证**。
@@ -42,11 +42,10 @@ HOMEBREW_CASK_OPTS="--no-quarantine" brew install --cask ninja   # 为何用 env
   （syspolicyd：scan `Code did not match any currently allowed policy`
   → `Prompt shown` → `denial breadcrumb`；`spctl -a -vv` = rejected）。
 - 两条可用路径（**注意**：`--no-quarantine` **CLI 开关在本机 brew 5.1.8
-  已禁用**——实测 `brew install --cask ninja --no-quarantine` 报
-  "Calling the `--[no-]quarantine` switch is disabled! There is no replacement."，
-  证据 docs/q4-evidence/d3b-cli-switch.log）：
-  - 安装时用环境变量 `HOMEBREW_CASK_OPTS="--no-quarantine"`（有效开关，实测
-    装出的副本无隔离属性、直接可开，证据 d3-cask-opts.log）；
+  已禁用**——`brew install --cask ninja --no-quarantine` 报
+  "Calling the `--[no-]quarantine` switch is disabled! There is no replacement."）：
+  - 安装时用环境变量 `HOMEBREW_CASK_OPTS="--no-quarantine"`（有效开关，
+    装出的副本无隔离属性、直接可开）；
   - 装完去属性：`xattr -dr com.apple.quarantine /Applications/Ninja.app`。
 - 本机自打 DMG 手工拖拽安装（不经 brew）**不带**隔离属性，直接可开。
 - 公开分发（他人下载）之前必须补 Developer ID + notarization——见
