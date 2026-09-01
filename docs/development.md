@@ -53,6 +53,17 @@ Screenshots use window IDs. Keyboard evidence prefers the embed API, not `CGEven
 
 `scripts/e2e/reap.sh` kills leftover hold processes and host instances.
 
+## Quality gates
+
+The five standing gates from [PLAN.md](../PLAN.md) run as one command:
+
+```sh
+scripts/e2e/quality-gates.sh          # all gates, virtual display for GUI ones
+scripts/e2e/quality-gates.sh --no-gui # G0–G2 only (no GUI session needed)
+```
+
+G0 unit tests, G1 protocol hygiene (dependency direction + goldens), G2 kernel-noun scan are pure logic. G3–G5 (idle invariants, enable/toggle lifecycle, crash isolation) launch the real host on the virtual display with an isolated config and a throwaway plugin, driving the panel through the same hook path as the UI (`NINJA_PANEL_PLUGIN_FILE`). Run it before pushing host or protocol changes.
+
 ## Hygiene
 
 - Plugin nouns stay out of the kernel.

@@ -980,7 +980,7 @@ impl Message {
             Message::SpawnDenied(SpawnDenied::new(10, "argv 为空")),
             Message::SpawnExited(SpawnExited::new(10, 4242, 0)),
             Message::ConfigPush(ConfigPush::new(
-                vec!["preview".into()],
+                vec!["pager".into()],
                 BTreeMap::from([("new_window".into(), "cmd+n".into())]),
                 536_870_912,
             )),
