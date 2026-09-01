@@ -30,8 +30,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSEventModifierFlags,
-    NSMenu, NSMenuItem, NSWindow, NSWindowDelegate,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSApplicationTerminateReply,
+    NSEventModifierFlags, NSMenu, NSMenuItem, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{NSNotification, NSObject, NSString};
 
@@ -70,15 +70,18 @@ define_class!(
         fn applicationDidFinishLaunching(&self, _notification: &NSNotification) {
             let mtm = MainThreadMarker::new().expect("delegate on main thread");
             let app = NSApplication::sharedApplication(mtm);
+            crate::tab_rename::install();
 
-            // 首窗（context=WINDOW；INITIAL_SIZE 定尺寸见 make_window）。
-            let window = shell::make_window(mtm, None, ghostty_sys::GHOSTTY_SURFACE_CONTEXT_WINDOW);
-            shell::present_window(&window);
-            // 首叶夺焦（窗口 key 后把 first responder 落在终端面上）。
-            if let Some(container) = crate::pane::container_of(&window)
-                && let Some(first) = container.leaves().first()
-            {
-                window.makeFirstResponder(Some(crate::surface::as_responder(first)));
+            if !crate::session::restore(mtm) {
+                let window =
+                    shell::make_window(mtm, None, ghostty_sys::GHOSTTY_SURFACE_CONTEXT_WINDOW);
+                shell::present_window(&window);
+                crate::session::note_new_window(&window);
+                if let Some(container) = crate::pane::container_of(&window)
+                    && let Some(first) = container.leaves().first()
+                {
+                    window.makeFirstResponder(Some(crate::surface::as_responder(first)));
+                }
             }
 
             // q3：启用即拉起——runloop 就绪后拉起全部 enabled 插件
@@ -178,6 +181,18 @@ define_class!(
             }
         }
 
+        /// ⌘Q：在 AppKit 拆标签组之前把窗/tab 树存下来。
+        /// `applicationWillTerminate` 太晚——未选中 tab 那时可能已经不可见。
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn applicationShouldTerminate(
+            &self,
+            _sender: Option<&NSApplication>,
+        ) -> NSApplicationTerminateReply {
+            crate::session::save();
+            crate::session::begin_quit();
+            NSApplicationTerminateReply::TerminateNow
+        }
+
         // 多窗口：最后一个窗口关闭才退出（⌘Q 随时退）。
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn applicationShouldTerminateAfterLastWindowClosed(
@@ -235,6 +250,10 @@ define_class!(
             let window: Option<&NSWindow> = unsafe { msg_send![notification, object] };
             if let Some(w) = window {
                 shell::save_last_frame(w);
+                crate::session::note_close(w);
+                if !crate::session::is_quitting() {
+                    crate::session::save();
+                }
                 if let Some(content) = w.contentView() {
                     shell::window_closed(&content);
                 }
@@ -252,6 +271,7 @@ define_class!(
             let window: Option<&NSWindow> = unsafe { msg_send![notification, object] };
             if let Some(w) = window {
                 shell::save_last_frame(w);
+                shell::suppress_titlebar_sampling(w);
             }
         }
 
@@ -530,6 +550,28 @@ define_class!(
             }
         }
 
+        #[unsafe(method(ninjaActFind:))]
+        fn ninja_act_find(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("start_search");
+        }
+
+        #[unsafe(method(ninjaActFindNext:))]
+        fn ninja_act_find_next(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("navigate_search:next");
+        }
+
+        #[unsafe(method(ninjaActFindPrev:))]
+        fn ninja_act_find_prev(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            perform_menu_binding("navigate_search:previous");
+        }
+
+        #[unsafe(method(ninjaActRenameTab:))]
+        fn ninja_act_rename_tab(&self, _s: Option<&objc2::runtime::AnyObject>) {
+            if !perform_menu_binding("prompt_title:tab") {
+                shell::prompt_tab_title(&host::current_surface_view());
+            }
+        }
+
         /// Panes 菜单动作（绑定路径；无焦点面时 no-op）。
         #[unsafe(method(ninjaActSplitRight:))]
         fn ninja_act_split_right(&self, _s: Option<&objc2::runtime::AnyObject>) {
@@ -600,6 +642,11 @@ define_class!(
         #[unsafe(method(ninjaReloadTick:))]
         fn ninja_reload_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
             host::reload_tick();
+        }
+
+        #[unsafe(method(ninjaTitleTick:))]
+        fn ninja_title_tick(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            host::title_tick();
         }
 
         /// q3 面板钩子拍：NINJA_PANEL_PLUGIN_FILE 每行 "<name> on|off"
@@ -781,6 +828,26 @@ const EDIT_ITEMS: &[MenuSpec] = &[
         title: "Select All",
         selector: "selectAll:",
         action: "select_all",
+    },
+    MenuSpec {
+        title: "Find…",
+        selector: "ninjaActFind:",
+        action: "start_search",
+    },
+    MenuSpec {
+        title: "Find Next",
+        selector: "ninjaActFindNext:",
+        action: "navigate_search:next",
+    },
+    MenuSpec {
+        title: "Find Previous",
+        selector: "ninjaActFindPrev:",
+        action: "navigate_search:previous",
+    },
+    MenuSpec {
+        title: "Rename Tab",
+        selector: "ninjaActRenameTab:",
+        action: "prompt_title:tab",
     },
 ];
 

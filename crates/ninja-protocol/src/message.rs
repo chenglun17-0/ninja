@@ -1,4 +1,4 @@
-//! 六类消息的 Rust 类型（线格式 schema 的权威定义）。
+//! 七类消息的 Rust 类型（线格式 schema 的权威定义）。
 //!
 //! 每条消息一个结构体，公共字段 `v`（协议版本）+ 由 [`Message`] 的
 //! internally-tagged 枚举注入的 `type`；线上形态 `{"type":..,"v":..,...}`
@@ -40,12 +40,49 @@ pub enum HitKind {
     Osc8,
 }
 
-/// 层的位置。线上：`"overlay"`（盖在命中 cell 上）/ `"side"`（侧开）。
+/// 层的位置。线上：`"overlay"`（盖在命中 cell 上）/
+/// `"side"`（侧开）/ `"tab"`（新开一个标签，层铺满）。
+/// 只描述放哪，不描述怎么画——画法见 [`Surface`]。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Placement {
     Overlay,
     Side,
+    Tab,
+}
+
+/// 层的表面。线上：`"pixels"`（宿主建 IOSurface，插件写入）/
+/// `"html"`（宿主建 WKWebView，插件发 [`LayerHtml`] / [`LayerMsg`]）。
+/// 缺省 [`Surface::Pixels`]（旧 golden 不出该字段）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Surface {
+    #[default]
+    Pixels,
+    Html,
+}
+
+fn surface_is_pixels(s: &Surface) -> bool {
+    *s == Surface::Pixels
+}
+
+/// [`InputMouse`] 的键。线上：`"left"` / `"right"` / `"middle"`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// [`InputMouse`] 的动作。线上：`"down"` / `"up"` / `"move"`。
+/// `move` 目前是拖动（按下后移动）；自由悬停宿主可不发。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseAction {
+    Down,
+    Up,
+    Move,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +180,9 @@ impl HitIgnore {
 // ---------------------------------------------------------------------------
 
 /// 插件→宿主：请求一层。`anchor_*` 是命中 cell 坐标（overlay 的锚点、
-/// side 的参考行）。
+/// side 的参考行）；`tab` 忽略锚点，层铺满新标签。
+/// `title` 给标签栏用（空 = 宿主用通用 "Tab"）；缺省且空串不出线，旧 golden 不变。
+/// `surface` 声明怎么画（[`Surface::Pixels`] 缺省且不出线，旧 golden 不变）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerOpen {
     pub v: u32,
@@ -151,6 +190,10 @@ pub struct LayerOpen {
     pub placement: Placement,
     pub anchor_row: u32,
     pub anchor_col: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "surface_is_pixels")]
+    pub surface: Surface,
 }
 
 impl LayerOpen {
@@ -161,7 +204,19 @@ impl LayerOpen {
             placement,
             anchor_row,
             anchor_col,
+            title: String::new(),
+            surface: Surface::Pixels,
         }
+    }
+
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
+    }
+
+    pub fn with_surface(mut self, surface: Surface) -> Self {
+        self.surface = surface;
+        self
     }
 }
 
@@ -229,6 +284,47 @@ impl LayerClose {
         Self {
             v: PROTOCOL_VERSION,
             layer,
+        }
+    }
+}
+
+/// 插件→宿主：HTML 文档，宿主在 [`Surface::Html`] 层用 WKWebView 加载。
+/// `html` 是完整文档（含 CSS）；单帧仍受 8MiB 上限。像素层收到即忽略。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LayerHtml {
+    pub v: u32,
+    pub layer: u64,
+    pub html: String,
+}
+
+impl LayerHtml {
+    pub fn new(layer: u64, html: impl Into<String>) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            layer,
+            html: html.into(),
+        }
+    }
+}
+
+/// 双向：html 表面的不透明邮箱。`name` / `body` 是插件与它自己页面的约定，
+/// 宿主原样转发，不做名字分派（没有 save/dirty 等内核名词）。
+/// 像素层：插件→宿主忽略；宿主不会从像素层发出本消息。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LayerMsg {
+    pub v: u32,
+    pub layer: u64,
+    pub name: String,
+    pub body: String,
+}
+
+impl LayerMsg {
+    pub fn new(layer: u64, name: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            layer,
+            name: name.into(),
+            body: body.into(),
         }
     }
 }
@@ -316,6 +412,82 @@ impl InputKey {
             key: key.into(),
             text: text.into(),
             modifiers,
+        }
+    }
+}
+
+/// 宿主→插件：像素层内的鼠标。坐标是层视图像素，原点左上，与
+/// [`LayerReady`] 的 `width_px`/`height_px` 同一空间。html 表面鼠标留在
+/// WebKit，不发本消息。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InputMouse {
+    pub v: u32,
+    pub layer: u64,
+    pub button: MouseButton,
+    pub action: MouseAction,
+    pub x_px: u32,
+    pub y_px: u32,
+    pub modifiers: Vec<Modifier>,
+}
+
+impl InputMouse {
+    pub fn new(
+        layer: u64,
+        button: MouseButton,
+        action: MouseAction,
+        x_px: u32,
+        y_px: u32,
+        modifiers: Vec<Modifier>,
+    ) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            layer,
+            button,
+            action,
+            x_px,
+            y_px,
+            modifiers,
+        }
+    }
+}
+
+/// 宿主→插件：像素层滚轮。`dx`/`dy` 是整型 delta（正 `dy` = 手指向上/
+/// 内容向下的宿主原样符号，插件自己解释）；html 表面不发。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InputScroll {
+    pub v: u32,
+    pub layer: u64,
+    pub dx: i32,
+    pub dy: i32,
+    pub modifiers: Vec<Modifier>,
+}
+
+impl InputScroll {
+    pub fn new(layer: u64, dx: i32, dy: i32, modifiers: Vec<Modifier>) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            layer,
+            dx,
+            dy,
+            modifiers,
+        }
+    }
+}
+
+/// 宿主→插件：层焦点变化。`focused` 是 JSON boolean。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InputFocus {
+    pub v: u32,
+    pub layer: u64,
+    pub focused: bool,
+}
+
+impl InputFocus {
+    pub fn new(layer: u64, focused: bool) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            layer,
+            focused,
         }
     }
 }
@@ -489,6 +661,90 @@ impl ConfigPush {
 }
 
 // ---------------------------------------------------------------------------
+// pane：宿主推终端面快照；插件把文本写入 PTY
+// ---------------------------------------------------------------------------
+
+/// 一个终端叶子（PTY 面）的快照。`window`/`tab`/`leaf` 是与
+/// `window-save-state` 恢复顺序一致的槽位（只计带 PTY 的标签）。
+/// `fg_pid == 0` 表示前台进程未知。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PaneInfo {
+    pub pane: u32,
+    pub window: u32,
+    pub tab: u32,
+    pub leaf: u32,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub fg_pid: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+}
+
+impl PaneInfo {
+    pub fn new(
+        pane: u32,
+        window: u32,
+        tab: u32,
+        leaf: u32,
+        cwd: impl Into<String>,
+        fg_pid: u32,
+    ) -> Self {
+        Self {
+            pane,
+            window,
+            tab,
+            leaf,
+            cwd: cwd.into(),
+            fg_pid,
+            title: String::new(),
+        }
+    }
+
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
+    }
+}
+
+/// 宿主→插件：当前所有终端 pane。活面的 pane/前台 pid/cwd 变了才推；
+/// 宿主退出前再推一次。插件据此记录各窗正在跑的 CLI agent，并在
+/// 宿主重启后按槽位把 resume 命令写回 PTY。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PaneSnapshot {
+    pub v: u32,
+    pub panes: Vec<PaneInfo>,
+}
+
+impl PaneSnapshot {
+    pub fn new(panes: Vec<PaneInfo>) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            panes,
+        }
+    }
+}
+
+/// 插件→宿主：把 `text` 写入指定 pane 的 PTY（如同用户键入）。
+/// 宿主找不到 pane 时忽略（不断连）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PaneInput {
+    pub v: u32,
+    pub pane: u32,
+    pub text: String,
+}
+
+impl PaneInput {
+    pub fn new(pane: u32, text: impl Into<String>) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            pane,
+            text: text.into(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 顶层枚举
 // ---------------------------------------------------------------------------
 
@@ -518,6 +774,10 @@ pub enum Message {
     LayerPresent(LayerPresent),
     #[serde(rename = "layer.close")]
     LayerClose(LayerClose),
+    #[serde(rename = "layer.html")]
+    LayerHtml(LayerHtml),
+    #[serde(rename = "layer.msg")]
+    LayerMsg(LayerMsg),
     #[serde(rename = "input.hotkey")]
     InputHotkey(InputHotkey),
     #[serde(rename = "input.hotkey.granted")]
@@ -526,6 +786,12 @@ pub enum Message {
     InputHotkeyDenied(InputHotkeyDenied),
     #[serde(rename = "input.key")]
     InputKey(InputKey),
+    #[serde(rename = "input.mouse")]
+    InputMouse(InputMouse),
+    #[serde(rename = "input.scroll")]
+    InputScroll(InputScroll),
+    #[serde(rename = "input.focus")]
+    InputFocus(InputFocus),
     #[serde(rename = "spawn.request")]
     SpawnRequest(SpawnRequest),
     #[serde(rename = "spawn.started")]
@@ -538,6 +804,10 @@ pub enum Message {
     ConfigPush(ConfigPush),
     #[serde(rename = "theme.set")]
     ThemeSet(ThemeSet),
+    #[serde(rename = "pane.snapshot")]
+    PaneSnapshot(PaneSnapshot),
+    #[serde(rename = "pane.input")]
+    PaneInput(PaneInput),
 }
 
 /// 本版本全部 type 字符串（顺序与 [`Message`] 变体一致）。
@@ -549,16 +819,23 @@ pub const KNOWN_TYPES: &[&str] = &[
     "layer.ready",
     "layer.present",
     "layer.close",
+    "layer.html",
+    "layer.msg",
     "input.hotkey",
     "input.hotkey.granted",
     "input.hotkey.denied",
     "input.key",
+    "input.mouse",
+    "input.scroll",
+    "input.focus",
     "spawn.request",
     "spawn.started",
     "spawn.denied",
     "spawn.exited",
     "config.push",
     "theme.set",
+    "pane.snapshot",
+    "pane.input",
 ];
 
 impl Message {
@@ -572,16 +849,23 @@ impl Message {
             Message::LayerReady(m) => m.v,
             Message::LayerPresent(m) => m.v,
             Message::LayerClose(m) => m.v,
+            Message::LayerHtml(m) => m.v,
+            Message::LayerMsg(m) => m.v,
             Message::InputHotkey(m) => m.v,
             Message::InputHotkeyGranted(m) => m.v,
             Message::InputHotkeyDenied(m) => m.v,
             Message::InputKey(m) => m.v,
+            Message::InputMouse(m) => m.v,
+            Message::InputScroll(m) => m.v,
+            Message::InputFocus(m) => m.v,
             Message::SpawnRequest(m) => m.v,
             Message::SpawnStarted(m) => m.v,
             Message::SpawnDenied(m) => m.v,
             Message::SpawnExited(m) => m.v,
             Message::ConfigPush(m) => m.v,
             Message::ThemeSet(m) => m.v,
+            Message::PaneSnapshot(m) => m.v,
+            Message::PaneInput(m) => m.v,
         }
     }
 
@@ -595,21 +879,28 @@ impl Message {
             Message::LayerReady(_) => "layer.ready",
             Message::LayerPresent(_) => "layer.present",
             Message::LayerClose(_) => "layer.close",
+            Message::LayerHtml(_) => "layer.html",
+            Message::LayerMsg(_) => "layer.msg",
             Message::InputHotkey(_) => "input.hotkey",
             Message::InputHotkeyGranted(_) => "input.hotkey.granted",
             Message::InputHotkeyDenied(_) => "input.hotkey.denied",
             Message::InputKey(_) => "input.key",
+            Message::InputMouse(_) => "input.mouse",
+            Message::InputScroll(_) => "input.scroll",
+            Message::InputFocus(_) => "input.focus",
             Message::SpawnRequest(_) => "spawn.request",
             Message::SpawnStarted(_) => "spawn.started",
             Message::SpawnDenied(_) => "spawn.denied",
             Message::SpawnExited(_) => "spawn.exited",
             Message::ConfigPush(_) => "config.push",
             Message::ThemeSet(_) => "theme.set",
+            Message::PaneSnapshot(_) => "pane.snapshot",
+            Message::PaneInput(_) => "pane.input",
         }
     }
 
-    /// 所属六类之一：`hit` / `layer` / `input` / `spawn` / `config` /
-    /// `theme`（type 的第一个 `.` 前段）。
+    /// 所属七类之一：`hit` / `layer` / `input` / `spawn` / `config` /
+    /// `theme` / `pane`（type 的第一个 `.` 前段）。
     pub fn class(&self) -> &'static str {
         self.message_type().split('.').next().unwrap_or("")
     }
@@ -622,18 +913,24 @@ impl Message {
             | Message::InputHotkeyGranted(_)
             | Message::InputHotkeyDenied(_)
             | Message::InputKey(_)
+            | Message::InputMouse(_)
+            | Message::InputScroll(_)
+            | Message::InputFocus(_)
             | Message::SpawnStarted(_)
             | Message::SpawnDenied(_)
             | Message::SpawnExited(_)
-            | Message::ConfigPush(_) => Direction::HostToPlugin,
+            | Message::ConfigPush(_)
+            | Message::PaneSnapshot(_) => Direction::HostToPlugin,
             Message::HitClaim(_)
             | Message::HitIgnore(_)
             | Message::LayerOpen(_)
             | Message::LayerPresent(_)
+            | Message::LayerHtml(_)
             | Message::InputHotkey(_)
             | Message::SpawnRequest(_)
-            | Message::ThemeSet(_) => Direction::PluginToHost,
-            Message::LayerClose(_) => Direction::Both,
+            | Message::ThemeSet(_)
+            | Message::PaneInput(_) => Direction::PluginToHost,
+            Message::LayerClose(_) | Message::LayerMsg(_) => Direction::Both,
         }
     }
 
@@ -658,10 +955,22 @@ impl Message {
             Message::LayerReady(LayerReady::new(8, 3, 640, 480, 144, 123456)),
             Message::LayerPresent(LayerPresent::new(3)),
             Message::LayerClose(LayerClose::new(3)),
+            Message::LayerHtml(LayerHtml::new(3, "<p>hi</p>")),
+            Message::LayerMsg(LayerMsg::new(3, "ping", "{}")),
             Message::InputHotkey(InputHotkey::new(9, "p", vec![Modifier::Cmd])),
             Message::InputHotkeyGranted(InputHotkeyGranted::new(9)),
             Message::InputHotkeyDenied(InputHotkeyDenied::new(9, "已被另一个插件占用")),
             Message::InputKey(InputKey::new(3, "esc", "", vec![])),
+            Message::InputMouse(InputMouse::new(
+                3,
+                MouseButton::Left,
+                MouseAction::Down,
+                12,
+                34,
+                vec![],
+            )),
+            Message::InputScroll(InputScroll::new(3, 0, 1, vec![])),
+            Message::InputFocus(InputFocus::new(3, true)),
             Message::SpawnRequest(SpawnRequest::new(
                 10,
                 vec!["rg".into(), "-n".into(), "你好".into()],
@@ -702,6 +1011,16 @@ impl Message {
                     "#fdf6e3".into(),
                 ],
             )),
+            Message::PaneSnapshot(PaneSnapshot::new(vec![PaneInfo::new(
+                2,
+                0,
+                1,
+                0,
+                "/Users/jal/demo",
+                4242,
+            )
+            .with_title("ninja")])),
+            Message::PaneInput(PaneInput::new(2, "pi --session 01a02485\n")),
         ]
     }
 }

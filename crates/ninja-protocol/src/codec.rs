@@ -12,7 +12,7 @@
 
 use serde::Deserialize;
 
-use crate::message::{Message, PROTOCOL_VERSION, is_known_type};
+use crate::message::{is_known_type, Message, PROTOCOL_VERSION};
 
 /// 解码错误。前四类都是「不能猜」的硬错误。
 #[derive(Clone, Debug, PartialEq)]
@@ -115,12 +115,22 @@ impl Message {
     }
 
     /// **宿主侧**入口（bytes = 帧载荷 JSON 字节）。lenient：未知字段
-    /// 忽略；`v` 不符 / 未知 `type` / 坏 JSON → 错误（宿主处置：断开
-    /// 该插件连接）。
+    /// 忽略；`v` 不符 / 未知 `type` / 坏 JSON → 错误。未知 `type` 的宿主
+    /// 泵处置见 [`Message::decode_host_frame`]（忽略不断连）。
     pub fn decode_host(bytes: &[u8]) -> Result<Message, DecodeError> {
         let text = std::str::from_utf8(bytes)
             .map_err(|e| DecodeError::InvalidJson(format!("帧载荷不是 UTF-8：{e}")))?;
         Message::from_json(text)
+    }
+
+    /// 宿主泵用：未知 `type` → `Ok(None)`（记日志后丢帧，不断连）。
+    /// 其余错误与 [`Message::decode_host`] 相同。
+    pub fn decode_host_frame(bytes: &[u8]) -> Result<Option<Message>, DecodeError> {
+        match Message::decode_host(bytes) {
+            Ok(m) => Ok(Some(m)),
+            Err(DecodeError::UnknownType(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// **插件侧**入口。解码同上；不同在处置契约：任何

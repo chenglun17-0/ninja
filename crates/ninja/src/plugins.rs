@@ -38,14 +38,10 @@
 //!
 //! # layer 适配器（q0 审计 #4 的结构路线）
 //!
-//! `layer.open` → 按锚 cell 算几何（纯函数 [`overlay_rect`]）→ 宿主建
-//! **全局 IOSurface**（kIOSurfaceIsGlobal，跨进程共享像素）→ 叠一个
-//! wantsLayer 的 NSView（CALayer `contents` = IOSurfaceRef，macOS 支持）
-//! 到 SurfaceHostView 之上——ghostty 的 Metal 层是同一 view 的 layer
-//! （layer-hosting），宿主 subview 天然在其上（q0 像素级验证过）→ 回
-//! `layer.ready{w,h,dpi,io_surface_id}` → `layer.present` 重设 contents
-//! 触发重合成 → `layer.close`（双向）/pane 关闭/resize/插件死亡三路
-//! 全回收还焦点。
+//! `layer.open` → `placement`（overlay/side/tab）× `surface`（pixels/html）。
+//! 像素：宿主建全局 IOSurface，插件写入，`layer.present` 合成。html：宿主建
+//! WKWebView，插件发 `layer.html` / `layer.msg`（不透明邮箱，内核不分派名字）。
+//! 宿主不出现插件名词。
 //!
 //! # input 适配器
 //!
@@ -54,7 +50,8 @@
 //!   `input.key{layer:0}` 投递（适配器语义，协议面不变）。
 //! - 层前台时 SurfaceHostView 的 keyDown 先查本模块路由 `input.key`
 //!   （Esc 语义收口在宿主：直接关层，PRODUCT「任何插件层都能立刻关掉」），
-//!   未命中再进既有 surface_key 链。
+//!   未命中再进既有 surface_key 链。像素层另发 `input.mouse` / `input.scroll`
+//!   / `input.focus`。html 表面键鼠留在 WebKit。
 //!
 //! # theme 适配器（无 `config_set` 的宿主绕法）
 //!
@@ -66,18 +63,24 @@
 //! 热重载管线全 surface 传播。插件连接死亡/禁用 → 删层重载，回 ODP/
 //! 用户主题基线。
 //!
-//! # spawn/config：协议面保留、宿主不接线（防镀金）
+//! # spawn：协议面保留、宿主不接线（防镀金）
 //!
-//! q3 验收点名接线的是 hit/layer/input/theme.set；ninja-preview 自读
-//! 文件、ninja-theme 只推色板，都不需要 spawn。`spawn.*` 消息解码合法、
+//! q3 验收点名接线的是 hit/layer/input/theme.set；`spawn.*` 消息解码合法、
 //! 宿主记日志忽略。
+//!
+//! # pane 适配器
+//!
+//! 活面的 pane/前台 pid/cwd 变了才广播 `pane.snapshot`（对照 Orca：
+//! 身份事件 + 退出时再推一次，不按秒扫）。槽位与 `window-save-state`
+//! 恢复顺序一致。插件回 `pane.input` 时经 `ghostty_surface_text` 写入
+//! 对应 PTY。找不到 pane 则忽略、不断连。
 //!
 //! # 超时纪律
 //!
 //! 同步短超时，绝不卡死主 runloop：claim 汇集 [`HIT_REPLY_TIMEOUT`]
 //! （500ms）、层握手 [`LAYER_HANDSHAKE_TIMEOUT`]（1.5s，只在有人认领时
-//! 进入）、冷启动 connect（2s，只发生在首击兜底）。层打开/主题覆盖期间
-//! 主 runloop 挂 150ms 泵 timer（无层无覆盖即不存在，空载零开销）。
+//! 进入）、冷启动 connect（2s，只发生在首击兜底）。层打开/主题覆盖/
+//! 有插件连接期间主 runloop 挂 150ms 泵 timer（空载零开销）。
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -87,23 +90,32 @@ use std::time::{Duration, Instant};
 
 use ninja_protocol::frame::{FrameDecoder, encode_frame};
 use ninja_protocol::{
-    Hit, HitKind, InputHotkey, InputHotkeyDenied, InputHotkeyGranted, InputKey, LayerClose,
-    LayerOpen, LayerReady, Message, Modifier, Placement, ThemeSet,
+    Hit, HitKind, InputFocus, InputHotkey, InputHotkeyDenied, InputHotkeyGranted,
+    InputKey, InputMouse, InputScroll, LayerClose, LayerMsg, LayerOpen, LayerReady, Message,
+    Modifier, MouseAction, MouseButton, PaneInfo, PaneInput, PaneSnapshot, Placement, Surface,
+    ThemeSet,
 };
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, Message as _};
 use objc2_core_foundation::{
     CFBoolean, CFData, CFDictionary, CFNumber, CFNumberType, CFRetained,
 };
 use objc2_core_graphics::{
     CGColorRenderingIntent, CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_app_kit::{NSEvent, NSView, NSWindow};
+use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
 use objc2_io_surface::IOSurfaceRef;
+use objc2_web_kit::{
+    WKScriptMessage, WKScriptMessageHandler, WKUserContentController, WKWebView,
+    WKWebViewConfiguration,
+};
 
+use crate::keymap;
 use crate::surface::SurfaceHostView;
 
 // ---------------------------------------------------------------------------
@@ -483,6 +495,73 @@ fn macos_pid_cwd(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
+/// 当前所有 PTY 面：槽位顺序与 [`crate::session::save`] 一致（只计带
+/// PaneContainer 的标签；预览 chrome 标签不占号）。
+fn collect_pane_snapshot() -> PaneSnapshot {
+    let mut panes = Vec::new();
+    for (window_idx, group) in crate::session::tab_groups().into_iter().enumerate() {
+        for (tab_idx, tw) in group.iter().enumerate() {
+            let Some(c) = crate::pane::container_of(tw) else {
+                continue;
+            };
+            for (leaf_idx, leaf) in c.leaves().iter().enumerate() {
+                let Some(surface) = leaf.surface_opt() else {
+                    continue;
+                };
+                let fg_pid = unsafe { ghostty_sys::ghostty_surface_foreground_pid(surface) } as u32;
+                panes.push(PaneInfo::new(
+                    leaf.pane_id(),
+                    window_idx as u32,
+                    tab_idx as u32,
+                    leaf_idx as u32,
+                    cwd_for_view(leaf),
+                    fg_pid,
+                ));
+            }
+        }
+    }
+    PaneSnapshot::new(panes)
+}
+
+/// 活面 pane/pid/cwd 签名。泵每拍只比这个；变了才走窗口遍历。
+fn cheap_pane_sig() -> String {
+    let mut parts = Vec::new();
+    crate::host::visit_live_panes(|pane, pid, pwd| {
+        parts.push((pane, pid, pwd.unwrap_or("").to_string()));
+    });
+    parts.sort_by_key(|p| p.0);
+    let mut s = String::new();
+    for (pane, pid, cwd) in parts {
+        s.push_str(&pane.to_string());
+        s.push(':');
+        s.push_str(&pid.to_string());
+        s.push(':');
+        s.push_str(&cwd);
+        s.push(';');
+    }
+    s
+}
+
+fn handle_pane_input(m: &PaneInput) {
+    if m.text.is_empty() {
+        return;
+    }
+    let Some(view) = crate::host::view_by_pane_id(m.pane) else {
+        eprintln!("ninja: pane.input pane={} 找不到面，忽略", m.pane);
+        return;
+    };
+    let Some(surface) = view.surface_opt() else {
+        return;
+    };
+    unsafe {
+        ghostty_sys::ghostty_surface_text(
+            surface,
+            m.text.as_ptr().cast(),
+            m.text.len(),
+        );
+    }
+}
+
 /// ghostty mods → 协议修饰键列表。
 pub fn modifiers_from_mods(mods: ghostty_sys::ghostty_input_mods_e) -> Vec<Modifier> {
     let mut out = Vec::new();
@@ -758,6 +837,10 @@ pub struct PluginHost {
     disabled: bool,
     /// 已授予的热键。
     hotkeys: Vec<HotkeyGrant>,
+    /// 上次拉起时插件二进制 mtime。监视拍比对，变了就热重载。
+    bin_mtime: std::collections::BTreeMap<String, Option<std::time::SystemTime>>,
+    /// 上次广播时的活面签名（pane:pid:cwd）。变了才发 pane.snapshot。
+    last_pane_sig: Option<String>,
 }
 
 /// 一条已授予的热键。
@@ -851,6 +934,8 @@ impl PluginHost {
                     cfg,
                     disabled: false,
                     hotkeys: Vec::new(),
+                    bin_mtime: std::collections::BTreeMap::new(),
+                    last_pane_sig: None,
                 })
             }
             Err(e) => {
@@ -899,6 +984,8 @@ impl PluginHost {
                     self.path
                 );
                 self.spawn_errors.remove(name);
+                self.bin_mtime
+                    .insert(name.to_string(), std::fs::metadata(&bin).and_then(|m| m.modified()).ok());
                 self.children.push((name.to_string(), child));
             }
             Err(e) => {
@@ -974,6 +1061,55 @@ impl PluginHost {
         }
         if self.cfg.enabled.is_empty() {
             self.shutdown(); // 名单空 = 零插件：socket 删除，回空载
+        }
+    }
+
+    /// 二进制 mtime 变了：杀掉旧进程再拉起（不改 enabled 名单）。
+    fn restart_plugin(&mut self, name: &str) {
+        if self.disabled {
+            return;
+        }
+        let mut i = 0;
+        while i < self.children.len() {
+            if self.children[i].0 == name {
+                let (_, mut c) = self.children.remove(i);
+                let _ = c.kill();
+                let _ = c.wait();
+            } else {
+                i += 1;
+            }
+        }
+        self.pump_plugins();
+        self.spawn_one(name);
+        spawn_pending_arm();
+        ensure_pump_timer();
+    }
+
+    fn respawn_stale_plugins(&mut self) {
+        if self.disabled {
+            return;
+        }
+        let names = self.cfg.enabled.clone();
+        for name in names {
+            let Some(bin) = resolve_plugin_binary(&name, &self.cfg) else {
+                continue;
+            };
+            let Ok(mt) = std::fs::metadata(&bin).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if mt.elapsed().map(|d| d.as_millis() < 300).unwrap_or(false) {
+                continue;
+            }
+            match self.bin_mtime.get(&name).copied().flatten() {
+                Some(prev) if prev == mt => continue,
+                None => {
+                    self.bin_mtime.insert(name.clone(), Some(mt));
+                    continue;
+                }
+                Some(_) => {}
+            }
+            eprintln!("ninja: 插件 {name:?} 二进制已更新，热重载");
+            self.restart_plugin(&name);
         }
     }
 
@@ -1063,6 +1199,8 @@ impl PluginHost {
                         stream,
                         decoder: FrameDecoder::new(),
                     });
+                    // 新连接立刻推一份快照（agent-restore 靠它恢复）。
+                    self.last_pane_sig = None;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break, // 监听器异常：本轮不再收，下次分发再试
@@ -1177,17 +1315,20 @@ impl PluginHost {
                                     dead.push(i); // 帧级违规：断开
                                     responded[i] = true;
                                 }
-                                Ok(p) => match Message::decode_host(&p) {
-                                    Ok(Message::HitClaim(m)) if m.id == hit.id => {
+                                Ok(p) => match Message::decode_host_frame(&p) {
+                                    Ok(None) => {
+                                        ade_debug("忽略未知 type（插件可比宿主新）");
+                                    }
+                                    Ok(Some(Message::HitClaim(m))) if m.id == hit.id => {
                                         if best.is_none_or(|(pr, _)| m.priority > pr) {
                                             best = Some((m.priority, c.id));
                                         }
                                         responded[i] = true;
                                     }
-                                    Ok(Message::HitIgnore(m)) if m.id == hit.id => {
+                                    Ok(Some(Message::HitIgnore(m))) if m.id == hit.id => {
                                         responded[i] = true;
                                     }
-                                    Ok(other) => {
+                                    Ok(Some(other)) => {
                                         // 回执窗口内顺带消化 theme.set/hotkey
                                         //（借用期先存，循环外统一处置）。
                                         deferred.push((other, c.id));
@@ -1325,34 +1466,48 @@ impl PluginHost {
             Ok(p) => p,
             Err(_) => return HandshakeStep::Dead,
         };
-        match Message::decode_host(&payload) {
-            Ok(Message::LayerOpen(m)) => match layer_open(geom, &m, conn_id) {
-                Some(ready) => {
-                    let f = encode_frame(&Message::LayerReady(ready)).expect("LayerReady 编码");
-                    if self.conns[conn_idx].stream.write_all(&f).is_err() {
-                        HandshakeStep::Dead
-                    } else {
+        match Message::decode_host_frame(&payload) {
+            Ok(None) => HandshakeStep::Continue,
+            Ok(Some(Message::LayerOpen(m))) => {
+                let html = m.surface == Surface::Html;
+                match layer_open(geom, &m, conn_id) {
+                    Some(ready) => {
+                        let f = encode_frame(&Message::LayerReady(ready)).expect("LayerReady 编码");
+                        if self.conns[conn_idx].stream.write_all(&f).is_err() {
+                            HandshakeStep::Dead
+                        } else if html {
+                            // html 表面：建 WKWebView 可能重入 runloop。不要握着
+                            // PluginHost 锁再等 layer.html，否则泵/监视 try 同一把锁会卡死主线程。
+                            ensure_pump_timer();
+                            HandshakeStep::Presented
+                        } else {
+                            HandshakeStep::Continue
+                        }
+                    }
+                    None => {
+                        eprintln!("ninja: 层分配失败（IOSurface/视图），拒层");
+                        let f = encode_frame(&Message::LayerClose(LayerClose::new(0))).expect("编码");
+                        let _ = self.conns[conn_idx].stream.write_all(&f);
                         HandshakeStep::Continue
                     }
                 }
-                None => {
-                    eprintln!("ninja: 层分配失败（IOSurface/视图），拒层");
-                    let f = encode_frame(&Message::LayerClose(LayerClose::new(0))).expect("编码");
-                    let _ = self.conns[conn_idx].stream.write_all(&f);
-                    HandshakeStep::Continue
-                }
-            },
-            Ok(Message::LayerPresent(m)) => {
+            }
+            Ok(Some(Message::LayerPresent(m))) => {
                 layer_present(m.layer);
                 ensure_pump_timer();
                 HandshakeStep::Presented
             }
-            Ok(Message::LayerClose(m)) => {
+            Ok(Some(Message::LayerHtml(m))) => {
+                layer_load_html(m.layer, &m.html);
+                ensure_pump_timer();
+                HandshakeStep::Presented
+            }
+            Ok(Some(Message::LayerClose(m))) => {
                 layer_close(m.layer);
                 stop_pump_timer_if_idle();
                 HandshakeStep::Continue
             }
-            Ok(other) => {
+            Ok(Some(other)) => {
                 // 握手期也可推色板/热键（认领型插件顺带换色）。
                 self.handle_async_message(&other, conn_id);
                 HandshakeStep::Continue
@@ -1377,12 +1532,15 @@ impl PluginHost {
                 layer_close(m.layer);
                 stop_pump_timer_if_idle();
             }
+            Message::LayerHtml(m) => layer_load_html(m.layer, &m.html),
+            Message::LayerMsg(m) => layer_post_msg(m.layer, &m.name, &m.body),
             Message::SpawnRequest(m) => {
                 ade_debug(&format!(
                     "spawn.request id={} argv={:?}：协议面保留，q3 宿主不接线（忽略）",
                     m.id, m.argv
                 ));
             }
+            Message::PaneInput(m) => handle_pane_input(m),
             _ => {}
         }
     }
@@ -1451,15 +1609,16 @@ impl PluginHost {
                     while let Some(payload) = conn.decoder.pop() {
                         match payload {
                             Err(_) => dead = true,
-                            Ok(p) => match Message::decode_host(&p) {
-                                Ok(Message::LayerPresent(m)) => {
+                            Ok(p) => match Message::decode_host_frame(&p) {
+                                Ok(None) => {}
+                                Ok(Some(Message::LayerPresent(m))) => {
                                     layer_present(m.layer);
                                 }
-                                Ok(Message::LayerClose(m)) => {
+                                Ok(Some(Message::LayerClose(m))) => {
                                     layer_close(m.layer);
                                     stop_pump_timer_if_idle();
                                 }
-                                Ok(other) => {
+                                Ok(Some(other)) => {
                                     deferred.push((other, conn_id));
                                 }
                                 Err(_) => dead = true,
@@ -1491,9 +1650,29 @@ impl PluginHost {
                 }
             }
         }
-        if !any_layers() {
+        self.maybe_broadcast_pane_snapshot(false);
+        if !any_layers() && self.conns.is_empty() {
             stop_pump_timer_if_idle();
         }
+    }
+
+    fn maybe_broadcast_pane_snapshot(&mut self, force: bool) {
+        if self.disabled || self.conns.is_empty() {
+            return;
+        }
+        let sig = cheap_pane_sig();
+        if !force && self.last_pane_sig.as_deref() == Some(sig.as_str()) {
+            return;
+        }
+        let snap = collect_pane_snapshot();
+        let msg = Message::PaneSnapshot(snap);
+        let Ok(frame) = encode_frame(&msg) else {
+            return;
+        };
+        for c in &mut self.conns {
+            let _ = c.stream.write_all(&frame);
+        }
+        self.last_pane_sig = Some(sig);
     }
 
     /// 连接死亡收口（EOF / IO 错 / 坏协议）：摘连接 + 收掉该连接拥有的
@@ -1528,6 +1707,9 @@ impl PluginHost {
         if self.disabled {
             return; // 幂等
         }
+        // 对照 Orca quit-capture：断连前再推一次，并给插件一点时间落盘，
+        // 再 SIGKILL（否则 EOF 还没读到就被杀掉，json 停在上一拍）。
+        self.maybe_broadcast_pane_snapshot(true);
         self.disabled = true;
         if revoke_theme_override() {
             eprintln!("ninja: 插件禁用，色板回退内置/用户基线");
@@ -1538,6 +1720,7 @@ impl PluginHost {
         }
         stop_pump_timer_if_idle();
         self.conns.clear();
+        std::thread::sleep(Duration::from_millis(80));
         for (_name, c) in self.children.iter_mut() {
             let _ = c.kill();
             let _ = c.wait();
@@ -1581,14 +1764,20 @@ pub struct LayerGeom {
 struct LayerEntry {
     /// 协议层句柄（layer.ready 里发给插件的那个）。
     handle: u64,
-    /// 拥有该层的 pane。
+    /// 拥有该层的 pane（tab 层用 0：不跟终端 pane 的 resize/Esc 走）。
     pane: u32,
-    /// 宿主自持的合成视图（layer-backed；drawRect 画最新一帧 CGImage）。
-    view: Retained<LayerView>,
-    /// 共享像素（跨进程；插件往里画）。
-    surface: CFRetained<IOSurfaceRef>,
+    /// 像素层合成视图。html tab 为 None。
+    view: Option<Retained<LayerView>>,
+    /// 像素层共享 IOSurface。html tab 为 None。
+    surface: Option<CFRetained<IOSurfaceRef>>,
+    /// html 表面。
+    web: Option<Retained<LayerWebView>>,
     /// 所属插件连接 id。
     conn: u64,
+    /// tab 层持有 chrome 窗（关层时关窗；窗关时反手收层）。
+    tab_window: Option<Retained<NSWindow>>,
+    /// layer.open 的 id（resize 重发 layer.ready 时回同一条）。
+    open_id: u64,
 }
 
 /// 层内容视图：layer-backed NSView，drawRect 把「最新一帧」CGImage 画满
@@ -1599,6 +1788,10 @@ struct LayerEntry {
 #[allow(non_snake_case)]
 pub struct LayerViewIvars {
     image: RefCell<Option<CFRetained<CGImage>>>,
+    handle: Cell<u64>,
+    conn: Cell<u64>,
+    is_tab: Cell<bool>,
+    presented: Cell<bool>,
 }
 
 define_class!(
@@ -1615,29 +1808,277 @@ define_class!(
             true // 与 SurfaceHostView 同系：左上原点
         }
 
+        #[unsafe(method(isOpaque))]
+        fn is_opaque(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            self.ivars().is_tab.get()
+        }
+
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
-            let Some(image) = self.ivars().image.borrow().clone() else {
-                return;
-            };
             let Some(nsctx) = objc2_app_kit::NSGraphicsContext::currentContext() else {
                 return;
             };
-            // SAFETY: currentContext 非 nil 时 CGContext 非空。
             let ctx = nsctx.CGContext();
             let b = self.bounds();
             let rect = objc2_core_foundation::CGRect {
                 origin: objc2_core_foundation::CGPoint::new(0.0, 0.0),
                 size: objc2_core_foundation::CGSize::new(b.size.width, b.size.height),
             };
-            // AppKit flipped 视图的 CG 上下文对原生 CG 调用仍是 y-up
-            //（翻转只作用于 AppKit 绘制 API）——先翻 CTM 再画，否则上下颠倒。
+            objc2_core_graphics::CGContext::set_rgb_fill_color(
+                Some(&ctx),
+                40.0 / 255.0,
+                44.0 / 255.0,
+                52.0 / 255.0,
+                1.0,
+            );
+            objc2_core_graphics::CGContext::fill_rect(Some(&ctx), rect);
+            let Some(image) = self.ivars().image.borrow().clone() else {
+                return;
+            };
+            // AppKit flipped 视图的原生 CG 仍是 y-up：先翻 CTM 再画 CGImage。
+            objc2_core_graphics::CGContext::save_g_state(Some(&ctx));
             objc2_core_graphics::CGContext::translate_ctm(Some(&ctx), 0.0, rect.size.height);
             objc2_core_graphics::CGContext::scale_ctm(Some(&ctx), 1.0, -1.0);
             objc2_core_graphics::CGContext::draw_image(Some(&ctx), rect, Some(&image));
+            objc2_core_graphics::CGContext::restore_g_state(Some(&ctx));
+        }
+
+        #[unsafe(method(becomeFirstResponder))]
+        fn become_first_responder(&self) -> bool {
+            let ok: bool = unsafe { objc2::msg_send![super(self), becomeFirstResponder] };
+            if ok {
+                send_layer_focus(self.ivars().handle.get(), self.ivars().conn.get(), true);
+            }
+            ok
+        }
+
+        #[unsafe(method(resignFirstResponder))]
+        fn resign_first_responder(&self) -> bool {
+            let ok: bool = unsafe { objc2::msg_send![super(self), resignFirstResponder] };
+            if ok {
+                send_layer_focus(self.ivars().handle.get(), self.ivars().conn.get(), false);
+            }
+            ok
+        }
+
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            if !self.ivars().is_tab.get() {
+                let _: () = unsafe { objc2::msg_send![super(self), keyDown: event] };
+                return;
+            }
+            tab_key_down(self, event);
+        }
+
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            send_layer_scroll(self, event);
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            send_layer_mouse(self, event, MouseAction::Down);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            send_layer_mouse(self, event, MouseAction::Up);
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            send_layer_mouse(self, event, MouseAction::Move);
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            send_layer_mouse(self, event, MouseAction::Down);
+        }
+
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, event: &NSEvent) {
+            send_layer_mouse(self, event, MouseAction::Up);
+        }
+
+        #[unsafe(method(rightMouseDragged:))]
+        fn right_mouse_dragged(&self, event: &NSEvent) {
+            send_layer_mouse(self, event, MouseAction::Move);
+        }
+
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, event: &NSEvent) {
+            send_layer_mouse(self, event, MouseAction::Down);
+        }
+
+        #[unsafe(method(otherMouseUp:))]
+        fn other_mouse_up(&self, event: &NSEvent) {
+            send_layer_mouse(self, event, MouseAction::Up);
+        }
+
+        #[unsafe(method(otherMouseDragged:))]
+        fn other_mouse_dragged(&self, event: &NSEvent) {
+            send_layer_mouse(self, event, MouseAction::Move);
+        }
+
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, size: NSSize) {
+            let prev = self.frame().size;
+            let _: () = unsafe { objc2::msg_send![super(self), setFrameSize: size] };
+            if self.ivars().is_tab.get()
+                && self.ivars().presented.get()
+                && self.ivars().handle.get() != 0
+                && !self.inLiveResize()
+                && ((prev.width - size.width).abs() > 0.5 || (prev.height - size.height).abs() > 0.5)
+            {
+                rebuild_tab_layer(self.ivars().handle.get());
+            }
+        }
+
+        #[unsafe(method(viewDidEndLiveResize))]
+        fn view_did_end_live_resize(&self) {
+            let _: () = unsafe { objc2::msg_send![super(self), viewDidEndLiveResize] };
+            if self.ivars().is_tab.get()
+                && self.ivars().presented.get()
+                && self.ivars().handle.get() != 0
+            {
+                rebuild_tab_layer(self.ivars().handle.get());
+            }
         }
     }
 );
+
+/// html 表面：WKWebView 加载插件 HTML。Esc / ⌘W 宿主关层（PRODUCT）。
+/// 其它键留给 WebKit。JS 只能经 `webkit.messageHandlers.layer` 出站。
+#[allow(non_snake_case)]
+pub struct LayerWebIvars {
+    handle: Cell<u64>,
+    conn: Cell<u64>,
+    handler: RefCell<Option<Retained<LayerMsgHandler>>>,
+}
+
+#[allow(non_snake_case)]
+pub struct LayerMsgIvars {
+    handle: Cell<u64>,
+    conn: Cell<u64>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "NinjaLayerMsgHandler"]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = LayerMsgIvars]
+    pub struct LayerMsgHandler;
+
+    unsafe impl NSObjectProtocol for LayerMsgHandler {}
+
+    unsafe impl WKScriptMessageHandler for LayerMsgHandler {
+        #[unsafe(method(userContentController:didReceiveScriptMessage:))]
+        unsafe fn user_content_controller_did_receive_script_message(
+            &self,
+            _controller: &WKUserContentController,
+            message: &WKScriptMessage,
+        ) {
+            on_layer_script_message(self, message);
+        }
+    }
+);
+
+impl LayerMsgHandler {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = LayerMsgHandler::alloc(mtm).set_ivars(LayerMsgIvars {
+            handle: Cell::new(0),
+            conn: Cell::new(0),
+        });
+        unsafe { objc2::msg_send![super(this), init] }
+    }
+}
+
+define_class!(
+    #[unsafe(super(WKWebView))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = LayerWebIvars]
+    pub struct LayerWebView;
+
+    impl LayerWebView {
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(becomeFirstResponder))]
+        fn become_first_responder(&self) -> bool {
+            let ok: bool = unsafe { objc2::msg_send![super(self), becomeFirstResponder] };
+            if ok {
+                send_layer_focus(self.ivars().handle.get(), self.ivars().conn.get(), true);
+            }
+            ok
+        }
+
+        #[unsafe(method(resignFirstResponder))]
+        fn resign_first_responder(&self) -> bool {
+            let ok: bool = unsafe { objc2::msg_send![super(self), resignFirstResponder] };
+            if ok {
+                send_layer_focus(self.ivars().handle.get(), self.ivars().conn.get(), false);
+            }
+            ok
+        }
+
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            let mods = keymap::mods_from_flags(event.modifierFlags().0 as u64);
+            let proto = modifiers_from_mods(mods);
+            let chars = event.characters().map(|c| c.to_string()).unwrap_or_default();
+            let fallback = chars.chars().next();
+            let key = code_to_key_name(event.keyCode(), fallback);
+            if (key == "esc" && !proto.contains(&Modifier::Cmd))
+                || (key == "w"
+                    && proto.contains(&Modifier::Cmd)
+                    && !proto.contains(&Modifier::Shift))
+            {
+                if let Some(w) = self.window() {
+                    w.performClose(None);
+                }
+                return;
+            }
+            let _: () = unsafe { objc2::msg_send![super(self), keyDown: event] };
+        }
+    }
+);
+
+impl LayerWebView {
+    fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+        let config = unsafe { WKWebViewConfiguration::new(mtm) };
+        let handler = LayerMsgHandler::new(mtm);
+        let ucc = unsafe { config.userContentController() };
+        let proto = ProtocolObject::from_ref(&*handler);
+        unsafe {
+            ucc.addScriptMessageHandler_name(&proto, &NSString::from_str("layer"));
+        }
+        let this = LayerWebView::alloc(mtm).set_ivars(LayerWebIvars {
+            handle: Cell::new(0),
+            conn: Cell::new(0),
+            handler: RefCell::new(Some(handler)),
+        });
+        // SAFETY: WKWebView 指定初始化器；ivars 已就位。
+        unsafe {
+            objc2::msg_send![super(this), initWithFrame: frame, configuration: &*config]
+        }
+    }
+
+    fn bind(&self, handle: u64, conn: u64) {
+        self.ivars().handle.set(handle);
+        self.ivars().conn.set(conn);
+        if let Some(h) = self.ivars().handler.borrow().as_ref() {
+            h.ivars().handle.set(handle);
+            h.ivars().conn.set(conn);
+        }
+    }
+}
 
 /// 注册表本体（只在主线程碰；static 要求手工 Send）。
 struct Registry {
@@ -1717,6 +2158,20 @@ fn cf_i64(v: i64) -> Option<CFRetained<CFNumber>> {
 /// q0 审计 #4：宿主 subview 天然在终端之上）。返回发给插件的
 /// `layer.ready`。同一 pane 至多一层（重复 open 先收旧层）。
 fn layer_open(geom: &LayerGeom, m: &LayerOpen, conn: u64) -> Option<LayerReady> {
+    match (m.placement, m.surface) {
+        (Placement::Tab, Surface::Html) => layer_open_tab_html(geom, m, conn),
+        (Placement::Tab, Surface::Pixels) => layer_open_tab_pixels(geom, m, conn),
+        (Placement::Overlay | Placement::Side, Surface::Pixels) => {
+            layer_open_overlay(geom, m, conn)
+        }
+        (Placement::Overlay | Placement::Side, Surface::Html) => {
+            eprintln!("ninja: overlay/side 不接 html 表面");
+            None
+        }
+    }
+}
+
+fn layer_open_overlay(geom: &LayerGeom, m: &LayerOpen, conn: u64) -> Option<LayerReady> {
     let mtm = MainThreadMarker::new()?;
     // 挂窗视图才有意义（无窗 = 无合成面）。
     let _window = geom.view.window()?;
@@ -1727,6 +2182,7 @@ fn layer_open(geom: &LayerGeom, m: &LayerOpen, conn: u64) -> Option<LayerReady> 
     let rect = match m.placement {
         Placement::Overlay => overlay_rect(m.anchor_row, m.anchor_col, geom.cell_pt, geom.view_pt),
         Placement::Side => overlay_rect(m.anchor_row, 0, geom.cell_pt, geom.view_pt),
+        Placement::Tab => unreachable!("tab 走 layer_open_tab"),
     };
     let w_pt = rect.2.round().max(64.0);
     let h_pt = rect.3.round().max(64.0);
@@ -1786,16 +2242,22 @@ fn layer_open(geom: &LayerGeom, m: &LayerOpen, conn: u64) -> Option<LayerReady> 
     let mut reg = REGISTRY.lock().ok()?;
     let handle = reg.next_handle;
     reg.next_handle += 1;
+    view.ivars().handle.set(handle);
+    view.ivars().conn.set(conn);
+    view.ivars().is_tab.set(false);
     reg.layers.push(LayerEntry {
         handle,
         pane: geom.pane,
-        view,
-        surface,
+        view: Some(view),
+        surface: Some(surface),
+        web: None,
         conn,
+        tab_window: None,
+        open_id: m.id,
     });
     drop(reg);
     ade_debug(&format!(
-        "layer.open → ready handle={handle} {w_px}x{h_px}px dpi={} iosurface={surface_id}",
+        "layer.open overlay → ready handle={handle} {w_px}x{h_px}px dpi={} iosurface={surface_id}",
         (72.0 * geom.scale) as u32
     ));
     Some(LayerReady::new(
@@ -1808,6 +2270,385 @@ fn layer_open(geom: &LayerGeom, m: &LayerOpen, conn: u64) -> Option<LayerReady> 
     ))
 }
 
+/// 预览标签不挂终端 pane（避免终端 resize/Esc 误收）。
+const TAB_PANE: u32 = u32::MAX;
+
+thread_local! {
+    static CLOSING_LAYER_TAB: Cell<bool> = const { Cell::new(false) };
+}
+
+fn new_global_iosurface(w_px: u32, h_px: u32) -> Option<CFRetained<IOSurfaceRef>> {
+    let dict = unsafe {
+        let keys: [*const std::ffi::c_void; 5] = [
+            std::ptr::from_ref(objc2_io_surface::kIOSurfaceWidth).cast(),
+            std::ptr::from_ref(objc2_io_surface::kIOSurfaceHeight).cast(),
+            std::ptr::from_ref(objc2_io_surface::kIOSurfaceBytesPerElement).cast(),
+            std::ptr::from_ref(objc2_io_surface::kIOSurfacePixelFormat).cast(),
+            #[allow(deprecated)]
+            std::ptr::from_ref(objc2_io_surface::kIOSurfaceIsGlobal).cast(),
+        ];
+        let w_v = cf_i64(w_px as i64)?;
+        let h_v = cf_i64(h_px as i64)?;
+        let bpe = cf_i64(4)?;
+        let fmt = cf_i64(0x4247_5241_i64)?;
+        let global = CFBoolean::new(true);
+        let values: [*const std::ffi::c_void; 5] = [
+            std::ptr::from_ref(&*w_v).cast(),
+            std::ptr::from_ref(&*h_v).cast(),
+            std::ptr::from_ref(&*bpe).cast(),
+            std::ptr::from_ref(&*fmt).cast(),
+            std::ptr::from_ref(global).cast(),
+        ];
+        let mut keys_mut = keys;
+        let mut values_mut = values;
+        CFDictionary::new(
+            None,
+            keys_mut.as_mut_ptr(),
+            values_mut.as_mut_ptr(),
+            5,
+            &objc2_core_foundation::kCFTypeDictionaryKeyCallBacks,
+            &objc2_core_foundation::kCFTypeDictionaryValueCallBacks,
+        )?
+    };
+    unsafe { IOSurfaceRef::new(&dict) }
+}
+
+fn tab_title(m: &LayerOpen) -> &str {
+    if m.title.is_empty() {
+        "Tab"
+    } else {
+        m.title.as_str()
+    }
+}
+
+fn tab_content_size(geom: &LayerGeom) -> NSSize {
+    geom.view
+        .window()
+        .map(|w| w.contentRectForFrameRect(w.frame()).size)
+        .unwrap_or(NSSize::new(800.0, 600.0))
+}
+
+fn layer_open_tab_html(geom: &LayerGeom, m: &LayerOpen, conn: u64) -> Option<LayerReady> {
+    let mtm = MainThreadMarker::new()?;
+    let parent = geom.view.window();
+    let cs = tab_content_size(geom);
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), cs);
+    let web = LayerWebView::new(mtm, frame);
+    let window = crate::shell::new_chrome_tab(mtm, tab_title(m), web.as_super(), parent.as_deref());
+    let scale = window.backingScaleFactor().max(1.0);
+    let b = web.bounds();
+    let w_pt = b.size.width.max(64.0);
+    let h_pt = b.size.height.max(64.0);
+    let w_px = (w_pt * scale).round().max(64.0) as u32;
+    let h_px = (h_pt * scale).round().max(64.0) as u32;
+
+    let mut reg = REGISTRY.lock().ok()?;
+    let handle = reg.next_handle;
+    reg.next_handle += 1;
+    web.bind(handle, conn);
+    let _ = window.makeFirstResponder(Some(web.as_super()));
+    reg.layers.push(LayerEntry {
+        handle,
+        pane: TAB_PANE,
+        view: None,
+        surface: None,
+        web: Some(web),
+        conn,
+        tab_window: Some(window),
+        open_id: m.id,
+    });
+    drop(reg);
+    eprintln!("ninja: layer tab handle={handle} {w_pt:.0}x{h_pt:.0}pt html");
+    Some(LayerReady::new(
+        m.id,
+        handle,
+        w_px,
+        h_px,
+        (72.0 * scale) as u32,
+        0,
+    ))
+}
+
+fn layer_open_tab_pixels(geom: &LayerGeom, m: &LayerOpen, conn: u64) -> Option<LayerReady> {
+    let mtm = MainThreadMarker::new()?;
+    let parent = geom.view.window();
+    let cs = tab_content_size(geom);
+    let view = LayerView::new(mtm);
+    view.setWantsLayer(true);
+    view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), cs));
+    view.ivars().is_tab.set(true);
+    let window = crate::shell::new_chrome_tab(mtm, tab_title(m), view.as_super(), parent.as_deref());
+    let scale = window.backingScaleFactor().max(1.0);
+    let b = view.bounds();
+    let w_pt = b.size.width.max(64.0);
+    let h_pt = b.size.height.max(64.0);
+    let w_px = (w_pt * scale).round().max(64.0) as u32;
+    let h_px = (h_pt * scale).round().max(64.0) as u32;
+    let surface = new_global_iosurface(w_px, h_px)?;
+    let surface_id = surface.id() as u64;
+
+    let mut reg = REGISTRY.lock().ok()?;
+    let handle = reg.next_handle;
+    reg.next_handle += 1;
+    view.ivars().handle.set(handle);
+    view.ivars().conn.set(conn);
+    let _ = window.makeFirstResponder(Some(view.as_super()));
+    reg.layers.push(LayerEntry {
+        handle,
+        pane: TAB_PANE,
+        view: Some(view),
+        surface: Some(surface),
+        web: None,
+        conn,
+        tab_window: Some(window),
+        open_id: m.id,
+    });
+    drop(reg);
+    eprintln!("ninja: layer tab handle={handle} {w_px}x{h_px}px pixels iosurface={surface_id}");
+    Some(LayerReady::new(
+        m.id,
+        handle,
+        w_px,
+        h_px,
+        (72.0 * scale) as u32,
+        surface_id,
+    ))
+}
+
+fn tab_key_down(view: &LayerView, event: &NSEvent) {
+    let mods = keymap::mods_from_flags(event.modifierFlags().0 as u64);
+    let proto = modifiers_from_mods(mods);
+    let chars = event.characters().map(|c| c.to_string()).unwrap_or_default();
+    let fallback = chars.chars().next();
+    let key = code_to_key_name(event.keyCode(), fallback);
+    if (key == "esc" && !proto.contains(&Modifier::Cmd))
+        || (key == "w" && proto.contains(&Modifier::Cmd) && !proto.contains(&Modifier::Shift))
+    {
+        if let Some(w) = view.window() {
+            w.performClose(None);
+        }
+        return;
+    }
+    send_tab_key(view, key, chars, proto);
+}
+
+fn send_to_plugin(conn: u64, msg: &Message) {
+    if let Some(host) = take_dispatcher()
+        && let Ok(mut h) = host.lock()
+    {
+        let _ = h.send_message(conn, msg);
+    }
+}
+
+fn send_tab_key(view: &LayerView, key: String, text: String, mods: Vec<Modifier>) {
+    let handle = view.ivars().handle.get();
+    let conn = view.ivars().conn.get();
+    if handle == 0 {
+        return;
+    }
+    send_to_plugin(conn, &Message::InputKey(InputKey::new(handle, key, text, mods)));
+}
+
+fn send_layer_focus(handle: u64, conn: u64, focused: bool) {
+    if handle == 0 {
+        return;
+    }
+    send_to_plugin(conn, &Message::InputFocus(InputFocus::new(handle, focused)));
+}
+
+fn layer_event_px(view: &NSView, event: &NSEvent) -> (u32, u32) {
+    let loc = view.convertPoint_fromView(event.locationInWindow(), None);
+    let scale = view
+        .window()
+        .map(|w| w.backingScaleFactor())
+        .unwrap_or(1.0)
+        .max(1.0);
+    let x = (loc.x * scale).round().max(0.0) as u32;
+    let y = (loc.y * scale).round().max(0.0) as u32;
+    (x, y)
+}
+
+fn mouse_button_of(event: &NSEvent) -> MouseButton {
+    match event.buttonNumber() {
+        1 => MouseButton::Right,
+        2 => MouseButton::Middle,
+        _ => MouseButton::Left,
+    }
+}
+
+fn send_layer_mouse(view: &LayerView, event: &NSEvent, action: MouseAction) {
+    let handle = view.ivars().handle.get();
+    let conn = view.ivars().conn.get();
+    if handle == 0 {
+        return;
+    }
+    let (x_px, y_px) = layer_event_px(view.as_super(), event);
+    let mods = modifiers_from_mods(keymap::mods_from_flags(event.modifierFlags().0 as u64));
+    send_to_plugin(
+        conn,
+        &Message::InputMouse(InputMouse::new(
+            handle,
+            mouse_button_of(event),
+            action,
+            x_px,
+            y_px,
+            mods,
+        )),
+    );
+}
+
+fn send_layer_scroll(view: &LayerView, event: &NSEvent) {
+    let handle = view.ivars().handle.get();
+    let conn = view.ivars().conn.get();
+    if handle == 0 {
+        return;
+    }
+    let dx = event.scrollingDeltaX().round() as i32;
+    let dy = event.scrollingDeltaY().round() as i32;
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    let mods = modifiers_from_mods(keymap::mods_from_flags(event.modifierFlags().0 as u64));
+    send_to_plugin(
+        conn,
+        &Message::InputScroll(InputScroll::new(handle, dx, dy, mods)),
+    );
+}
+
+fn rebuild_tab_layer(handle: u64) {
+    let Ok(mut reg) = REGISTRY.lock() else {
+        return;
+    };
+    let Some(e) = reg.layers.iter_mut().find(|e| e.handle == handle) else {
+        return;
+    };
+    let Some(view) = e.view.as_ref() else {
+        return; // html 表面跟窗口尺寸，不必重建
+    };
+    let Some(window) = view.window() else {
+        return;
+    };
+    let scale = window.backingScaleFactor().max(1.0);
+    let b = view.bounds();
+    let w_px = (b.size.width.max(64.0) * scale).round().max(64.0) as u32;
+    let h_px = (b.size.height.max(64.0) * scale).round().max(64.0) as u32;
+    let Some(surface) = new_global_iosurface(w_px, h_px) else {
+        return;
+    };
+    let surface_id = surface.id() as u64;
+    let open_id = e.open_id;
+    let conn = e.conn;
+    e.surface = Some(surface);
+    drop(reg);
+    send_to_plugin(
+        conn,
+        &Message::LayerReady(LayerReady::new(
+            open_id,
+            handle,
+            w_px,
+            h_px,
+            (72.0 * scale) as u32,
+            surface_id,
+        )),
+    );
+}
+
+fn layer_load_html(handle: u64, html: &str) {
+    let Ok(reg) = REGISTRY.lock() else { return };
+    let Some(e) = reg.layers.iter().find(|e| e.handle == handle) else {
+        eprintln!("ninja: layer.html handle={handle} 无此层");
+        return;
+    };
+    let Some(web) = e.web.as_ref() else {
+        eprintln!("ninja: layer.html handle={handle} 不是 html 表面");
+        return;
+    };
+    unsafe { web.loadHTMLString_baseURL(&NSString::from_str(html), None) };
+    eprintln!("ninja: layer.html handle={handle} {} bytes", html.len());
+}
+
+fn layer_post_msg(handle: u64, name: &str, body: &str) {
+    let Ok(reg) = REGISTRY.lock() else {
+        return;
+    };
+    let Some(e) = reg.layers.iter().find(|e| e.handle == handle) else {
+        return;
+    };
+    let Some(web) = e.web.as_ref() else {
+        return; // 像素层：不透明邮箱不适用
+    };
+    let payload = serde_json::json!({ "name": name, "body": body });
+    let js = format!(
+        "(function(){{var d={payload};window.dispatchEvent(new CustomEvent('layer-msg',{{detail:d}}));}})();"
+    );
+    unsafe {
+        web.evaluateJavaScript_completionHandler(&NSString::from_str(&js), None);
+    }
+}
+
+fn on_layer_script_message(handler: &LayerMsgHandler, message: &WKScriptMessage) {
+    let handle = handler.ivars().handle.get();
+    let conn = handler.ivars().conn.get();
+    if handle == 0 {
+        return;
+    }
+    let raw = unsafe { message.body() };
+    let (name, body) = parse_script_msg_body(&raw);
+    send_to_plugin(conn, &Message::LayerMsg(LayerMsg::new(handle, name, body)));
+}
+
+fn parse_script_msg_body(obj: &AnyObject) -> (String, String) {
+    if let Some(s) = obj.downcast_ref::<NSString>() {
+        return (String::new(), s.to_string());
+    }
+    let key_name = NSString::from_str("name");
+    let key_body = NSString::from_str("body");
+    let name: Option<Retained<NSObject>> = unsafe { objc2::msg_send![obj, objectForKey: &*key_name] };
+    let body: Option<Retained<NSObject>> = unsafe { objc2::msg_send![obj, objectForKey: &*key_body] };
+    let name = name
+        .and_then(|v| v.downcast_ref::<NSString>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    let body = body
+        .and_then(|v| v.downcast_ref::<NSString>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    (name, body)
+}
+
+/// 插件层标签 windowWillClose：收层并通知插件（不再 performClose）。
+pub fn layer_tab_closed(content: &NSView) {
+    let handle = if content.class() == LayerWebView::class() {
+        let view: &LayerWebView = unsafe { &*std::ptr::from_ref(content).cast() };
+        view.ivars().handle.get()
+    } else if content.class() == LayerView::class() {
+        let view: &LayerView = unsafe { &*std::ptr::from_ref(content).cast() };
+        view.ivars().handle.get()
+    } else {
+        return;
+    };
+    if handle == 0 {
+        return;
+    }
+    CLOSING_LAYER_TAB.set(true);
+    let conn = {
+        let Ok(reg) = REGISTRY.lock() else {
+            CLOSING_LAYER_TAB.set(false);
+            return;
+        };
+        reg.layers
+            .iter()
+            .find(|e| e.handle == handle)
+            .map(|e| e.conn)
+    };
+    layer_close(handle);
+    CLOSING_LAYER_TAB.set(false);
+    if let Some(conn) = conn
+        && let Some(host) = take_dispatcher()
+        && let Ok(mut h) = host.try_lock()
+    {
+        let _ = h.send_layer_close(conn, handle);
+    }
+}
+
 /// present：插件画完本帧——重设 contents（nil→surface）强制 CA 重采样
 /// 共享内存并重合成（同一 IOSurfaceRef 反复写，CA 不会自己发现变化）。
 fn layer_present(handle: u64) {
@@ -1815,13 +2656,23 @@ fn layer_present(handle: u64) {
     let Some(e) = reg.layers.iter().find(|e| e.handle == handle) else {
         return;
     };
-    let Some(image) = surface_to_image(&e.surface) else {
+    let (Some(surface), Some(view)) = (e.surface.as_ref(), e.view.as_ref()) else {
+        return;
+    };
+    let Some(image) = surface_to_image(surface) else {
         ade_debug(&format!("layer.present handle={handle}：像素拷贝失败"));
         return;
     };
-    *e.view.ivars().image.borrow_mut() = Some(image);
-    e.view.setNeedsDisplay(true);
-    ade_debug(&format!("layer.present handle={handle}（像素拷贝 → CGImage，重画中）"));
+    *view.ivars().image.borrow_mut() = Some(image);
+    view.ivars().presented.set(true);
+    view.setNeedsDisplay(true);
+    eprintln!(
+        "ninja: layer.present handle={handle} image={}x{} view={:.0}x{:.0}",
+        surface.width(),
+        surface.height(),
+        view.bounds().size.width,
+        view.bounds().size.height
+    );
 }
 
 /// 摘一个层（返回 是否摘到）。
@@ -1841,11 +2692,16 @@ fn layer_close(handle: u64) -> bool {
 
 /// 把合成视图从父视图摘掉（主线程）。
 fn remove_overlay(e: &LayerEntry) {
-    // 先丢帧像素（CGImage 全尺寸拷贝，≈层面积×4B）再摘视图——不等
-    // dealloc：AppKit 对摘下的 layer-backed 视图保留不确定时长，
-    // 「关掉即轻」门禁（q3 C14）要求收层时立即归还层内存。
-    e.view.discard_frame();
-    e.view.removeFromSuperview();
+    if let Some(view) = e.view.as_ref() {
+        view.discard_frame();
+    }
+    if let Some(w) = &e.tab_window {
+        if !CLOSING_LAYER_TAB.get() {
+            w.performClose(None);
+        }
+    } else if let Some(view) = e.view.as_ref() {
+        view.removeFromSuperview();
+    }
 }
 
 impl LayerView {
@@ -1858,6 +2714,10 @@ impl LayerView {
     fn new(mtm: objc2::MainThreadMarker) -> Retained<Self> {
         let this = LayerView::alloc(mtm).set_ivars(LayerViewIvars {
             image: RefCell::new(None),
+            handle: Cell::new(0),
+            conn: Cell::new(0),
+            is_tab: Cell::new(false),
+            presented: Cell::new(false),
         });
         // SAFETY: super 的 initWithFrame:；ivars 已就位（零尺寸——
         // 调用方随即 setFrame）。
@@ -2025,10 +2885,20 @@ fn ensure_pump_timer() {
     }
 }
 
-/// 停泵（幂等）：层/覆盖/等待窗口都没了才停。
+fn has_plugin_conns() -> bool {
+    take_dispatcher()
+        .and_then(|h| h.try_lock().ok().map(|g| !g.conns.is_empty()))
+        .unwrap_or(false)
+}
+
+/// 停泵（幂等）：层/覆盖/等待窗口/插件连接都没了才停。
 fn stop_pump_timer_if_idle() {
-    if any_layers() || plugin_theme_override().is_some() || spawn_pending_active() {
-        return; // 还有层要合成 / 覆盖要盯 / 还在等插件连上
+    if any_layers()
+        || plugin_theme_override().is_some()
+        || spawn_pending_active()
+        || has_plugin_conns()
+    {
+        return;
     }
     if let Ok(mut slot) = PUMP_TIMER.lock()
         && let Some(t) = slot.0.take()
@@ -2041,20 +2911,19 @@ fn stop_pump_timer_if_idle() {
 
 /// 泵入口（timer 回调直调；测试可直调）。
 pub fn pump_now() {
-    ade_debug(&format!(
-        "pump tick（layers={} theme={} pending={}）",
-        any_layers(),
-        plugin_theme_override().is_some(),
-        spawn_pending_active()
-    ));
-    if !any_layers() && plugin_theme_override().is_none() && !spawn_pending_active() {
-        stop_pump_timer_if_idle();
-        return;
-    }
     match take_dispatcher() {
         Some(host) => {
-            if let Ok(mut h) = host.lock() {
+            // try_lock：点击握手若正握着同一把锁，嵌套 timer 不能再阻塞。
+            if let Ok(mut h) = host.try_lock() {
                 h.pump_plugins();
+                let keep = any_layers()
+                    || plugin_theme_override().is_some()
+                    || spawn_pending_active()
+                    || !h.conns.is_empty();
+                drop(h);
+                if !keep {
+                    stop_pump_timer_if_idle();
+                }
             }
         }
         None => stop_pump_timer_if_idle(),
@@ -2113,6 +2982,15 @@ pub fn spawn_startup_plugins() {
         && let Ok(mut h) = host.lock()
     {
         h.spawn_enabled_now();
+    }
+}
+
+/// 配置监视拍顺带看插件二进制 mtime：`cp` 新文件后热重载，不必退宿主。
+pub fn watch_plugin_binaries() {
+    if let Some(host) = take_dispatcher()
+        && let Ok(mut h) = host.try_lock()
+    {
+        h.respawn_stale_plugins();
     }
 }
 
@@ -2204,7 +3082,7 @@ pub fn toggle_plugin(name: &str, on: bool) -> bool {
 pub fn host_close_layers_of_pane(pane: u32) {
     for (handle, conn) in layer_close_pane(pane) {
         if let Some(host) = take_dispatcher()
-            && let Ok(mut h) = host.lock()
+            && let Ok(mut h) = host.try_lock()
         {
             let _ = h.send_layer_close(conn, handle);
         }

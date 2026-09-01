@@ -22,8 +22,24 @@ use objc2::rc::Retained;
 use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{NSEvent, NSFocusRingType, NSResponder, NSView, NSWindowStyleMask};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
+use serde::{Deserialize, Serialize};
 
 use crate::surface::{as_responder, SurfaceHostView};
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "t")]
+pub enum LayoutNode {
+    Leaf {
+        #[serde(default)]
+        pwd: Option<String>,
+    },
+    Split {
+        dir: String,
+        ratio: f64,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
 
 /// 分隔条厚度（points；命中区即此厚度）。
 pub const DIVIDER: f64 = 5.0;
@@ -161,6 +177,8 @@ pub struct Ivars {
     /// setHidden 隐藏但**不销毁**：surface 数据继续喂不丢（隐藏面不出帧，
     /// occlusion=false 停画），还原即重显正确内容。
     zoomed: RefCell<Option<Retained<SurfaceHostView>>>,
+    title_override: RefCell<Option<String>>,
+    last_osc_title: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -192,10 +210,21 @@ define_class!(
         #[unsafe(method(drawFocusRingMask))]
         fn draw_focus_ring_mask(&self) {}
 
+        #[unsafe(method(isOpaque))]
+        fn is_opaque(&self) -> bool {
+            true
+        }
+
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, size: NSSize) {
             // SAFETY: 标准 super 调用。
             let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+            self.relayout();
+        }
+
+        #[unsafe(method(viewDidMoveToWindow))]
+        fn view_did_move_to_window(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidMoveToWindow] };
             self.relayout();
         }
 
@@ -253,11 +282,14 @@ impl PaneContainer {
             next_id: Cell::new(1),
             dividers: RefCell::new(HashMap::new()),
             zoomed: RefCell::new(None),
+            title_override: RefCell::new(None),
+            last_osc_title: RefCell::new(None),
         });
         // SAFETY: super 的 initWithFrame:；ivars 已就位。
         let view: Retained<PaneContainer> =
             unsafe { msg_send![super(this), initWithFrame: frame] };
         view.setFocusRingType(NSFocusRingType::None);
+        view.setClipsToBounds(true);
         view.addSubview(&first);
         *view.ivars().tree.borrow_mut() = Some(Node::Leaf {
             view: first,
@@ -270,6 +302,77 @@ impl PaneContainer {
     /// 首个叶子（建窗时挂 surface 用）。
     pub fn first_leaf(&self) -> Retained<SurfaceHostView> {
         self.leaves()[0].clone()
+    }
+
+    pub fn title_override(&self) -> Option<String> {
+        self.ivars().title_override.borrow().clone()
+    }
+
+    pub fn set_title_override(&self, title: Option<String>) {
+        *self.ivars().title_override.borrow_mut() = title;
+        self.apply_title();
+    }
+
+    pub fn set_last_osc_title(&self, title: String) {
+        *self.ivars().last_osc_title.borrow_mut() = Some(title);
+        if self.title_override().is_none() {
+            self.apply_title();
+        }
+    }
+
+    fn apply_title(&self) {
+        let Some(w) = self.window() else {
+            return;
+        };
+        let title = self
+            .title_override()
+            .or_else(|| self.ivars().last_osc_title.borrow().clone())
+            .unwrap_or_else(|| "ninja".into());
+        if w.title().to_string() != title {
+            w.setTitle(&objc2_foundation::NSString::from_str(&title));
+            crate::shell::suppress_titlebar_sampling(&w);
+        }
+    }
+
+    pub fn dump_layout(&self) -> LayoutNode {
+        let tree = self.ivars().tree.borrow();
+        dump_node(tree.as_ref())
+    }
+
+    /// 用会话快照换掉占位叶子并挂 surface。
+    pub fn restore_layout(&self, dump: &LayoutNode, context: ghostty_sys::ghostty_surface_context_e) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        for leaf in self.leaves() {
+            if leaf.surface_opt().is_some() {
+                crate::host::close_leaf_now(&leaf);
+            }
+            leaf.removeFromSuperview();
+        }
+        {
+            let mut ds = self.ivars().dividers.borrow_mut();
+            for d in ds.values() {
+                d.removeFromSuperview();
+            }
+            ds.clear();
+        }
+        let node = materialize(self, dump, mtm);
+        self.set_tree_and_layout(node);
+        let leaves = self.leaves();
+        let Some(first) = leaves.first() else {
+            return;
+        };
+        let pwds = collect_pwds(dump);
+        crate::host::attach_surface(first, context, None, pwds.first().cloned().flatten());
+        for (i, leaf) in leaves.iter().enumerate().skip(1) {
+            crate::host::attach_surface(
+                leaf,
+                ghostty_sys::GHOSTTY_SURFACE_CONTEXT_SPLIT,
+                Some(first),
+                pwds.get(i).cloned().flatten(),
+            );
+        }
     }
 
     /// 当前焦点叶子（first responder 是本容器的某个 SurfaceHostView）。
@@ -325,6 +428,7 @@ impl PaneContainer {
             &new_view,
             ghostty_sys::GHOSTTY_SURFACE_CONTEXT_SPLIT,
             Some(target),
+            None,
         );
         self.addSubview(&new_view);
 
@@ -666,7 +770,7 @@ impl PaneContainer {
     }
 
     /// 递归布局：容器 bounds → 子树 rect（叶子 setFrame → resize 全链）。
-    fn relayout(&self) {
+    pub fn relayout(&self) {
         let bounds = self.bounds();
         let zoomed_ptr = self
             .ivars()
@@ -781,6 +885,82 @@ fn collect_leaves(node: Option<&Node>, out: &mut Vec<Retained<SurfaceHostView>>)
             collect_leaves(Some(second), out);
         }
         None => {}
+    }
+}
+
+fn dump_node(node: Option<&Node>) -> LayoutNode {
+    match node {
+        Some(Node::Leaf { view, .. }) => LayoutNode::Leaf {
+            pwd: view.ivars().pwd.borrow().clone(),
+        },
+        Some(Node::Split {
+            dir,
+            ratio,
+            first,
+            second,
+            ..
+        }) => LayoutNode::Split {
+            dir: match dir {
+                Dir::Horizontal => "h".into(),
+                Dir::Vertical => "v".into(),
+            },
+            ratio: *ratio,
+            first: Box::new(dump_node(Some(first))),
+            second: Box::new(dump_node(Some(second))),
+        },
+        None => LayoutNode::Leaf { pwd: None },
+    }
+}
+
+fn collect_pwds(dump: &LayoutNode) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    fn walk(n: &LayoutNode, out: &mut Vec<Option<String>>) {
+        match n {
+            LayoutNode::Leaf { pwd } => out.push(pwd.clone()),
+            LayoutNode::Split { first, second, .. } => {
+                walk(first, out);
+                walk(second, out);
+            }
+        }
+    }
+    walk(dump, &mut out);
+    out
+}
+
+fn materialize(container: &PaneContainer, dump: &LayoutNode, mtm: MainThreadMarker) -> Node {
+    match dump {
+        LayoutNode::Leaf { .. } => {
+            let view = SurfaceHostView::new(mtm);
+            container.addSubview(&view);
+            Node::Leaf {
+                view,
+                frame: NSRect::ZERO,
+            }
+        }
+        LayoutNode::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
+            let id = container.ivars().next_id.get();
+            container.ivars().next_id.set(id + 1);
+            let divider = DividerView::new(mtm, id);
+            container.addSubview(&divider);
+            container.ivars().dividers.borrow_mut().insert(id, divider);
+            Node::Split {
+                dir: if dir == "v" {
+                    Dir::Vertical
+                } else {
+                    Dir::Horizontal
+                },
+                id,
+                ratio: (*ratio).clamp(RATIO_MIN, RATIO_MAX),
+                first: Box::new(materialize(container, first, mtm)),
+                second: Box::new(materialize(container, second, mtm)),
+                frame: NSRect::ZERO,
+            }
+        }
     }
 }
 

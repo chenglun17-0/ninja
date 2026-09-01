@@ -16,9 +16,10 @@ use std::sync::Mutex;
 use objc2::rc::Retained;
 use objc2::{msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
-    NSApplication, NSBackingStoreType, NSEventType, NSScreen, NSView, NSWindow,
-    NSWindowOrderingMode, NSWindowStyleMask,
+    NSAlert, NSAlertFirstButtonReturn, NSAppearance, NSAppearanceCustomization,
+    NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSBackingStoreType,
+    NSEventType, NSScreen, NSTextField, NSView, NSWindow, NSWindowOrderingMode,
+    NSWindowStyleMask, NSWindowTabbingMode,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSUserDefaults};
 
@@ -27,7 +28,7 @@ use crate::pane::container_of;
 use crate::surface::SurfaceHostView;
 
 /// 所有终端窗口共用的 tabbing identifier（相同才能自动成组）。
-const TABBING_ID: &str = "ninja-terminal";
+pub(crate) const TABBING_ID: &str = "ninja-terminal";
 const LAST_FRAME_KEY: &str = "dev.ninja.last-window-frame";
 const QUIT_KEEPS_WINDOWS_KEY: &str = "NSQuitAlwaysKeepsWindows";
 
@@ -95,6 +96,7 @@ pub fn make_window(
     };
     window.setTitle(&NSString::from_str("ninja"));
     window.setTabbingIdentifier(&NSString::from_str(TABBING_ID));
+    window.setTabbingMode(NSWindowTabbingMode::Preferred);
     window.setContentView(Some(&container));
     apply_chrome(&window);
     // delegate 挂 AppDelegate（windowShouldClose 的裸⌘W 决策、
@@ -112,7 +114,7 @@ pub fn make_window(
 
     let first = container.first_leaf();
     let parent = parent.filter(|p| p.surface_opt().is_some());
-    host::attach_surface(&first, context, parent);
+    host::attach_surface(&first, context, parent, None);
     // Ghostty：window-width/height 都 >0 才发 INITIAL_SIZE；否则 800×600。
     if !window.isVisible() {
         let (w, h) = first
@@ -125,6 +127,114 @@ pub fn make_window(
     }
     place_on_e2e_screen(&window);
     window
+}
+
+/// 会话恢复：按保存的分屏树和工作目录建窗，不走默认 cwd。
+pub fn make_window_restored(
+    mtm: MainThreadMarker,
+    context: ghostty_sys::ghostty_surface_context_e,
+    tab: &crate::session::SessionTab,
+    frame: NSRect,
+) -> Retained<NSWindow> {
+    let container = crate::pane::PaneContainer::new(mtm);
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable;
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            frame,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    window.setTitle(&NSString::from_str("ninja"));
+    window.setTabbingIdentifier(&NSString::from_str(TABBING_ID));
+    window.setTabbingMode(NSWindowTabbingMode::Preferred);
+    window.setContentView(Some(&container));
+    apply_chrome(&window);
+    crate::app::wire_window(&window);
+    unsafe { window.setReleasedWhenClosed(false) };
+    container.restore_layout(&tab.tree, context);
+    if let Some(t) = &tab.title_override {
+        container.set_title_override(Some(t.clone()));
+    }
+    window.setFrame_display(frame, false);
+    window
+}
+
+/// Ghostty Change Tab Title：空白则回到 OSC 标题。
+pub fn prompt_tab_title(view: &Option<Retained<SurfaceHostView>>) {
+    let Some(v) = view else {
+        return;
+    };
+    let Some(w) = v.window() else {
+        return;
+    };
+    prompt_tab_title_for_window(&w);
+}
+
+pub fn prompt_tab_title_for_window(w: &NSWindow) {
+    if crate::tab_rename::begin_inline(w) {
+        return;
+    }
+    let Some(c) = container_of(w) else {
+        // 预览 tab：直接改 window title。
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("Change Tab Title"));
+        let field: Retained<NSTextField> = unsafe {
+            msg_send![NSTextField::alloc(mtm), initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(250.0, 24.0),
+            )]
+        };
+        field.setStringValue(&w.title());
+        alert.setAccessoryView(Some(&field));
+        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        if alert.runModal() != NSAlertFirstButtonReturn {
+            return;
+        }
+        let t = field.stringValue().to_string();
+        if !t.is_empty() {
+            w.setTitle(&NSString::from_str(&t));
+        }
+        return;
+    };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Change Tab Title"));
+    alert.setInformativeText(&NSString::from_str("Leave blank to restore the default."));
+    let field: Retained<NSTextField> = unsafe {
+        msg_send![NSTextField::alloc(mtm), initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(250.0, 24.0),
+        )]
+    };
+    let current = c
+        .title_override()
+        .unwrap_or_else(|| w.title().to_string());
+    field.setStringValue(&NSString::from_str(&current));
+    alert.setAccessoryView(Some(&field));
+    alert.addButtonWithTitle(&NSString::from_str("OK"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let resp = alert.runModal();
+    if resp != NSAlertFirstButtonReturn {
+        return;
+    }
+    let new_title = field.stringValue().to_string();
+    if new_title.is_empty() {
+        c.set_title_override(None);
+    } else {
+        c.set_title_override(Some(new_title));
+    }
 }
 
 /// 按 Ghostty `showWindow` + `applyCascade` 展示：尺寸/原点优先级见
@@ -370,12 +480,13 @@ fn place_on_e2e_screen(window: &NSWindow) {
     println!("screen: NINJA_E2E_SCREEN={target}（虚拟屏取证）");
 }
 
-/// Ghostty 默认 `macos-titlebar-style = transparent`：标题栏透明、底色 =
-/// 终端背景、标题文字随背景明暗（darkAqua/aqua）。插件 theme.set / 用户
-/// ghostty `theme=` 改背景后热重载会再走这里。
+/// 顶栏不能是会采样的材质。Tahoe 标题栏默认 Liquid Glass，会把下面的
+/// Metal 帧当背景；终端一滚，顶栏就闪。透明标题栏 + 关掉采样层之后，
+/// 露出的是窗口底色（终端色、静态），和内容面互不合成。
 pub fn apply_chrome(window: &NSWindow) {
     window.setTitlebarAppearsTransparent(true);
     window.setTitlebarSeparatorStyle(objc2_app_kit::NSTitlebarSeparatorStyle::None);
+    window.setOpaque(true);
     let (r, g, b) = host::bg_rgb();
     window.setBackgroundColor(Some(&host::bg_color()));
     // SAFETY: NSAppearanceName* 是框架提供的常量字符串。
@@ -387,8 +498,79 @@ pub fn apply_chrome(window: &NSWindow) {
         }
     };
     window.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
-    paint_titlebar(window, r, g, b);
-    window.invalidateShadow();
+    suppress_titlebar_sampling(window);
+    paint_titlebar_solid(window, r, g, b);
+}
+
+/// 关掉标题栏里的采样层（Glass / VisualEffect / TitlebarBackground）。
+/// 只 setHidden；不 setWantsLayer、不改 backgroundColor——那些会自己触发重绘。
+pub fn suppress_titlebar_sampling(window: &NSWindow) {
+    let Some(cv) = window.contentView() else {
+        return;
+    };
+    let Some(root) = (unsafe { cv.superview() }) else {
+        return;
+    };
+    hide_sampling_views(&root, false);
+}
+
+fn paint_titlebar_solid(window: &NSWindow, r: u8, g: u8, b: u8) {
+    let Some(cv) = window.contentView() else {
+        return;
+    };
+    let Some(root) = (unsafe { cv.superview() }) else {
+        return;
+    };
+    let Some(space) = objc2_core_graphics::CGColorSpace::new_device_rgb() else {
+        return;
+    };
+    let comps = [
+        f64::from(r) / 255.0,
+        f64::from(g) / 255.0,
+        f64::from(b) / 255.0,
+        1.0,
+    ];
+    let Some(color) = (unsafe { objc2_core_graphics::CGColor::new(Some(&space), comps.as_ptr()) })
+    else {
+        return;
+    };
+    paint_titlebar_view(&root, &color);
+}
+
+fn paint_titlebar_view(v: &NSView, color: &objc2_core_graphics::CGColor) {
+    if class_name(v) == "NSTitlebarView" {
+        v.setWantsLayer(true);
+        if let Some(layer) = v.layer() {
+            layer.setOpaque(true);
+            layer.setBackgroundColor(Some(color));
+        }
+        return;
+    }
+    for sub in v.subviews() {
+        paint_titlebar_view(&sub, color);
+    }
+}
+
+fn hide_sampling_views(v: &NSView, in_titlebar: bool) {
+    let name = class_name(v);
+    let in_titlebar = in_titlebar || name == "NSTitlebarContainerView";
+    if in_titlebar
+        && matches!(
+            name.as_str(),
+            "NSTitlebarBackgroundView" | "_NSTitlebarDecorationView"
+        )
+        && !v.isHidden()
+    {
+        v.setHidden(true);
+    }
+    for sub in v.subviews() {
+        hide_sampling_views(&sub, in_titlebar);
+    }
+}
+
+fn class_name(v: &NSView) -> String {
+    let s: objc2::rc::Retained<NSString> = unsafe { objc2::msg_send![v, className] };
+    s.to_string()
 }
 
 /// Rec. 601 亮度（与 Ghostty `OSColor.luminance` 同款）。
@@ -397,59 +579,6 @@ fn bg_is_light(r: u8, g: u8, b: u8) -> bool {
     let g = f64::from(g) / 255.0;
     let b = f64::from(b) / 255.0;
     0.299 * r + 0.587 * g + 0.114 * b > 0.5
-}
-
-/// Tahoe 标题栏会另铺 NSTitlebarBackgroundView；涂成终端底并藏起材质层，
-/// 否则标题栏像一块浅色方板、深色底上标题字看不见。
-fn paint_titlebar(window: &NSWindow, r: u8, g: u8, b: u8) {
-    let Some(cv) = window.contentView() else {
-        return;
-    };
-    // SAFETY: 读 superview 仅取标题栏所在的 theme frame，不跨线程持有。
-    let Some(root) = (unsafe { cv.superview() }) else {
-        return;
-    };
-    let color = {
-        let Some(space) = objc2_core_graphics::CGColorSpace::new_device_rgb() else {
-            return;
-        };
-        let comps = [
-            f64::from(r) / 255.0,
-            f64::from(g) / 255.0,
-            f64::from(b) / 255.0,
-            1.0,
-        ];
-        // SAFETY: sRGB 四分量、色彩空间有效。
-        unsafe { objc2_core_graphics::CGColor::new(Some(&space), comps.as_ptr()) }
-    };
-    let Some(color) = color else {
-        return;
-    };
-    walk_views(&root, &mut |v| {
-        let name = class_name(v);
-        if name == "NSTitlebarBackgroundView" {
-            v.setHidden(true);
-            return;
-        }
-        if name == "NSTitlebarView" {
-            v.setWantsLayer(true);
-            if let Some(layer) = v.layer() {
-                layer.setBackgroundColor(Some(color.as_ref()));
-            }
-        }
-    });
-}
-
-fn class_name(v: &NSView) -> String {
-    let s: objc2::rc::Retained<NSString> = unsafe { objc2::msg_send![v, className] };
-    s.to_string()
-}
-
-fn walk_views(v: &NSView, f: &mut impl FnMut(&NSView)) {
-    f(v);
-    for sub in v.subviews() {
-        walk_views(&sub, f);
-    }
 }
 
 /// ghostty close_surface（⌘W 默认绑定）/ EOF（close_surface_cb）的宿主侧
@@ -536,6 +665,7 @@ pub fn window_should_close(w: &NSWindow) -> bool {
 pub fn new_window(mtm: MainThreadMarker, parent: Option<&SurfaceHostView>) -> Retained<NSWindow> {
     let w = make_window(mtm, parent, ghostty_sys::GHOSTTY_SURFACE_CONTEXT_WINDOW);
     present_window(&w);
+    crate::session::note_new_window(&w);
     w
 }
 
@@ -558,9 +688,13 @@ pub fn new_tab(mtm: MainThreadMarker, parent: Option<&SurfaceHostView>) -> Retai
         Some(host) => {
             host.addTabbedWindow_ordered(&w, NSWindowOrderingMode::Above);
             w.makeKeyAndOrderFront(None);
+            crate::session::note_new_tab(host, &w);
+            suppress_titlebar_sampling(host);
+            suppress_titlebar_sampling(&w);
         }
         None => {
             w.makeKeyAndOrderFront(None);
+            crate::session::note_new_window(&w);
         }
     }
     w
@@ -579,10 +713,61 @@ pub fn shutdown_all_windows(mtm: MainThreadMarker) {
 
 /// windowWillClose：单窗收尾（contentView 的 pane 容器，全叶延迟 free）。
 pub fn window_closed(content: &objc2_app_kit::NSView) {
+    crate::plugins::layer_tab_closed(content);
     if !crate::pane::is_container(content) {
         return;
     }
     crate::pane::downcast_container(content).shutdown_all();
+}
+
+/// 插件层标签：无 PTY 的 chrome 窗，挂进当前 tab 组。content 由调用方
+/// 提供（像素 LayerView 或 html WKWebView），标题走 `title`。
+pub fn new_chrome_tab(
+    mtm: MainThreadMarker,
+    title: &str,
+    content: &NSView,
+    parent: Option<&NSWindow>,
+) -> Retained<NSWindow> {
+    let app = NSApplication::sharedApplication(mtm);
+    let key = app.keyWindow().or_else(|| app.mainWindow());
+    let host: Option<&NSWindow> = parent.or(key.as_deref());
+    let content_size = host
+        .map(|w| w.contentRectForFrameRect(w.frame()).size)
+        .unwrap_or(NSSize::new(800.0, 600.0));
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable;
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), content_size),
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    window.setTitle(&NSString::from_str(title));
+    window.setTabbingIdentifier(&NSString::from_str(TABBING_ID));
+    window.setTabbingMode(NSWindowTabbingMode::Preferred);
+    content.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), content_size));
+    window.setContentView(Some(content));
+    apply_chrome(&window);
+    crate::app::wire_window(&window);
+    unsafe { window.setReleasedWhenClosed(false) };
+    match host {
+        Some(host) => {
+            host.addTabbedWindow_ordered(&window, NSWindowOrderingMode::Above);
+            window.makeKeyAndOrderFront(None);
+            suppress_titlebar_sampling(host);
+            suppress_titlebar_sampling(&window);
+        }
+        None => {
+            window.makeKeyAndOrderFront(None);
+        }
+    }
+    let _ = window.makeFirstResponder(Some(content));
+    window
 }
 
 /// msg_send 用的 nil sender（Option<&AnyObject> 编码为 null id）。
@@ -608,6 +793,15 @@ pub fn goto_tab(w: &NSWindow, goto: ghostty_sys::ghostty_action_goto_tab_e) {
                 let windows = group.windows();
                 if let Some(last) = windows.into_iter().last() {
                     last.makeKeyAndOrderFront(None);
+                }
+            }
+        }
+        n if n >= 1 => {
+            // Ghostty `goto_tab:1`…：1-based。
+            if let Some(group) = w.tabGroup() {
+                let idx = (n as usize).saturating_sub(1);
+                if let Some(tw) = group.windows().into_iter().nth(idx) {
+                    tw.makeKeyAndOrderFront(None);
                 }
             }
         }
@@ -654,6 +848,7 @@ pub fn move_tab(w: &NSWindow, amount: isize) {
         NSWindowOrderingMode::Above
     };
     target.addTabbedWindow_ordered(&selected, ordering);
+    crate::session::note_move(&selected, amount);
 }
 
 /// ghostty CLOSE_TAB(this/other/right)：tab 组操作。this → 当前 tab

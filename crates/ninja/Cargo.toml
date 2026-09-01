@@ -17,6 +17,9 @@ ninja-protocol.workspace = true
 libc = "0.2"
 # q2 配置：ninja.toml 收缩后的解析（[plugins] 等）。
 toml = "0.9"
+block2 = "0.6"
+serde.workspace = true
+serde_json.workspace = true
 
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
@@ -36,6 +39,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSRange",
     "NSAttributedString",
     "NSUserDefaults",
+    "NSNotification",
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "AppKitDefines",
@@ -45,11 +49,13 @@ objc2-app-kit = { version = "0.3", features = [
     "NSView",
     "NSResponder",
     "NSEvent",
+    "block2",
     "NSPasteboard",
     "NSColor",
     "NSAppearance",
     "NSScreen",
     "NSGraphics",
+    "NSImage",
     # q1 壳：菜单 / NSTextInputClient（IME）/ 追踪区。
     "NSMenu",
     "NSMenuItem",
@@ -59,10 +65,23 @@ objc2-app-kit = { version = "0.3", features = [
     "NSButton",
     "NSControl",
     "NSTextField",
+    "NSAlert",
+    "NSColor",
 ] }
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer"] }
 # q3 层原语：全局 IOSurface（跨进程共享像素）。
 objc2-io-surface = "0.3"
+# html 表面：插件 HTML → 宿主 WKWebView（不透明邮箱走 script handler）。
+objc2-web-kit = { version = "0.3", features = [
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKPreferences",
+    "WKWebpagePreferences",
+    "WKNavigationDelegate",
+    "WKScriptMessage",
+    "WKScriptMessageHandler",
+    "WKUserContentController",
+] }
 # 覆盖层取证：NSColor → CGColor 填 CALayer 背景。
 objc2-core-graphics = { version = "0.3", features = [
     "CGColor",

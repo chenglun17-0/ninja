@@ -1,9 +1,9 @@
-//! q3 契约测试：六类消息全覆盖。
+//! q3 契约测试：七类消息全覆盖。
 //!
-//! - 往返：sample → JSON → 解码 == 原值（17 条全量）。
+//! - 往返：sample → JSON → 解码 == 原值（与 KNOWN_TYPES 等长）。
 //! - golden：每条消息与 tests/golden/<type>.json 字节一致（钉死线格式，
 //!   第二语言实现的参照物；再生成见 examples/dump_messages.rs）。
-//! - 信封不变量：每条序列化必含 `"v":0` 与 `"type":<type>`；六类各至少
+//! - 信封不变量：每条序列化必含 `"v":0` 与 `"type":<type>`；七类各至少
 //!   一条；KNOWN_TYPES 与枚举一一对应。
 //! - 策略：宿主 lenient（未知字段忽略）；版本门（v 不符 → 不猜）；
 //!   未知 type / 缺 v / 缺 type / 坏 JSON 的错误分类。
@@ -24,8 +24,8 @@ fn goldens_dir() -> std::path::PathBuf {
 fn six_classes_all_covered() {
     let samples = Message::sample_messages();
     assert_eq!(samples.len(), KNOWN_TYPES.len(), "每条消息一个样例");
-    for class in ["hit", "layer", "input", "spawn", "config", "theme"] {
-        assert!(samples.iter().any(|m| m.class() == class), "六类缺 {class}");
+    for class in ["hit", "layer", "input", "spawn", "config", "theme", "pane"] {
+        assert!(samples.iter().any(|m| m.class() == class), "七类缺 {class}");
     }
     for (m, ty) in samples.iter().zip(KNOWN_TYPES) {
         assert_eq!(m.message_type(), *ty);
@@ -97,6 +97,52 @@ fn golden_files_pin_wire_format() {
         })
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(seen, on_disk, "golden 目录与消息集不一致");
+}
+
+#[test]
+fn layer_open_tab_title_is_optional() {
+    let titled = Message::LayerOpen(LayerOpen::new(1, Placement::Tab, 0, 0).with_title("foo.py"));
+    let json = titled.to_json().unwrap();
+    assert!(json.contains(r#""placement":"tab""#), "{json}");
+    assert!(json.contains(r#""title":"foo.py""#), "{json}");
+    assert_eq!(Message::from_json(&json).unwrap(), titled);
+
+    let bare = Message::LayerOpen(LayerOpen::new(1, Placement::Overlay, 0, 0));
+    let json = bare.to_json().unwrap();
+    assert!(!json.contains("title"), "空 title 不应出线：{json}");
+    assert!(!json.contains("surface"), "缺省 pixels 不应出线：{json}");
+}
+
+#[test]
+fn layer_open_surface_html_is_opt_in() {
+    let html = Message::LayerOpen(
+        LayerOpen::new(1, Placement::Tab, 0, 0).with_surface(Surface::Html),
+    );
+    let json = html.to_json().unwrap();
+    assert!(json.contains(r#""surface":"html""#), "{json}");
+    assert_eq!(Message::from_json(&json).unwrap(), html);
+    // 旧线格式无 surface 字段 → pixels。
+    let old = r#"{"type":"layer.open","v":0,"id":8,"placement":"overlay","anchor_row":41,"anchor_col":0}"#;
+    match Message::from_json(old).unwrap() {
+        Message::LayerOpen(m) => assert_eq!(m.surface, Surface::Pixels),
+        other => panic!("{:?}", other.message_type()),
+    }
+}
+
+#[test]
+fn host_frame_ignores_unknown_type() {
+    let unknown = br#"{"v":0,"type":"agent.foo","id":1}"#;
+    assert_eq!(Message::decode_host_frame(unknown).unwrap(), None);
+    assert!(matches!(
+        Message::decode_host(unknown),
+        Err(DecodeError::UnknownType(_))
+    ));
+    // 已知 type 字段坏值仍是硬错误。
+    let bad = br#"{"v":0,"type":"hit"}"#;
+    assert!(matches!(
+        Message::decode_host_frame(bad),
+        Err(DecodeError::InvalidJson(_))
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -314,5 +360,8 @@ fn frame_rejects_oversized_and_empty() {
     dec.extend(&full[..4]).unwrap();
     assert!(dec.pop().is_none());
     dec.extend(&full[4..]).unwrap();
-    assert_eq!(dec.pop().unwrap().unwrap(), m.to_json().unwrap().into_bytes());
+    assert_eq!(
+        dec.pop().unwrap().unwrap(),
+        m.to_json().unwrap().into_bytes()
+    );
 }

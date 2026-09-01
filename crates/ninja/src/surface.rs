@@ -62,6 +62,10 @@ pub struct Ivars {
     pub cell_px: Cell<Option<(u32, u32)>>,
     /// 上次 push_size 推过的视图尺寸（points；变化 = resize → q3 收层）。
     pub last_pushed_pt: Cell<Option<(f64, f64)>>,
+    /// OSC 标题：Ghostty 75ms 合并，避免回车中间态把顶栏刷成 `~`。
+    pub pending_title: RefCell<Option<String>>,
+    /// ⌘F 搜索栏（叠在 Metal 面上）。
+    pub search_bar: RefCell<Option<Retained<crate::search::SearchBarView>>>,
 }
 
 define_class!(
@@ -96,6 +100,11 @@ define_class!(
 
         #[unsafe(method(drawFocusRingMask))]
         fn draw_focus_ring_mask(&self) {}
+
+        #[unsafe(method(isOpaque))]
+        fn is_opaque(&self) -> bool {
+            true
+        }
 
         #[unsafe(method(becomeFirstResponder))]
         fn become_first_responder(&self) -> bool {
@@ -590,6 +599,8 @@ impl SurfaceHostView {
             initial_pt: Cell::new(None),
             cell_px: Cell::new(None),
             last_pushed_pt: Cell::new(None),
+            pending_title: RefCell::new(None),
+            search_bar: RefCell::new(None),
         });
         // Ghostty AppKit SurfaceView 默认 800×600；window-width/height
         // 都 >0 时 INITIAL_SIZE 再校准。
@@ -600,6 +611,7 @@ impl SurfaceHostView {
         // SAFETY: super 的 initWithFrame:；ivars 已就位。
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.setFocusRingType(NSFocusRingType::None);
+        view.setClipsToBounds(true);
         view
     }
 

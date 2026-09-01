@@ -48,6 +48,8 @@ struct Host {
     free_scheduled: bool,
     /// ghostty config 的 background 色（容器/分隔条/窗口 chrome 同源）。
     bg: (u8, u8, u8),
+    /// OSC 标题 75ms 合并（Ghostty SurfaceView.setTitle 同款）。
+    title_scheduled: bool,
 }
 
 static HOST: AtomicPtr<Host> = AtomicPtr::new(std::ptr::null_mut());
@@ -93,6 +95,7 @@ pub fn init(app: ghostty_app_t, config: ghostty_config_t, load_info: crate::conf
         pending_free: Vec::new(),
         free_scheduled: false,
         bg: (0x16, 0x16, 0x1e),
+        title_scheduled: false,
     });
     refresh_derived(&mut host);
     HOST.store(Box::into_raw(host), Ordering::Release);
@@ -263,6 +266,7 @@ pub fn watch_tick() {
     if h.watch.changed(&files) {
         schedule_reload("file-watch");
     }
+    crate::plugins::watch_plugin_binaries();
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +279,7 @@ pub fn attach_surface(
     view: &SurfaceHostView,
     context: ghostty_surface_context_e,
     parent: Option<&SurfaceHostView>,
+    working_directory: Option<String>,
 ) -> ghostty_surface_t {
     let host = host_opt().expect("host init");
     let mtm = MainThreadMarker::new().expect("main thread");
@@ -302,6 +307,17 @@ pub fn attach_surface(
         scfg.initial_input = std::ptr::null();
         scfg.wait_after_command = false;
         scfg.context = context;
+        // macOS .app 进程 cwd 是 `/`。未指定工作目录且配置也没给时，落到 $HOME。
+        let wd = working_directory.and_then(|s| CString::new(s).ok()).or_else(|| {
+            if scfg.working_directory.is_null() {
+                std::env::var("HOME").ok().and_then(|h| CString::new(h).ok())
+            } else {
+                None
+            }
+        });
+        if let Some(ref c) = wd {
+            scfg.working_directory = c.as_ptr();
+        }
         let surface = ghostty_surface_new(host.app, &scfg);
         assert!(!surface.is_null(), "ghostty_surface_new failed");
         view.ivars().surface.set(surface);
@@ -396,6 +412,28 @@ pub fn free_tick() {
 /// surface_new 期间就会同步触发 CELL_SIZE/SIZE_LIMIT/INITIAL_SIZE 等
 /// action（那时还没进 live 表）。retain 保证调用期间视图存活；已拆面
 /// 的 ivars.surface 为 null，各分发分支自然 no-op。
+/// 活面的廉价身份（pane / 前台 pid / 缓存 pwd）。pane.snapshot 只在
+/// 这份签名变化时才做窗口遍历和广播——对照 Orca：不按秒扫，身份变了才记。
+pub fn visit_live_panes(mut f: impl FnMut(u32, u64, Option<&str>)) {
+    let Some(h) = host_opt() else {
+        return;
+    };
+    for (surface, view) in &h.live {
+        let pwd = view.ivars().pwd.borrow();
+        let pid = unsafe { ghostty_surface_foreground_pid(*surface) };
+        f(view.pane_id(), pid, pwd.as_deref());
+    }
+}
+
+pub fn view_by_pane_id(id: u32) -> Option<Retained<SurfaceHostView>> {
+    host_opt().and_then(|h| {
+        h.live
+            .iter()
+            .find(|(_, v)| v.pane_id() == id)
+            .map(|(_, v)| v.clone())
+    })
+}
+
 pub fn view_of_surface(surface: ghostty_surface_t) -> Option<Retained<SurfaceHostView>> {
     // SAFETY: userdata 是建面时挂的本进程指针；retain 防已拆面在调用
     // 期间释放（pending_free 持有的 Retained 也参与保活）。
@@ -625,9 +663,7 @@ unsafe fn dispatch_action(
                 let title = CStr::from_ptr(action.action.set_title.title)
                     .to_string_lossy()
                     .to_string();
-                if let Some(w) = window_of(&view) {
-                    w.setTitle(&NSString::from_str(&title));
-                }
+                queue_title(&view, title);
                 true
             }
             GHOSTTY_ACTION_SET_TAB_TITLE => {
@@ -635,8 +671,42 @@ unsafe fn dispatch_action(
                 let title = CStr::from_ptr(action.action.set_tab_title.title)
                     .to_string_lossy()
                     .to_string();
-                if let Some(w) = window_of(&view) {
-                    w.setTitle(&NSString::from_str(&title));
+                queue_title(&view, title);
+                true
+            }
+            GHOSTTY_ACTION_PROMPT_TITLE => {
+                shell::prompt_tab_title(&view);
+                true
+            }
+            GHOSTTY_ACTION_START_SEARCH => {
+                let needle = {
+                    let p = action.action.start_search.needle;
+                    if p.is_null() {
+                        None
+                    } else {
+                        Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+                    }
+                };
+                if let Some(v) = &view {
+                    crate::search::show(v, needle.as_deref());
+                }
+                true
+            }
+            GHOSTTY_ACTION_END_SEARCH => {
+                if let Some(v) = &view {
+                    crate::search::hide_from_action(v);
+                }
+                true
+            }
+            GHOSTTY_ACTION_SEARCH_TOTAL => {
+                if let Some(v) = &view {
+                    crate::search::set_total(v, action.action.search_total.total as i64);
+                }
+                true
+            }
+            GHOSTTY_ACTION_SEARCH_SELECTED => {
+                if let Some(v) = &view {
+                    crate::search::set_selected(v, action.action.search_selected.selected as i64);
                 }
                 true
             }
@@ -753,6 +823,72 @@ unsafe fn dispatch_action(
 
 fn window_of(view: &Option<Retained<SurfaceHostView>>) -> Option<Retained<objc2_app_kit::NSWindow>> {
     view.as_ref().and_then(|v| v.window())
+}
+
+/// Ghostty `SurfaceView.setTitle`：75ms 合并连续 OSC 标题。回车会先发
+/// `~` 再发 `user@host: cwd`，立刻 setTitle 就会把顶栏刷成 `~`。
+fn queue_title(view: &Option<Retained<SurfaceHostView>>, title: String) {
+    let Some(v) = view else {
+        return;
+    };
+    *v.ivars().pending_title.borrow_mut() = Some(title);
+    let Some(h) = host_opt() else {
+        return;
+    };
+    if h.title_scheduled {
+        return;
+    }
+    h.title_scheduled = true;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let Some(delegate) = app.delegate() else {
+        return;
+    };
+    let target: Retained<objc2::runtime::AnyObject> = unsafe { objc2::msg_send![&*delegate, self] };
+    let timer = unsafe {
+        objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+            0.075,
+            &target,
+            objc2::sel!(ninjaTitleTick:),
+            None,
+            false,
+        )
+    };
+    std::mem::forget(timer);
+}
+
+/// ninjaTitleTick: 落地合并后的窗口标题。
+pub fn title_tick() {
+    let Some(h) = host_opt() else {
+        return;
+    };
+    h.title_scheduled = false;
+    let pending: Vec<(Retained<SurfaceHostView>, String)> = h
+        .live
+        .iter()
+        .filter_map(|(_, v)| {
+            v.ivars()
+                .pending_title
+                .borrow_mut()
+                .take()
+                .map(|t| (v.clone(), t))
+        })
+        .collect();
+    for (v, title) in pending {
+        let Some(w) = v.window() else {
+            continue;
+        };
+        if let Some(c) = pane::container_of(&w) {
+            c.set_last_osc_title(title);
+            continue;
+        }
+        if w.title().to_string() != title {
+            w.setTitle(&NSString::from_str(&title));
+            shell::suppress_titlebar_sampling(&w);
+        }
+    }
 }
 
 unsafe extern "C" fn read_clipboard_cb(

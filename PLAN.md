@@ -31,7 +31,7 @@
 | 插件形态 | 子进程 | 宿主内动态库、Lua VM、常驻 Node、宿主内置面板 |
 | 插件传输 | Unix domain socket | 共享地址空间 API、gRPC、HTTP |
 | 插件编码 | 长度前缀 JSON，消息带 `v` | Protobuf / Cap'n Proto 作为 v0 |
-| 层的像素 | 宿主建 IOSurface，插件写入，合成在 Ghostty Metal 层之上 | 插件自己弹窗口、宿主代渲染文件内容 |
+| 层 | `placement`（overlay/side/tab）× `surface`（pixels = IOSurface / html = WKWebView） | 插件自己弹窗口；内核出现插件名词；为单个插件加 WK API |
 | 标签 / 分屏 | 空载宿主 | 插件、tmux 顶替宿主布局 |
 | 预览插件 | 文本和代码 pager | 图片、PDF、目录、系统打开器 |
 | 分发 | 签名的 macOS .app | 只提供 `cargo run` |
@@ -40,7 +40,7 @@
 
 官方示例插件（文本预览、theme.set）同仓库、独立 binary，只通过 JSON 协议说话。第二个实现可以不用 Rust。
 
-ADE 协议 v0 六类：`hit` / `layer` / `input` / `spawn` / `config` / `theme`。新原语必须已有第二个独立插件需要，才能进协议。线格式：Unix socket 上 `u32le 长度 + UTF-8 JSON`。宿主忽略未知字段；插件碰到不支持的 `v` 必须退出。
+ADE 协议 v0 六类：`hit` / `layer` / `input` / `spawn` / `config` / `theme`。新原语必须已有第二个独立插件需要，才能进协议。线格式：Unix socket 上 `u32le 长度 + UTF-8 JSON`。宿主忽略未知字段，对插件→宿主的未知 `type` 忽略不断连；插件碰到不支持的 `v` 必须退出。层是 `placement` × `surface`，宿主不出现插件名词。
 
 嵌入 API 官方声明 pre-1.0，破坏性变更是预期。钉 commit，升级显式做。
 
@@ -78,6 +78,7 @@ ninja/
 - q2 配置 ✅ 2026-08-31（取证 docs/q2-evidence/：虚拟屏 E2E 38 断言全绿 + 纯逻辑单测 11；ODP 缺省像素/Dracula 真实生效且让位/⌘G·⌘⇧P 重绑/#ff00ff 热重载像素传播/ninja.toml 收缩/q0 回归 PASS）
 - q3 插件系统 + 三门禁 ✅ 2026-08-31（取证 docs/q3-evidence/：虚拟屏 E2E 47 断言全绿两轮 + q0/q1/q2 回归 PASS；三门禁=空载 0.55× Ghostty、⌘click 路径→层内看文本→Esc 回焦点、关掉即轻三场景）
 - q4 分发 ✅ 2026-08-31（brew tap + cask/DMG：本地 file:// tap `brew install --cask ninja` 装 .app；Apple Development 真签、无公证 Gatekeeper 行为已实测记录；卸载无残留。证据 docs/q4-evidence/）
+- 层原语补完 2026-09-01：`placement` × `surface`；tab 可 pixels；`input.mouse`/`scroll`/`focus`；html 表面 `layer.msg`；宿主对未知 type 忽略不断连。preview 显式 `surface=html`。未跑虚拟屏 E2E。
 
 ### q0 嵌入底座
 
