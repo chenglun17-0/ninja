@@ -26,7 +26,9 @@ pub fn host_config_path() -> PathBuf {
     if let Some(p) = std::env::var_os("NINJA_CONFIG") {
         return PathBuf::from(p);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join(".config/ninja/ninja.toml")
 }
 
@@ -61,9 +63,7 @@ pub fn parse_host_config(text: &str) -> HostConfig {
                 "ninja: ninja.toml `{k}` 已收缩——终端配置（shell/字体/主题色）\
                  走 ghostty 配置文件，忽略"
             ),
-            other => eprintln!(
-                "ninja: ninja.toml 未知键 `{other}`（q2 只收 [plugins]），忽略"
-            ),
+            other => eprintln!("ninja: ninja.toml 未知键 `{other}`（q2 只收 [plugins]），忽略"),
         }
     }
     cfg
@@ -153,7 +153,10 @@ pub fn write_plugins_enabled(enabled: &[String]) -> std::io::Result<PathBuf> {
         *plugins = toml::Value::Table(toml::map::Map::new());
     }
     plugins["enabled"] = toml::Value::Array(
-        enabled.iter().map(|s| toml::Value::String(s.clone())).collect(),
+        enabled
+            .iter()
+            .map(|s| toml::Value::String(s.clone()))
+            .collect(),
     );
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;

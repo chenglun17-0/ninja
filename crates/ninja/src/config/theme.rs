@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 
-
 // ---------------------------------------------------------------------------
 // ODP 钉值（One Dark Pro 官方主题源，注明来源键）
 // ---------------------------------------------------------------------------
@@ -48,7 +47,10 @@ pub fn odp_layer_text() -> String {
     s.push_str(&format!("background = {}\n", hex(ODP_BACKGROUND)));
     s.push_str(&format!("foreground = {}\n", hex(ODP_FOREGROUND)));
     s.push_str(&format!("cursor-color = {}\n", hex(ODP_CURSOR)));
-    s.push_str(&format!("selection-background = {}\n", hex(ODP_SELECTION_BG)));
+    s.push_str(&format!(
+        "selection-background = {}\n",
+        hex(ODP_SELECTION_BG)
+    ));
     for (i, c) in ODP_ANSI.iter().enumerate() {
         s.push_str(&format!("palette = {}={}\n", i, hex(*c)));
     }
