@@ -42,6 +42,17 @@ EOF → exit 0                        # host closed: normal shutdown, no cleanup
 
 The host kills nothing on the happy path. Socket EOF is your shutdown signal.
 
+Hit payloads carry two details the message table implies but plugins trip on:
+
+- `text` may carry `:line` / `:line:col` suffixes (`src/main.rs:42:13`) — strip
+  them before treating the rest as a path.
+- a relative path resolves against `cwd`, which can arrive as a `file://` URL —
+  strip the scheme before joining.
+
+Both sides send `layer.open` with `id` = the hit id right after `hit.claim`
+(back to back); the host digests it during the claim window and echoes the id
+in `layer.ready`, which is how you pair the surface with the file you opened.
+
 ## 4. Install and toggle
 
 ```sh
