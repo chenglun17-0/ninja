@@ -62,7 +62,11 @@ objc2-app-kit = { version = "0.3", features = [
     "NSTextInputClient",
     "NSTrackingArea",
     # q3 插件面板：开关与状态行。
+    "NSBox",
     "NSButton",
+    "NSClipView",
+    "NSFont",
+    "NSScrollView",
     "NSControl",
     "NSTextField",
     "NSAlert",

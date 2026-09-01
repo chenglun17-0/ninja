@@ -87,7 +87,7 @@ mod binary;
 mod classify;
 mod layer;
 
-pub use binary::{discover_plugin_names, footprint_bytes, resolve_plugin_binary, sweep_stale_sockets};
+pub use binary::{discover_plugin_names, footprint_bytes, resolve_plugin_binary, sweep_stale_sockets, user_plugin_dir};
 pub use classify::{
     classify_token, classify_url, code_to_key_name, key_name_to_code, line_token_at,
     modifiers_from_mods, normalize_cwd, normalize_open_payload, theme_conf_text,
