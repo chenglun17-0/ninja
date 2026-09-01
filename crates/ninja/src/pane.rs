@@ -891,7 +891,13 @@ fn collect_leaves(node: Option<&Node>, out: &mut Vec<Retained<SurfaceHostView>>)
 fn dump_node(node: Option<&Node>) -> LayoutNode {
     match node {
         Some(Node::Leaf { view, .. }) => LayoutNode::Leaf {
-            pwd: view.ivars().pwd.borrow().clone(),
+            // OSC-7 优先；没有 shell 集成（如 command= 直启非交互程序）时
+            // 兜底读前台进程真实 cwd——与 pane 快照（cwd_for_view）同口径，
+            // 否则恢复后 cwd 丢失，agent-restore 的槽位匹配永远等不到。
+            pwd: view.ivars().pwd.borrow().clone().or_else(|| {
+                let fallback = crate::plugins::cwd_for_view(view);
+                (!fallback.is_empty()).then_some(fallback)
+            }),
         },
         Some(Node::Split {
             dir,
