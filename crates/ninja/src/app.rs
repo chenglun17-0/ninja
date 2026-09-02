@@ -280,6 +280,23 @@ define_class!(
         fn windowDidResignKey(&self, _notification: &NSNotification) {
             host::with_app(|app| unsafe { ghostty_sys::ghostty_app_set_focus(app, false) });
         }
+
+        // 窗口换屏（拖到另一块屏 / 全屏 Space 搬屏）：每个叶 surface 重推
+        // display id + backing scale（内屏 2x ↔ 外屏 1x 时 frame points
+        // 不变，只有这里和 viewDidChangeBackingProperties 能知道）。
+        #[unsafe(method(windowDidChangeScreen:))]
+        fn windowDidChangeScreen(&self, notification: &NSNotification) {
+            // SAFETY: object() 返回通知对象（此处恒为 NSWindow）。
+            let window: Option<&NSWindow> = unsafe { msg_send![notification, object] };
+            let Some(w) = window else { return };
+            if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
+                eprintln!("ninja: windowDidChangeScreen scale={}", w.backingScaleFactor());
+            }
+            let Some(container) = crate::pane::container_of(w) else { return };
+            for leaf in container.leaves() {
+                leaf.screen_changed();
+            }
+        }
     }
 
     impl AppDelegate {

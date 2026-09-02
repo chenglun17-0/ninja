@@ -74,7 +74,8 @@ objc2-app-kit = { version = "0.3", features = [
     "NSAlert",
     "NSColor",
 ] }
-objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer"] }
+# CATransaction：跨屏换 backing scale 时改 layer.contentsScale 要关隐式动画。
+objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer", "CATransaction"] }
 # q3 层原语：全局 IOSurface（跨进程共享像素）。
 objc2-io-surface = "0.3"
 # html 表面：插件 HTML → 宿主 WKWebView（不透明邮箱走 script handler）。

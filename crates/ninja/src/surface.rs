@@ -3,9 +3,11 @@
 //!
 //! 职责（q1 验收面）：
 //! - **resize 全链**：`setFrameSize` → `surface_set_size(px)` +
-//!   `set_content_scale(backingScale)`（分屏 relayout / 窗口缩放共用）；
-//!   `viewDidMoveToWindow` 补挂窗后的首推。SIZE_LIMIT/INITIAL_SIZE action
-//!   存进本视图，由 [`crate::host`] 换算成窗口 min/max/初始尺寸。
+//!   `set_content_scale(backingScale)` + 同步 `layer.contentsScale`（分屏
+//!   relayout / 窗口缩放共用）；`viewDidMoveToWindow` 补挂窗后的首推；
+//!   `viewDidChangeBackingProperties` / 窗口换屏补跨屏 scale 变化。
+//!   SIZE_LIMIT/INITIAL_SIZE action 存进本视图，由 [`crate::host`] 换算成
+//!   窗口 min/max/初始尺寸。
 //! - **焦点链**：become/resign first responder → `surface_set_focus`；
 //!   放大态隐藏 → `surface_set_occlusion(false)`（渲染线程停画，数据照喂）。
 //! - **键盘**：`keyDown/keyUp/flagsChanged` → NSEvent →
@@ -31,6 +33,7 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSRect, NSSize, NSString,
 };
+use objc2_quartz_core::CATransaction;
 
 use ghostty_sys::*;
 
@@ -138,6 +141,23 @@ define_class!(
         fn set_frame_size(&self, size: NSSize) {
             // SAFETY: 标准 super 调用。
             let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+            self.push_size();
+        }
+
+        /// 跨屏（Retina ↔ 非 Retina / 不同缩放）：frame points 不变但
+        /// backing scale 变了，setFrameSize 不会来——必须在这里重推，
+        /// 否则 ghostty 的 layer.contentsScale 还是旧值，渲染尺寸按旧
+        /// scale 算、合成器再缩一次 → 画面错位/只画一块。
+        #[unsafe(method(viewDidChangeBackingProperties))]
+        fn view_did_change_backing_properties(&self) {
+            // SAFETY: 标准 super 调用。
+            let _: () = unsafe { msg_send![super(self), viewDidChangeBackingProperties] };
+            self.push_size();
+        }
+
+        /// windowDidChangeScreen 延后一拍的补推（见 [`Self::screen_changed`]）。
+        #[unsafe(method(ninjaScreenChangedTick:))]
+        fn ninja_screen_changed_tick(&self, _timer: Option<&AnyObject>) {
             self.push_size();
         }
 
@@ -687,6 +707,19 @@ impl SurfaceHostView {
             crate::plugins::host_close_layers_of_pane(self.pane_id());
         }
         self.ivars().last_pushed_pt.set(Some(now));
+        // libghostty 只在建 surface 时设一次 layer.contentsScale，之后由
+        // 宿主同步（Swift 壳 viewDidChangeBackingProperties 同款）。它的
+        // 渲染目标尺寸 = layer.bounds × contentsScale，不同步就与下面推的
+        // px 对不上（帧被丢 / 合成器二次缩放）。关隐式动画避免缩放闪一下。
+        if let Some(layer) = self.layer()
+            && (layer.contentsScale() - scale).abs() > f64::EPSILON
+        {
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            layer.setContentsScale(scale);
+            CATransaction::commit();
+        }
+        // SAFETY: `s` 是本 view 持有的活 surface；主线程串行更新其尺寸。
         unsafe {
             ghostty_surface_set_content_scale(s, scale, scale);
             ghostty_surface_set_size(
@@ -697,6 +730,35 @@ impl SurfaceHostView {
             // 主线程同步补一帧（resize 期间渲染线程外的文档化路径）。
             ghostty_surface_draw(s);
         }
+    }
+
+    /// 窗口换屏（NSWindowDidChangeScreen）：display id 给 ghostty（vsync
+    /// 跟新屏刷新率）+ 重推 scale/尺寸。通知到达时 backingScaleFactor
+    /// 可能还没更新（ghostty #2731），所以除了立即推，再延后一拍补推。
+    pub fn screen_changed(&self) {
+        if let Some(s) = self.surface_opt() {
+            let display_id = self
+                .window()
+                .and_then(|w| w.screen())
+                .map(|sc| sc.CGDirectDisplayID())
+                .unwrap_or(0);
+            // SAFETY: `s` 是本 view 持有的活 surface；display id 来自当前 NSScreen。
+            unsafe { ghostty_surface_set_display_id(s, display_id) };
+        }
+        self.push_size();
+        // SAFETY: ObjC 的 -self 按约定返回 retain 过的自身引用。
+        let target: Retained<AnyObject> = unsafe { msg_send![self, self] };
+        // SAFETY: scheduledTimer 平凡；一次性，触发即失效。
+        let timer = unsafe {
+            objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                0.0,
+                &target,
+                objc2::sel!(ninjaScreenChangedTick:),
+                None,
+                false,
+            )
+        };
+        std::mem::forget(timer);
     }
 
     /// 隐藏/显示（放大态切换）：隐藏面停 occlusion，数据照喂不丢
