@@ -1,4 +1,4 @@
-//! q2 配置系统：ghostty 配置装载管线 + ODP 缺省层 + ninja.toml 收缩 +
+//! q2 配置系统：ghostty 配置装载管线 + ninja.toml 收缩 +
 //! 键位全量继承（trigger→菜单换算）+ 热重载（文件监视）+ 取证 dump。
 //!
 //! ## 装载管线（键位/主题/字体全部走 ghostty 配置）
@@ -12,17 +12,13 @@
 //!    的 Action 联合是封闭的（Binding.zig 对未知动作名抛 InvalidAction，
 //!    vendored 测试 "parse: action invalid"），自定义动作名进不了
 //!    keybind 配置，认领空闲动作是唯一让宿主动作进 ghostty 键位系统的路；
-//! 3. `load_file` ODP 层（[`ODP_LAYER_FILE`]，仅当用户没设 `theme=`）：
-//!    One Dark Pro 钉值（bg/fg/cursor/selection/ANSI16）以显式 ghostty
-//!    色键装载在默认文件**之前**——用户显式色键后载覆盖；
-//! 4. `load_default_files`（XDG + macOS App Support，bundle_id 钉
+//! 3. `load_default_files`（XDG + macOS App Support，bundle_id 钉
 //!    com.mitchellh.ghostty → 读用户既有 ~/Library/Application
-//!    Support/com.mitchellh.ghostty/config）；
-//! 5. `load_recursive_files`（`config-file=` 包含链）；
-//! 6. `finalize`（具名 `theme=` 在此装载并压顶：Config.zig loadTheme
-//!    先读主题文件、再按 _replay_steps 重放已有配置——**因此 ODP 层绝不能
-//!    在用户设了 theme= 时装载**，否则 ODP 色键会反压用户主题；宿主侧
-//!    事先扫描用户文件判定，见 [`user_sets_theme`]）；
+//!    Support/com.mitchellh.ghostty/config）。空配置 = libghostty 默认
+//!    色板（与原版 Ghostty 相同，不垫 One Dark Pro）；
+//! 4. `load_recursive_files`（`config-file=` 包含链）；
+//! 5. 可选插件主题层（`theme.set`，压用户文件之后、finalize 之前）；
+//! 6. `finalize`（具名 `theme=` 在此装载并压顶）；
 //! 7. 诊断打印（diagnostics_count/get_diagnostic → stderr）。
 //!
 //! C API 只能从文件装载（无 config_set，q0 审计 #5 实测），程序化注入走
@@ -63,7 +59,6 @@ pub use theme::*;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-
 pub const PLUGIN_THEME_LAYER_FILE: &str = "plugin-theme.conf";
 
 /// vendored 构建烘进来的 ghostty 资源目录（含 themes/；无则空串）。
@@ -71,8 +66,6 @@ pub const BAKED_RESOURCES_DIR: &str = env!("NINJA_GHOSTTY_RESOURCES_DIR");
 
 /// 宿主层文件名（恒装载：ninja 特有动作的键位认领）。
 pub const HOST_LAYER_FILE: &str = "host.conf";
-/// ODP 层文件名（用户没设 theme= 时装载）。
-pub const ODP_LAYER_FILE: &str = "odp.conf";
 
 /// 菜单镜像的 ghostty 动作名（keyEquivalent 全部由
 /// `ghostty_config_trigger(action)` 推导；键位单一来源 = ghostty keybind）。
@@ -136,25 +129,9 @@ impl WatchState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::ghostty::line_config_file;
+    use super::*;
     use ghostty_sys::*;
-
-    #[test]
-    fn odp_layer_text_is_explicit_ghostty_config() {
-        let text = odp_layer_text();
-        // 色键齐全且值 = ODP 钉值。
-        assert!(text.contains("background = #282c34"));
-        assert!(text.contains("foreground = #abb2bf"));
-        assert!(text.contains("cursor-color = #528bff"));
-        assert!(text.contains("selection-background = #41454e"));
-        assert!(text.contains("palette = 0=#3f4451"));
-        assert!(text.contains("palette = 15=#e6e6e6"));
-        // 全部 16 条都在。
-        for i in 0..16 {
-            assert!(text.contains(&format!("palette = {i}=")), "missing palette {i}");
-        }
-    }
 
     #[test]
     fn host_layer_claims_toggle_visibility_on_bare_comma() {
@@ -166,9 +143,18 @@ mod tests {
 
     #[test]
     fn config_file_line_parsing() {
-        assert_eq!(line_config_file("config-file = /abs/x.conf"), Some("/abs/x.conf".into()));
-        assert_eq!(line_config_file("config-file=\"a b.conf\""), Some("a b.conf".into()));
-        assert_eq!(line_config_file("config-file = rel.conf # 尾注释"), Some("rel.conf".into()));
+        assert_eq!(
+            line_config_file("config-file = /abs/x.conf"),
+            Some("/abs/x.conf".into())
+        );
+        assert_eq!(
+            line_config_file("config-file=\"a b.conf\""),
+            Some("a b.conf".into())
+        );
+        assert_eq!(
+            line_config_file("config-file = rel.conf # 尾注释"),
+            Some("rel.conf".into())
+        );
         assert_eq!(line_config_file("config-file ="), None);
         assert_eq!(line_config_file("font-size = 18"), None);
     }
@@ -178,9 +164,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ninja-cfg-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("main.conf"), "theme=Dracula\nconfig-file = inc.conf\n").unwrap();
+        std::fs::write(
+            dir.join("main.conf"),
+            "theme=Dracula\nconfig-file = inc.conf\n",
+        )
+        .unwrap();
         // 环：inc 反指 main（visited 防环不死循环）。
-        std::fs::write(dir.join("inc.conf"), "config-file = main.conf\nbackground = #010203\n").unwrap();
+        std::fs::write(
+            dir.join("inc.conf"),
+            "config-file = main.conf\nbackground = #010203\n",
+        )
+        .unwrap();
         let files = collect_ghostty_files(&[dir.join("main.conf")]);
         assert_eq!(files.len(), 2, "chain followed, cycle cut: {files:?}");
         assert!(user_sets_theme(&files));
@@ -189,7 +183,7 @@ mod tests {
 
     #[test]
     fn odp_yields_when_user_sets_theme_anywhere_in_chain() {
-        // ODP 让位扫描：默认文件或 config-file 链上任一处 theme= 都让位。
+        // theme= 扫描：默认文件或 config-file 链上任一处 theme= 都算用户设了主题。
         let dir = std::env::temp_dir().join(format!("ninja-yield-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -224,7 +218,10 @@ preview = "/usr/local/bin/ninja-preview"
         );
         assert_eq!(
             cfg.plugins.paths,
-            vec![("preview".to_string(), "/usr/local/bin/ninja-preview".to_string())]
+            vec![(
+                "preview".to_string(),
+                "/usr/local/bin/ninja-preview".to_string()
+            )]
         );
     }
 
@@ -236,7 +233,10 @@ preview = "/usr/local/bin/ninja-preview"
             Vec::<String>::new()
         );
         // 破损 TOML：全忽略（不炸）。
-        assert_eq!(parse_host_config("this is [ not toml"), HostConfig::default());
+        assert_eq!(
+            parse_host_config("this is [ not toml"),
+            HostConfig::default()
+        );
     }
 
     #[test]

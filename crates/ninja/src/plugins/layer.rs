@@ -15,13 +15,11 @@ use std::cell::{Cell, RefCell};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class};
-use objc2_core_foundation::{
-    CFBoolean, CFData, CFDictionary, CFNumber, CFNumberType, CFRetained,
-};
+use objc2_app_kit::{NSEvent, NSView, NSWindow};
+use objc2_core_foundation::{CFBoolean, CFData, CFDictionary, CFNumber, CFNumberType, CFRetained};
 use objc2_core_graphics::{
     CGColorRenderingIntent, CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
 };
-use objc2_app_kit::{NSEvent, NSView, NSWindow};
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
 use objc2_io_surface::IOSurfaceRef;
 use objc2_web_kit::{
@@ -354,9 +352,7 @@ impl LayerWebView {
             handler: RefCell::new(Some(handler)),
         });
         // SAFETY: WKWebView 指定初始化器；ivars 已就位。
-        unsafe {
-            objc2::msg_send![super(this), initWithFrame: frame, configuration: &*config]
-        }
+        unsafe { objc2::msg_send![super(this), initWithFrame: frame, configuration: &*config] }
     }
 
     fn bind(&self, handle: u64, conn: u64) {
@@ -400,7 +396,12 @@ fn surface_to_image(surface: &CFRetained<IOSurfaceRef>) -> Option<CFRetained<CGI
     }
     let bpr = surface.bytes_per_row();
     // SAFETY: read/write 锁成对；base_address 在锁内有效。
-    let kr = unsafe { surface.lock(objc2_io_surface::IOSurfaceLockOptions::empty(), std::ptr::null_mut()) };
+    let kr = unsafe {
+        surface.lock(
+            objc2_io_surface::IOSurfaceLockOptions::empty(),
+            std::ptr::null_mut(),
+        )
+    };
     if kr != 0 {
         return None;
     }
@@ -409,7 +410,12 @@ fn surface_to_image(surface: &CFRetained<IOSurfaceRef>) -> Option<CFRetained<CGI
         std::slice::from_raw_parts(surface.base_address().as_ptr() as *const u8, bpr * h).to_vec()
     };
     // SAFETY: 与 lock 成对。
-    let _ = unsafe { surface.unlock(objc2_io_surface::IOSurfaceLockOptions::empty(), std::ptr::null_mut()) };
+    let _ = unsafe {
+        surface.unlock(
+            objc2_io_surface::IOSurfaceLockOptions::empty(),
+            std::ptr::null_mut(),
+        )
+    };
 
     let data = CFData::from_bytes(&bytes);
     let provider = CGDataProvider::with_cf_data(Some(&data))?;
@@ -438,7 +444,13 @@ fn surface_to_image(surface: &CFRetained<IOSurfaceRef>) -> Option<CFRetained<CGI
 /// i64 → CFNumber（kIOSurface* 属性字典值用）。
 fn cf_i64(v: i64) -> Option<CFRetained<CFNumber>> {
     // SAFETY: 值指针指向合法 i64；SInt64Type 与之匹配。
-    unsafe { CFNumber::new(None::<&objc2_core_foundation::CFAllocator>, CFNumberType::SInt64Type, (&raw const v).cast()) }
+    unsafe {
+        CFNumber::new(
+            None::<&objc2_core_foundation::CFAllocator>,
+            CFNumberType::SInt64Type,
+            (&raw const v).cast(),
+        )
+    }
 }
 
 /// 开层：几何（overlay_rect）→ 全局 IOSurface（BGRA8，跨进程共享）→
@@ -666,7 +678,8 @@ fn layer_open_tab_pixels(geom: &LayerGeom, m: &LayerOpen, conn: u64) -> Option<L
     view.setWantsLayer(true);
     view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), cs));
     view.ivars().is_tab.set(true);
-    let window = crate::shell::new_chrome_tab(mtm, tab_title(m), view.as_super(), parent.as_deref());
+    let window =
+        crate::shell::new_chrome_tab(mtm, tab_title(m), view.as_super(), parent.as_deref());
     let scale = window.backingScaleFactor().max(1.0);
     let b = view.bounds();
     let w_pt = b.size.width.max(64.0);
@@ -707,7 +720,10 @@ fn layer_open_tab_pixels(geom: &LayerGeom, m: &LayerOpen, conn: u64) -> Option<L
 fn tab_key_down(view: &LayerView, event: &NSEvent) {
     let mods = keymap::mods_from_flags(event.modifierFlags().0 as u64);
     let proto = modifiers_from_mods(mods);
-    let chars = event.characters().map(|c| c.to_string()).unwrap_or_default();
+    let chars = event
+        .characters()
+        .map(|c| c.to_string())
+        .unwrap_or_default();
     let fallback = chars.chars().next();
     let key = code_to_key_name(event.keyCode(), fallback);
     if (key == "esc" && !proto.contains(&Modifier::Cmd))
@@ -735,7 +751,10 @@ fn send_tab_key(view: &LayerView, key: String, text: String, mods: Vec<Modifier>
     if handle == 0 {
         return;
     }
-    send_to_plugin(conn, &Message::InputKey(InputKey::new(handle, key, text, mods)));
+    send_to_plugin(
+        conn,
+        &Message::InputKey(InputKey::new(handle, key, text, mods)),
+    );
 }
 
 fn send_layer_focus(handle: u64, conn: u64, focused: bool) {
@@ -892,8 +911,10 @@ fn parse_script_msg_body(obj: &AnyObject) -> (String, String) {
     }
     let key_name = NSString::from_str("name");
     let key_body = NSString::from_str("body");
-    let name: Option<Retained<NSObject>> = unsafe { objc2::msg_send![obj, objectForKey: &*key_name] };
-    let body: Option<Retained<NSObject>> = unsafe { objc2::msg_send![obj, objectForKey: &*key_body] };
+    let name: Option<Retained<NSObject>> =
+        unsafe { objc2::msg_send![obj, objectForKey: &*key_name] };
+    let body: Option<Retained<NSObject>> =
+        unsafe { objc2::msg_send![obj, objectForKey: &*key_body] };
     let name = name
         .and_then(|v| v.downcast_ref::<NSString>().map(|s| s.to_string()))
         .unwrap_or_default();

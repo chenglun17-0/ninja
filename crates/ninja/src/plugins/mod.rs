@@ -60,8 +60,8 @@
 //! 忽略不断连）→ 写 `{{tmp}}/ninja-{pid}/plugin-theme.conf`（bg/fg/cursor/
 //! selection/ANSI16 显式色键；装载序压用户文件之后、finalize 之前——
 //! finalize 的 loadTheme 重放会把这层压顶，见 crate::config）→ 复用 q2
-//! 热重载管线全 surface 传播。插件连接死亡/禁用 → 删层重载，回 ODP/
-//! 用户主题基线。
+//! 热重载管线全 surface 传播。插件连接死亡/禁用 → 删层重载，回 Ghostty/
+//! 用户配置基线。
 //!
 //! # spawn：协议面保留、宿主不接线（防镀金）
 //!
@@ -87,22 +87,25 @@ mod binary;
 mod classify;
 mod layer;
 
-pub use binary::{discover_plugin_names, footprint_bytes, resolve_plugin_binary, sweep_stale_sockets, user_plugin_dir};
+pub(crate) use binary::{ade_debug, effective_socket_path};
+pub use binary::{
+    discover_plugin_names, footprint_bytes, resolve_plugin_binary, sweep_stale_sockets,
+    user_plugin_dir,
+};
+#[cfg(test)]
+use binary::{resolve_plugin_binary_in, socket_path, sweep_stale_sockets_in};
 pub use classify::{
     classify_token, classify_url, code_to_key_name, key_name_to_code, line_token_at,
     modifiers_from_mods, normalize_cwd, normalize_open_payload, theme_conf_text,
 };
-pub use layer::{layer_tab_closed, LayerGeom};
-pub(crate) use binary::{ade_debug, effective_socket_path};
 pub(crate) use classify::{cwd_for_view, hotkey_to_key_event};
-pub(crate) use layer::{
-    layer_close, layer_close_all, layer_close_by_conn, layer_close_pane,
-    layer_foreground, layer_load_html, layer_open, layer_post_msg, layer_present,
-};
-#[cfg(test)]
-use binary::{resolve_plugin_binary_in, socket_path, sweep_stale_sockets_in};
 #[cfg(test)]
 use classify::{file_url_to_fs_path, overlay_rect};
+pub use layer::{LayerGeom, layer_tab_closed};
+pub(crate) use layer::{
+    layer_close, layer_close_all, layer_close_by_conn, layer_close_pane, layer_foreground,
+    layer_load_html, layer_open, layer_post_msg, layer_present,
+};
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -231,11 +234,7 @@ fn handle_pane_input(m: &PaneInput) {
         return;
     };
     unsafe {
-        ghostty_sys::ghostty_surface_text(
-            surface,
-            m.text.as_ptr().cast(),
-            m.text.len(),
-        );
+        ghostty_sys::ghostty_surface_text(surface, m.text.as_ptr().cast(), m.text.len());
     }
 }
 
@@ -243,14 +242,17 @@ fn handle_pane_input(m: &PaneInput) {
 /// 内容 = (色板名, 层文件文本)。拥有者连接死亡/禁用 →
 /// [`revoke_theme_override`]。
 pub fn plugin_theme_override() -> Option<(String, String)> {
-    THEME_OVERRIDE
-        .lock()
-        .ok()
-        .and_then(|s| s.as_ref().map(|(name, text, _)| (name.clone(), text.clone())))
+    THEME_OVERRIDE.lock().ok().and_then(|s| {
+        s.as_ref()
+            .map(|(name, text, _)| (name.clone(), text.clone()))
+    })
 }
 
 fn theme_owner() -> Option<u64> {
-    THEME_OVERRIDE.lock().ok().and_then(|s| s.as_ref().map(|(_, _, conn)| *conn))
+    THEME_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|s| s.as_ref().map(|(_, _, conn)| *conn))
 }
 
 /// 覆盖槽（主线程纪律；static 要求 Mutex）。
@@ -472,8 +474,10 @@ impl PluginHost {
                     self.path
                 );
                 self.spawn_errors.remove(name);
-                self.bin_mtime
-                    .insert(name.to_string(), std::fs::metadata(&bin).and_then(|m| m.modified()).ok());
+                self.bin_mtime.insert(
+                    name.to_string(),
+                    std::fs::metadata(&bin).and_then(|m| m.modified()).ok(),
+                );
                 self.children.push((name.to_string(), child));
             }
             Err(e) => {
@@ -622,7 +626,9 @@ impl PluginHost {
             .children
             .iter()
             .filter_map(|(name, child)| {
-                footprint_bytes(child.id()).filter(|&u| u > limit).map(|u| (name.clone(), u))
+                footprint_bytes(child.id())
+                    .filter(|&u| u > limit)
+                    .map(|u| (name.clone(), u))
             })
             .collect();
         if offenders.is_empty() {
@@ -770,11 +776,7 @@ impl PluginHost {
         self.pump_accept();
         if self.conns.is_empty() {
             // 兜底冷启动（常规路径已不依赖：宿主启动/面板开就拉过）。
-            let can_spawn = self
-                .cfg
-                .enabled
-                .iter()
-                .any(|n| !self.spawned.contains(n));
+            let can_spawn = self.cfg.enabled.iter().any(|n| !self.spawned.contains(n));
             if !can_spawn {
                 return DispatchOutcome::NoPlugins;
             }
@@ -915,7 +917,9 @@ impl PluginHost {
             ade_debug("dispatch: 全 ignore/静默");
             return DispatchOutcome::AllIgnored;
         };
-        ade_debug(&format!("dispatch: claim priority={priority} conn={claim_conn}"));
+        ade_debug(&format!(
+            "dispatch: claim priority={priority} conn={claim_conn}"
+        ));
         // 层握手：认领方在同一连接上要层。geom 为 None（无渲染上下文，
         // 如单测）时跳过——认领仍然成立，只是宿主不处理层。
         if let Some(geom) = geom
@@ -965,7 +969,11 @@ impl PluginHost {
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                 break; // 预算尽：层可能仍开着（等 present），泵兜底
             };
-            if self.conns[conn_idx].stream.set_read_timeout(Some(rem)).is_err() {
+            if self.conns[conn_idx]
+                .stream
+                .set_read_timeout(Some(rem))
+                .is_err()
+            {
                 self.drop_conn(conn_idx);
                 return;
             }
@@ -979,7 +987,7 @@ impl PluginHost {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    break // 静默超预算：不再等
+                    break; // 静默超预算：不再等
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => {
@@ -1025,7 +1033,8 @@ impl PluginHost {
                     }
                     None => {
                         eprintln!("ninja: 层分配失败（IOSurface/视图），拒层");
-                        let f = encode_frame(&Message::LayerClose(LayerClose::new(0))).expect("编码");
+                        let f =
+                            encode_frame(&Message::LayerClose(LayerClose::new(0))).expect("编码");
                         let _ = self.conns[conn_idx].stream.write_all(&f);
                         HandshakeStep::Continue
                     }
@@ -1061,7 +1070,9 @@ impl PluginHost {
             Message::InputHotkey(m) => {
                 let reply = self.hotkey_decide(m, conn_id);
                 if let Some(c) = self.conns.iter_mut().find(|c| c.id == conn_id) {
-                    let _ = c.stream.write_all(&encode_frame(&reply).expect("hotkey 回执编码"));
+                    let _ = c
+                        .stream
+                        .write_all(&encode_frame(&reply).expect("hotkey 回执编码"));
                 }
             }
             Message::LayerClose(m) => {
@@ -1125,7 +1136,11 @@ impl PluginHost {
         while i < self.conns.len() {
             let conn = &mut self.conns[i];
             let conn_id = conn.id;
-            if conn.stream.set_read_timeout(Some(Duration::from_millis(1))).is_err() {
+            if conn
+                .stream
+                .set_read_timeout(Some(Duration::from_millis(1)))
+                .is_err()
+            {
                 self.drop_conn(i);
                 continue;
             }
@@ -1270,7 +1285,6 @@ impl PluginHost {
             self.path
         );
     }
-
 }
 
 /// 握手循环的单步结果。
@@ -1346,9 +1360,7 @@ fn add_read_source(fd: std::os::unix::io::RawFd) -> Option<ConnSource> {
             &ctx,
         )
     }?;
-    sock.set_socket_flags(
-        objc2_core_foundation::kCFSocketAutomaticallyReenableReadCallBack,
-    );
+    sock.set_socket_flags(objc2_core_foundation::kCFSocketAutomaticallyReenableReadCallBack);
     let src = CFSocket::new_run_loop_source(None, Some(&sock), 0)?;
     // SAFETY: 读 extern 常量字符串静态（CF 已随进程初始化）。
     let mode = unsafe { objc2_core_foundation::kCFRunLoopCommonModes };
@@ -1432,9 +1444,10 @@ static SESSION_CFG: Mutex<Option<PluginsConfig>> = Mutex::new(None);
 /// [`spawn_startup_plugins`]）。
 pub fn init(cfg: PluginsConfig) {
     if let Some(host) = PluginHost::start(&cfg)
-        && let Ok(mut slot) = DISPATCHER.lock() {
-            *slot = Some(Arc::new(Mutex::new(host)));
-        }
+        && let Ok(mut slot) = DISPATCHER.lock()
+    {
+        *slot = Some(Arc::new(Mutex::new(host)));
+    }
     if let Ok(mut slot) = SESSION_CFG.lock() {
         *slot = Some(cfg);
     }
@@ -1723,7 +1736,9 @@ fn default_open(kind: HitKind, text: &str, view: &SurfaceHostView) {
             } else {
                 return; // 相对路径且无 cwd：不猜
             };
-            resolved.exists().then(|| resolved.to_string_lossy().to_string())
+            resolved
+                .exists()
+                .then(|| resolved.to_string_lossy().to_string())
         }
     };
     let Some(target) = target else {
@@ -1754,10 +1769,7 @@ fn point_to_cell(view: &SurfaceHostView, pt: NSPoint) -> Option<(u32, u32)> {
     }
     let col = ((pt.x.max(0.0) / b.size.width) * f64::from(sz.columns)).floor() as u32;
     let row = ((pt.y.max(0.0) / b.size.height) * f64::from(sz.rows)).floor() as u32;
-    Some((
-        row.min(sz.rows as u32 - 1),
-        col.min(sz.columns as u32 - 1),
-    ))
+    Some((row.min(sz.rows as u32 - 1), col.min(sz.columns as u32 - 1)))
 }
 
 /// 广播一站式入口（无分发器/锁坏 → NoPlugins）。
@@ -1804,10 +1816,8 @@ fn collect_geom(view: &SurfaceHostView) -> Option<LayerGeom> {
         view_pt: (b.size.width, b.size.height),
         scale,
         // SAFETY: 同类指针 retain（AppKit 引用计数安全；view 在主线程存活）。
-        view: unsafe {
-            Retained::retain(std::ptr::from_ref(view) as *mut SurfaceHostView)
-        }
-        .expect("view alive"),
+        view: unsafe { Retained::retain(std::ptr::from_ref(view) as *mut SurfaceHostView) }
+            .expect("view alive"),
     })
 }
 
@@ -1819,7 +1829,12 @@ fn collect_geom(view: &SurfaceHostView) -> Option<LayerGeom> {
 /// - 本 pane 有插件层 → 层前台：Esc 宿主直接关层（PRODUCT 语义），
 ///   其余键转 `input.key` 发给拥有该层的插件连接；
 /// - 已授予的全局热键命中 → `input.key{layer:0}` 发给拥有方。
-pub fn key_route(view: &SurfaceHostView, keycode: u16, mods: ghostty_sys::ghostty_input_mods_e, chars: Option<String>) -> bool {
+pub fn key_route(
+    view: &SurfaceHostView,
+    keycode: u16,
+    mods: ghostty_sys::ghostty_input_mods_e,
+    chars: Option<String>,
+) -> bool {
     let pane = view.pane_id();
     let proto_mods = modifiers_from_mods(mods);
     // 层前台优先。
@@ -1832,7 +1847,12 @@ pub fn key_route(view: &SurfaceHostView, keycode: u16, mods: ghostty_sys::ghostt
         }
         let fallback = chars.as_deref().and_then(|s| s.chars().next());
         let key = code_to_key_name(keycode, fallback);
-        let msg = Message::InputKey(InputKey::new(layer, key, chars.unwrap_or_default(), proto_mods));
+        let msg = Message::InputKey(InputKey::new(
+            layer,
+            key,
+            chars.unwrap_or_default(),
+            proto_mods,
+        ));
         if let Some(host) = take_dispatcher()
             && let Ok(mut h) = host.lock()
         {
@@ -1844,11 +1864,12 @@ pub fn key_route(view: &SurfaceHostView, keycode: u16, mods: ghostty_sys::ghostt
     let fallback = chars.as_deref().and_then(|s| s.chars().next());
     let key = code_to_key_name(keycode, fallback);
     let grant = take_dispatcher().and_then(|host| {
-        host.lock().ok().and_then(|h| h.hotkey_owner(&key, &proto_mods))
+        host.lock()
+            .ok()
+            .and_then(|h| h.hotkey_owner(&key, &proto_mods))
     });
     if let Some(conn) = grant {
-        let msg =
-            Message::InputKey(InputKey::new(0, key, chars.unwrap_or_default(), proto_mods));
+        let msg = Message::InputKey(InputKey::new(0, key, chars.unwrap_or_default(), proto_mods));
         if let Some(host) = take_dispatcher()
             && let Ok(mut h) = host.lock()
         {
@@ -1870,8 +1891,7 @@ impl PluginHost {
 
     /// 按连接发任意消息（input.key / layer.close 回程的公开包装）。
     pub(crate) fn send_message(&mut self, conn_id: u64, msg: &Message) -> std::io::Result<()> {
-        let frame =
-            encode_frame(msg).map_err(|e| std::io::Error::other(format!("encode: {e}")))?;
+        let frame = encode_frame(msg).map_err(|e| std::io::Error::other(format!("encode: {e}")))?;
         let c = self
             .conns
             .iter_mut()
@@ -1917,10 +1937,16 @@ mod tests {
         let line = "  src/main.rs:42:13  other.txt  ";
         // 点在 's'（col 2）→ 整个 src/main.rs:42:13。
         let got = line_token_at(line, 2);
-        assert_eq!(got.as_ref().map(|(t, s)| (t.as_str(), *s)), Some(("src/main.rs:42:13", 2)));
+        assert_eq!(
+            got.as_ref().map(|(t, s)| (t.as_str(), *s)),
+            Some(("src/main.rs:42:13", 2))
+        );
         // 点在路径中间也拿整个 token。
         let got = line_token_at(line, 6);
-        assert_eq!(got.as_ref().map(|(t, s)| (t.as_str(), *s)), Some(("src/main.rs:42:13", 2)));
+        assert_eq!(
+            got.as_ref().map(|(t, s)| (t.as_str(), *s)),
+            Some(("src/main.rs:42:13", 2))
+        );
         // 点在空白处 → None。
         assert!(line_token_at(line, 0).is_none());
         assert!(line_token_at(line, 19).is_none());
@@ -2008,7 +2034,9 @@ mod tests {
 
     fn sample_theme() -> ThemeSet {
         let ansi = std::array::from_fn::<String, 16, _>(|i| format!("#00{i:02x}00"));
-        ThemeSet::new("t", "#101010", "#202020", "#303030", "#404040", 128, "#505050", ansi)
+        ThemeSet::new(
+            "t", "#101010", "#202020", "#303030", "#404040", 128, "#505050", ansi,
+        )
     }
 
     #[test]
@@ -2112,7 +2140,9 @@ mod tests {
             Some(true)
         );
         // 用户目录段。
-        assert!(resolve_plugin_binary_in("good", &PluginsConfig::default(), Some(&user_dir)).is_some());
+        assert!(
+            resolve_plugin_binary_in("good", &PluginsConfig::default(), Some(&user_dir)).is_some()
+        );
         // 不存在 / 名字带斜杠 / 空 → None。
         assert!(resolve_plugin_binary_in("nope", &cfg, Some(&user_dir)).is_none());
         assert!(resolve_plugin_binary_in("a/b", &cfg, Some(&user_dir)).is_none());
@@ -2151,11 +2181,7 @@ mod tests {
             !host.children.iter().any(|(n, _)| n == "hog"),
             "超限子进程应被收割"
         );
-        let err = host
-            .spawn_errors
-            .get("hog")
-            .cloned()
-            .unwrap_or_default();
+        let err = host.spawn_errors.get("hog").cloned().unwrap_or_default();
         assert!(err.contains("超内存上限"), "面板应能看到原因：{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2271,24 +2297,51 @@ while True:
         };
         let mut host = PluginHost::bind(sock.clone(), cfg.clone()).expect("bind");
         // 首击冷启动：无连接 → 兜底拉起 → claim priority 7。
-        let hit = Hit::new(1, HitKind::Path, "/tmp/a.rs", "", 3, 2, 1, vec![Modifier::Cmd]);
+        let hit = Hit::new(
+            1,
+            HitKind::Path,
+            "/tmp/a.rs",
+            "",
+            3,
+            2,
+            1,
+            vec![Modifier::Cmd],
+        );
         let out = host.dispatch_hit_with_timeout(
             &hit,
             Duration::from_millis(3000),
             None, // 无 GUI：跳过层握手
         );
-        assert_eq!(out, DispatchOutcome::Claimed { priority: 7 }, "claim 必须仲裁出来");
+        assert_eq!(
+            out,
+            DispatchOutcome::Claimed { priority: 7 },
+            "claim 必须仲裁出来"
+        );
         // 子进程活着 + 快照可见。
         let snap = host.snapshot();
-        assert!(snap.iter().any(|s| s.name == "fake" && s.running && s.enabled), "{snap:?}");
+        assert!(
+            snap.iter()
+                .any(|s| s.name == "fake" && s.running && s.enabled),
+            "{snap:?}"
+        );
         // ignore 模式：再造一个 ignore 插件（第二个 host 段）。
         drop(host);
         // SAFETY: 同上。
         unsafe { std::env::set_var("NINJA_FAKE_MODE", "ignore") };
         let script2 = fake_plugin(&dir, "ig");
-        cfg.paths.insert("fake".into(), script2.to_string_lossy().to_string());
+        cfg.paths
+            .insert("fake".into(), script2.to_string_lossy().to_string());
         let mut host = PluginHost::bind(sock.clone(), cfg).expect("bind2");
-        let hit = Hit::new(1, HitKind::Path, "/tmp/a.rs", "", 3, 2, 1, vec![Modifier::Cmd]);
+        let hit = Hit::new(
+            1,
+            HitKind::Path,
+            "/tmp/a.rs",
+            "",
+            3,
+            2,
+            1,
+            vec![Modifier::Cmd],
+        );
         let out = host.dispatch_hit_with_timeout(&hit, Duration::from_millis(3000), None);
         assert_eq!(out, DispatchOutcome::AllIgnored);
         // 禁用：幂等回收（杀子进程 + 断连 + 删 socket）。

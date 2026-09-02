@@ -5,15 +5,16 @@ mod app;
 mod config;
 mod host;
 mod keymap;
+mod notify;
 mod pane;
 // ADE 插件监督器 + 适配器与插件面板。
 mod panel;
 mod plugins;
 mod search;
 mod session;
-mod tab_rename;
 mod shell;
 mod surface;
+mod tab_rename;
 
 fn main() {
     // 具名主题解析需要 GHOSTTY_RESOURCES_DIR（resourcesdir.zig 只在

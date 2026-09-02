@@ -33,6 +33,8 @@ A click is not "open this file". The host broadcasts a `hit` (path / URL / OSC-8
 
 Ghostty-specific behavior stays in the host adapter: ⌘+hover links, `file://` OSC-7, grid-token fallback when no hyperlink exists. None of that is in the protocol.
 
+Desktop notifications (OSC 9 / 777 / 99) are the same: libghostty fires `GHOSTTY_ACTION_DESKTOP_NOTIFICATION`; the shell posts a `UNUserNotification` and focuses that surface on click. Not an ADE primitive, not an agent feature.
+
 ## Layers
 
 A layer is `placement` × `surface`:

@@ -7,9 +7,11 @@ use std::cell::RefCell;
 use std::ptr::NonNull;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObjectProtocol, Sel};
 use objc2::runtime::Bool;
-use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly, Message as _};
+use objc2::runtime::{AnyObject, NSObjectProtocol, Sel};
+use objc2::{
+    ClassType, MainThreadMarker, MainThreadOnly, Message as _, define_class, msg_send, sel,
+};
 use objc2_app_kit::{
     NSButton, NSControl, NSEvent, NSEventMask, NSFocusRingType, NSResponder, NSTextField, NSView,
     NSWindow,
@@ -102,7 +104,10 @@ fn begin_on_button(target: &NSWindow, button: &NSView) -> bool {
         mtm,
         NSRect::new(
             NSPoint::new(inset, 1.0),
-            NSSize::new((b.size.width - inset * 2.0).max(24.0), (b.size.height - 2.0).max(14.0)),
+            NSSize::new(
+                (b.size.width - inset * 2.0).max(24.0),
+                (b.size.height - 2.0).max(14.0),
+            ),
         ),
         &current,
     );
@@ -160,8 +165,7 @@ fn apply_title(w: &NSWindow, title: String) {
 
 fn current_title(w: &NSWindow) -> String {
     if let Some(c) = container_of(w) {
-        c.title_override()
-            .unwrap_or_else(|| w.title().to_string())
+        c.title_override().unwrap_or_else(|| w.title().to_string())
     } else {
         w.title().to_string()
     }

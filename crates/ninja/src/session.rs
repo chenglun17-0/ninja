@@ -83,7 +83,9 @@ fn chrome_window(group: &[Retained<NSWindow>]) -> &NSWindow {
 
 fn find_strip(strips: &mut [Vec<Retained<NSWindow>>], w: &NSWindow) -> Option<usize> {
     let p = ptr_of(w);
-    strips.iter().position(|st| st.iter().any(|x| ptr_of(x) == p))
+    strips
+        .iter()
+        .position(|st| st.iter().any(|x| ptr_of(x) == p))
 }
 
 pub fn begin_quit() {
@@ -144,7 +146,10 @@ pub fn note_move(selected: &NSWindow, amount: isize) {
     let p = ptr_of(selected);
     STRIPS.with(|s| {
         let mut strips = s.borrow_mut();
-        let Some(si) = strips.iter().position(|st| st.iter().any(|x| ptr_of(x) == p)) else {
+        let Some(si) = strips
+            .iter()
+            .position(|st| st.iter().any(|x| ptr_of(x) == p))
+        else {
             return;
         };
         let count = strips[si].len();
@@ -227,7 +232,8 @@ pub fn restore(mtm: MainThreadMarker) -> bool {
     if !should_restore() {
         return false;
     }
-    if std::env::var_os("NINJA_P2_SELFTEST").is_some() || std::env::var_os("NINJA_E2E_SCREEN").is_some()
+    if std::env::var_os("NINJA_P2_SELFTEST").is_some()
+        || std::env::var_os("NINJA_E2E_SCREEN").is_some()
     {
         return false;
     }

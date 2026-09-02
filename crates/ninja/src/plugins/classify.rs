@@ -54,7 +54,9 @@ pub fn classify_token(token: &str) -> Option<HitKind> {
     }
     if let Some((scheme, rest)) = token.split_once("://")
         && scheme.len() >= 2
-        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
         && !rest.is_empty()
     {
         return Some(HitKind::Url);
@@ -131,15 +133,15 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len()
-            && let Ok(v) = u8::from_str_radix(
-                std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
         out.push(b[i]);
         i += 1;
     }
@@ -179,9 +181,8 @@ fn macos_pid_cwd(pid: u32) -> Option<String> {
     if got <= 0 {
         return None;
     }
-    let bytes = unsafe {
-        std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast::<u8>(), 1024)
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast::<u8>(), 1024) };
     let end = bytes.iter().position(|&c| c == 0).unwrap_or(0);
     if end == 0 {
         return None;
@@ -347,7 +348,10 @@ pub fn key_name_to_code(key: &str) -> Option<u16> {
 
 /// 协议 key + modifiers → `ghostty_input_key_s`（供 `config_key_is_binding`
 /// 冲突检查；keycode = macOS 原生虚拟键码，嵌入 API 惯例）。
-pub(crate) fn hotkey_to_key_event(key: &str, mods: &[Modifier]) -> Option<ghostty_sys::ghostty_input_key_s> {
+pub(crate) fn hotkey_to_key_event(
+    key: &str,
+    mods: &[Modifier],
+) -> Option<ghostty_sys::ghostty_input_key_s> {
     let code = key_name_to_code(key)?;
     let mut m: u32 = ghostty_sys::GHOSTTY_MODS_NONE;
     for md in mods {

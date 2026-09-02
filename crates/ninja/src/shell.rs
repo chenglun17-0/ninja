@@ -6,20 +6,23 @@
 //!   `addTabbedWindow:ordered:` 挂进当前窗口的 tab 组；
 //! - ghostty `close_surface`（⌘W 默认绑定）→ `close_surface_cb` →
 //!   [`handle_surface_close`]（≡ v1 handle_pane_eof）：多 pane 拆焦点叶
-//!   并 surface_free、单 pane performClose 关 tab/窗；
+//!   并 surface_free、单 pane performClose 关 tab/窗；活进程按
+//!   Ghostty `confirm-close-surface` 弹确认（libghostty 已把配置折进
+//!   `process_alive` / `needsConfirmQuit`）；
 //! - `windowShouldClose` 的裸⌘W 决策（菜单 Close=performClose 路径，
-//!   多 pane 只关焦点面、单 pane 放行原生语义）；
+//!   多 pane 只关焦点面、单 pane 放行原生语义）+ 整 tab/窗关闭确认；
 //! - `windowWillClose` → 全叶 surface_free（延迟，见 [`crate::host`]）。
 
+use std::cell::Cell;
 use std::sync::Mutex;
 
 use objc2::rc::Retained;
-use objc2::{msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, msg_send};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAppearance, NSAppearanceCustomization,
-    NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSBackingStoreType,
-    NSEventType, NSScreen, NSTextField, NSView, NSWindow, NSWindowOrderingMode,
-    NSWindowStyleMask, NSWindowTabbingMode,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAppearance, NSAppearanceCustomization,
+    NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSBackingStoreType, NSEventType,
+    NSScreen, NSTextField, NSView, NSWindow, NSWindowOrderingMode, NSWindowStyleMask,
+    NSWindowTabbingMode,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSUserDefaults};
 
@@ -34,6 +37,11 @@ const QUIT_KEEPS_WINDOWS_KEY: &str = "NSQuitAlwaysKeepsWindows";
 
 /// Ghostty `TerminalController.lastCascadePoint`：新窗错开，不叠在上一扇上。
 static LAST_CASCADE: Mutex<NSPoint> = Mutex::new(NSPoint { x: 0.0, y: 0.0 });
+
+std::thread_local! {
+    /// 确认框重入守卫：modal 期间再来一次 close 直接拦，不叠第二张。
+    static CONFIRMING: Cell<bool> = const { Cell::new(false) };
+}
 
 /// 开窗尺寸：`window-width/height` 都 >0 用格子；否则铺满当前屏可见区域。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,9 +226,7 @@ pub fn prompt_tab_title_for_window(w: &NSWindow) {
             NSSize::new(250.0, 24.0),
         )]
     };
-    let current = c
-        .title_override()
-        .unwrap_or_else(|| w.title().to_string());
+    let current = c.title_override().unwrap_or_else(|| w.title().to_string());
     field.setStringValue(&NSString::from_str(&current));
     alert.setAccessoryView(Some(&field));
     alert.addButtonWithTitle(&NSString::from_str("OK"));
@@ -581,10 +587,163 @@ fn bg_is_light(r: u8, g: u8, b: u8) -> bool {
     0.299 * r + 0.587 * g + 0.114 * b > 0.5
 }
 
+/// 关窗确认文案（Ghostty `BaseTerminalController` / `TerminalController` 同款）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseConfirmKind {
+    Surface,
+    Tab,
+    Window,
+    OtherTabs,
+    TabsToTheRight,
+    Quit,
+}
+
+impl CloseConfirmKind {
+    fn copy(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Surface => (
+                "Close Terminal?",
+                "The terminal still has a running process. If you close the terminal the process will be killed.",
+                "Close",
+            ),
+            Self::Tab => (
+                "Close Tab?",
+                "The terminal still has a running process. If you close the tab the process will be killed.",
+                "Close",
+            ),
+            Self::Window => (
+                "Close Window?",
+                "All terminal sessions in this window will be terminated.",
+                "Close",
+            ),
+            Self::OtherTabs => (
+                "Close Other Tabs?",
+                "At least one other tab still has a running process. If you close the tab the process will be killed.",
+                "Close",
+            ),
+            Self::TabsToTheRight => (
+                "Close Tabs on the Right?",
+                "At least one tab to the right still has a running process. If you close the tab the process will be killed.",
+                "Close",
+            ),
+            Self::Quit => (
+                "Quit ninja?",
+                "The terminal still has a running process. If you quit, the process will be killed.",
+                "Terminate",
+            ),
+        }
+    }
+}
+
+/// 关整个 tab/窗时的文案：组里还有别的 tab → Tab，否则 Window。
+pub(crate) fn close_window_or_tab_kind(tab_count: usize) -> CloseConfirmKind {
+    if tab_count > 1 {
+        CloseConfirmKind::Tab
+    } else {
+        CloseConfirmKind::Window
+    }
+}
+
+fn confirm_close_suppressed() -> bool {
+    std::env::var_os("NINJA_P2_SELFTEST").is_some()
+        || std::env::var_os("NINJA_E2E_SCREEN").is_some()
+}
+
+fn tab_count(w: &NSWindow) -> usize {
+    w.tabGroup().map(|g| g.windows().len()).unwrap_or(1).max(1)
+}
+
+fn window_needs_confirm(w: &NSWindow) -> bool {
+    if confirm_close_suppressed() {
+        return false;
+    }
+    container_of(w).is_some_and(|c| c.leaves().iter().any(|v| v.needs_confirm_quit()))
+}
+
+/// 任一面需要确认才拦 ⌘Q（libghostty `ghostty_app_needs_confirm_quit`）。
+pub fn app_needs_confirm_quit() -> bool {
+    if confirm_close_suppressed() {
+        return false;
+    }
+    let mut needs = false;
+    host::with_app(|app| {
+        // SAFETY: 公开 C API；app 句柄由 host 单例保证存活。
+        needs = unsafe { ghostty_sys::ghostty_app_needs_confirm_quit(app) };
+    });
+    needs
+}
+
+fn run_close_confirm(kind: CloseConfirmKind) -> bool {
+    if confirm_close_suppressed() {
+        return true;
+    }
+    let Some(mtm) = MainThreadMarker::new() else {
+        return true;
+    };
+    if CONFIRMING.with(|c| c.get()) {
+        return false;
+    }
+    CONFIRMING.with(|c| c.set(true));
+    let (title, info, button) = kind.copy();
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(info));
+    alert.setAlertStyle(NSAlertStyle::Warning);
+    alert.addButtonWithTitle(&NSString::from_str(button));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let resp = alert.runModal();
+    CONFIRMING.with(|c| c.set(false));
+    resp == NSAlertFirstButtonReturn
+}
+
+/// ⌘Q 确认（取消 → 不退出）。
+pub fn confirm_quit() -> bool {
+    run_close_confirm(CloseConfirmKind::Quit)
+}
+
+/// ⇧⌘W / `CLOSE_WINDOW`：整 tab 关（`close` 跳过裸⌘W 拆 pane），活进程先确认。
+pub fn confirm_then_close_window(w: &NSWindow) {
+    if window_needs_confirm(w) && !run_close_confirm(close_window_or_tab_kind(tab_count(w))) {
+        return;
+    }
+    w.close();
+}
+
+/// `CLOSE_ALL_WINDOWS`：有活进程先确认一次，再逐窗 `close`。
+pub fn confirm_then_close_all_windows(mtm: MainThreadMarker) {
+    let app = NSApplication::sharedApplication(mtm);
+    let list: Vec<Retained<NSWindow>> = app
+        .windows()
+        .into_iter()
+        .filter(|w| container_of(w).is_some())
+        .collect();
+    if list.iter().any(|w| window_needs_confirm(w)) && !run_close_confirm(CloseConfirmKind::Window)
+    {
+        return;
+    }
+    crate::session::save();
+    crate::session::begin_quit();
+    for w in list {
+        w.close();
+    }
+}
+
+fn close_leaf_maybe_confirm(
+    container: &crate::pane::PaneContainer,
+    view: &SurfaceHostView,
+    process_alive: bool,
+) {
+    if process_alive && !run_close_confirm(CloseConfirmKind::Surface) {
+        return;
+    }
+    container.close_leaf(view);
+}
+
 /// ghostty close_surface（⌘W 默认绑定）/ EOF（close_surface_cb）的宿主侧
 /// 决策 ≡ v1 handle_pane_eof：多 pane 窗拆该面（surface 延迟 free），
-/// 单 pane 窗 performClose 关 tab/窗。
-pub fn handle_surface_close(view: &SurfaceHostView, _process_alive: bool) {
+/// 单 pane 窗 performClose 关 tab/窗。`process_alive` 为真时先确认。
+/// 最后一面把确认交给 `windowShouldClose`，避免双弹。
+pub fn handle_surface_close(view: &SurfaceHostView, process_alive: bool) {
     let Some(w) = view.window() else {
         // 已脱窗（关窗中）：surface 由 windowWillClose 统一拆。
         host::close_leaf_deferred(view);
@@ -593,7 +752,11 @@ pub fn handle_surface_close(view: &SurfaceHostView, _process_alive: bool) {
     let Some(container) = container_of(&w) else {
         return;
     };
-    container.close_leaf(view);
+    if container.leaf_count() <= 1 {
+        w.performClose(None);
+        return;
+    }
+    close_leaf_maybe_confirm(container, view, process_alive);
 }
 
 /// ⌘W 的关闭决策（v1 D-A；纯逻辑，可单测）：
@@ -639,25 +802,25 @@ fn close_request_is_bare_cmd_key() -> bool {
 }
 
 /// `windowShouldClose:` 实现：裸 ⌘W + 多 pane → 关焦点面并拦掉整窗关闭；
-/// 其余放行。
+/// 其余路径关整个 tab/窗，活进程先确认。
 pub fn window_should_close(w: &NSWindow) -> bool {
-    if !close_request_is_bare_cmd_key() {
-        return true;
+    if close_request_is_bare_cmd_key()
+        && let Some(container) = container_of(w)
+        && !should_close_whole_window(container.leaf_count(), true)
+    {
+        // 多 pane：只关焦点面（close_leaf 自带焦点转移 + surface 延迟 free）。
+        return match container.focused_leaf() {
+            Some(f) => {
+                close_leaf_maybe_confirm(container, &f, f.needs_confirm_quit());
+                false
+            }
+            None => true, // 无焦点叶子（异常态）：放行原语义，不硬拦
+        };
     }
-    let Some(container) = container_of(w) else {
-        return true;
-    };
-    if should_close_whole_window(container.leaf_count(), true) {
-        return true; // 单 pane：关 tab/窗（原生语义）
+    if window_needs_confirm(w) && !run_close_confirm(close_window_or_tab_kind(tab_count(w))) {
+        return false;
     }
-    // 多 pane：只关焦点面（close_leaf 自带焦点转移 + surface 延迟 free）。
-    match container.focused_leaf() {
-        Some(f) => {
-            container.close_leaf(&f);
-            false
-        }
-        None => true, // 无焦点叶子（异常态）：放行原语义，不硬拦
-    }
+    true
 }
 
 /// ⌘N / ghostty NEW_WINDOW：新窗口（独立窗口，不成 tab）。parent =
@@ -852,8 +1015,8 @@ pub fn move_tab(w: &NSWindow, amount: isize) {
 }
 
 /// ghostty CLOSE_TAB(this/other/right)：tab 组操作。this → 当前 tab
-/// performClose（windowShouldClose 决策放行）；other/right → 其余 tab
-/// close（非裸⌘W 路径，整 tab 关）。
+/// performClose（windowShouldClose 确认）；other/right → 有活进程先确认
+/// 再 `close`（跳过 windowShouldClose，避免逐 tab 再弹）。
 pub fn close_tab(w: &NSWindow, mode: ghostty_sys::ghostty_action_close_tab_mode_e) {
     use ghostty_sys::*;
     let Some(group) = w.tabGroup() else {
@@ -871,22 +1034,39 @@ pub fn close_tab(w: &NSWindow, mode: ghostty_sys::ghostty_action_close_tab_mode_
     match mode {
         GHOSTTY_ACTION_CLOSE_TAB_MODE_THIS => w.performClose(None),
         GHOSTTY_ACTION_CLOSE_TAB_MODE_OTHER => {
-            for other in windows.iter() {
-                if !same_window(other, w) {
-                    other.close();
-                }
+            let others: Vec<&NSWindow> = windows
+                .iter()
+                .filter(|other| !same_window(other, w))
+                .map(|other| &**other)
+                .collect();
+            if others.iter().any(|other| window_needs_confirm(other))
+                && !run_close_confirm(CloseConfirmKind::OtherTabs)
+            {
+                return;
+            }
+            for other in others {
+                other.close();
             }
         }
         GHOSTTY_ACTION_CLOSE_TAB_MODE_RIGHT => {
             let mut after = false;
+            let mut right = Vec::new();
             for win in windows.iter() {
                 if same_window(win, w) {
                     after = true;
                     continue;
                 }
                 if after {
-                    win.close();
+                    right.push(&**win);
                 }
+            }
+            if right.iter().any(|win| window_needs_confirm(win))
+                && !run_close_confirm(CloseConfirmKind::TabsToTheRight)
+            {
+                return;
+            }
+            for win in right {
+                win.close();
             }
         }
         _ => {}
@@ -952,21 +1132,21 @@ mod tests {
 
     #[test]
     fn odp_background_is_dark_so_title_uses_dark_aqua() {
-        // ODP #282c34；浅色外观会让标题字变成黑字叠在深色底上（看不见）。
+        // Ghostty 默认 background #282c34；浅色外观会让标题字变成黑字叠在深色底上（看不见）。
         assert!(!super::bg_is_light(0x28, 0x2c, 0x34));
         assert!(super::bg_is_light(0xf5, 0xf5, 0xf5));
     }
 
     #[test]
     fn window_size_priority_matches_ghostty() {
-        use super::{choose_size, SizeChoice};
+        use super::{SizeChoice, choose_size};
         assert_eq!(choose_size(true), SizeChoice::InitialSize);
         assert_eq!(choose_size(false), SizeChoice::Maximize);
     }
 
     #[test]
     fn window_origin_priority_matches_ghostty() {
-        use super::{choose_origin, OriginChoice};
+        use super::{OriginChoice, choose_origin};
         assert_eq!(choose_origin(true, true), OriginChoice::ConfigPos);
         assert_eq!(choose_origin(false, true), OriginChoice::Restored);
         assert_eq!(choose_origin(false, false), OriginChoice::Center);
@@ -979,5 +1159,17 @@ mod tests {
         assert!(should_close_whole_window(2, false));
         assert!(should_close_whole_window(3, false));
         assert!(should_close_whole_window(1, false));
+    }
+
+    #[test]
+    fn close_confirm_kind_matches_ghostty_copy() {
+        use super::CloseConfirmKind;
+        assert_eq!(super::close_window_or_tab_kind(1), CloseConfirmKind::Window);
+        assert_eq!(super::close_window_or_tab_kind(2), CloseConfirmKind::Tab);
+        assert_eq!(super::close_window_or_tab_kind(0), CloseConfirmKind::Window);
+        let (title, _, button) = CloseConfirmKind::Quit.copy();
+        assert_eq!(title, "Quit ninja?");
+        assert_eq!(button, "Terminate");
+        assert_eq!(CloseConfirmKind::Surface.copy().2, "Close");
     }
 }

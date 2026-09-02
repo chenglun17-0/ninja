@@ -1,13 +1,13 @@
 //! ghostty 配置面：文件发现、装载管线、键位换算、配置读取与取证 dump。
 
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::path::{Path, PathBuf};
 
 use ghostty_sys::*;
 
 use super::{
-    host_layer_text, odp_layer_text, user_sets_theme, BAKED_RESOURCES_DIR, HostConfig,
-    HOST_LAYER_FILE, host_config_path, MENU_ACTIONS, ODP_LAYER_FILE, PLUGIN_THEME_LAYER_FILE,
+    BAKED_RESOURCES_DIR, HOST_LAYER_FILE, HostConfig, MENU_ACTIONS, PLUGIN_THEME_LAYER_FILE,
+    host_config_path, host_layer_text, user_sets_theme,
 };
 
 // ---------------------------------------------------------------------------
@@ -73,7 +73,11 @@ fn ghostty_config_edit_path() -> Option<String> {
     let path = if s.ptr.is_null() || s.len == 0 {
         None
     } else if s.sentinel {
-        Some(unsafe { CStr::from_ptr(s.ptr) }.to_string_lossy().into_owned())
+        Some(
+            unsafe { CStr::from_ptr(s.ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(s.ptr as *const u8, s.len) };
         Some(String::from_utf8_lossy(bytes).into_owned())
@@ -158,9 +162,9 @@ pub fn collect_ghostty_files(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// 一次装载的决策取证（dump/日志用）。
 #[derive(Clone, Debug)]
 pub struct LoadInfo {
-    /// 用户是否设置了 theme=（设置 → ODP 层让位）。
+    /// 用户是否设置了 theme=。
     pub user_theme: bool,
-    /// ODP 层是否装载。
+    /// 历史字段：不再垫 ODP，恒 false（dump JSON 兼容）。
     pub odp_applied: bool,
     /// 插件主题覆盖层是否装载（q3：theme.set 适配器；色板名）。
     pub plugin_theme: Option<String>,
@@ -236,7 +240,6 @@ pub fn load_pipeline() -> (ghostty_config_t, LoadInfo) {
         w
     };
     let user_theme = user_sets_theme(&ghostty_files);
-    let odp_applied = !user_theme;
     // q3：插件主题覆盖（theme.set 适配器写层文件压顶）。
     let plugin_theme = crate::plugins::plugin_theme_override();
 
@@ -244,10 +247,6 @@ pub fn load_pipeline() -> (ghostty_config_t, LoadInfo) {
     let _ = std::fs::create_dir_all(&dir);
     let host_layer = dir.join(HOST_LAYER_FILE);
     let _ = std::fs::write(&host_layer, host_layer_text());
-    let odp_layer = dir.join(ODP_LAYER_FILE);
-    if odp_applied {
-        let _ = std::fs::write(&odp_layer, odp_layer_text());
-    }
     let plugin_layer = dir.join(PLUGIN_THEME_LAYER_FILE);
     if let Some((_, text)) = &plugin_theme {
         let _ = std::fs::write(&plugin_layer, text);
@@ -257,13 +256,9 @@ pub fn load_pipeline() -> (ghostty_config_t, LoadInfo) {
 
     unsafe {
         let cfg = ghostty_config_new();
-        // 宿主层恒装载（ninja 特有动作的键位认领）。
+        // 宿主层恒装载（ninja 特有动作的键位认领）。不垫 ODP：空配置 =
+        // libghostty 默认色板（与原版 Ghostty 相同，前景 #ffffff）。
         load_file_cfg(cfg, &host_layer);
-        // ODP 层：仅当用户没设 theme=（见模块头：finalize 的 loadTheme
-        // 会重放已有配置，ODP 先载会反压用户主题）。
-        if odp_applied {
-            load_file_cfg(cfg, &odp_layer);
-        }
         ghostty_config_load_default_files(cfg);
         ghostty_config_load_recursive_files(cfg);
         // 插件主题层：压用户文件之后、finalize 之前——loadTheme 的
@@ -273,14 +268,17 @@ pub fn load_pipeline() -> (ghostty_config_t, LoadInfo) {
         }
         ghostty_config_finalize(cfg);
         let diagnostics = print_diagnostics(cfg);
-        (cfg, LoadInfo {
-            user_theme,
-            odp_applied,
-            plugin_theme: plugin_theme.map(|(name, _)| name),
-            layer_dir: dir,
-            watched,
-            diagnostics,
-        })
+        (
+            cfg,
+            LoadInfo {
+                user_theme,
+                odp_applied: false,
+                plugin_theme: plugin_theme.map(|(name, _)| name),
+                layer_dir: dir,
+                watched,
+                diagnostics,
+            },
+        )
     }
 }
 
@@ -467,6 +465,20 @@ pub fn get_f32(cfg: ghostty_config_t, key: &str) -> Option<f32> {
     ok.then_some(v)
 }
 
+/// 读 f64 键（`unfocused-split-opacity` 等）。
+pub fn get_f64(cfg: ghostty_config_t, key: &str) -> Option<f64> {
+    let mut v: f64 = 0.0;
+    let ok = unsafe {
+        ghostty_config_get(
+            cfg,
+            &mut v as *mut f64 as *mut c_void,
+            key.as_ptr() as *const _,
+            key.len(),
+        )
+    };
+    ok.then_some(v)
+}
+
 /// 读可选 i16（window-position-x/y；未设 → None）。
 pub fn get_i16(cfg: ghostty_config_t, key: &str) -> Option<i16> {
     let mut v: i16 = 0;
@@ -534,10 +546,7 @@ fn json_rgb(c: (u8, u8, u8)) -> String {
 }
 
 fn json_str(s: &str) -> String {
-    format!(
-        "\"{}\"",
-        s.replace('\\', "\\\\").replace('"', "\\\"")
-    )
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// 触发器可读描述（纯文本）：super+shift+'t'。
@@ -615,15 +624,21 @@ pub fn dump_effective_config(
     ));
     s.push_str(&format!(
         "  \"background\": {},\n",
-        get_color(cfg, "background").map(json_rgb).unwrap_or_else(|| "null".into())
+        get_color(cfg, "background")
+            .map(json_rgb)
+            .unwrap_or_else(|| "null".into())
     ));
     s.push_str(&format!(
         "  \"foreground\": {},\n",
-        get_color(cfg, "foreground").map(json_rgb).unwrap_or_else(|| "null".into())
+        get_color(cfg, "foreground")
+            .map(json_rgb)
+            .unwrap_or_else(|| "null".into())
     ));
     s.push_str(&format!(
         "  \"cursor_color\": {},\n",
-        get_color(cfg, "cursor-color").map(json_rgb).unwrap_or_else(|| "null".into())
+        get_color(cfg, "cursor-color")
+            .map(json_rgb)
+            .unwrap_or_else(|| "null".into())
     ));
     s.push_str(&format!(
         "  \"selection_background\": {},\n",
@@ -643,7 +658,10 @@ pub fn dump_effective_config(
             .map(|ps| {
                 format!(
                     "[{}]",
-                    ps.iter().map(|c| json_rgb(*c)).collect::<Vec<_>>().join(",")
+                    ps.iter()
+                        .map(|c| json_rgb(*c))
+                        .collect::<Vec<_>>()
+                        .join(",")
                 )
             })
             .unwrap_or_else(|| "null".into())
@@ -708,8 +726,15 @@ mod res_tests {
         let bundle = mk_res_dir(&root.join("app/Contents/Resources/ghostty"));
         std::fs::write(root.join("app/Contents/MacOS/ninja"), b"").unwrap();
         let baked = mk_res_dir(&root.join("dev-ghostty")); // 烘入路径同样有效
-        let got = resolve_resources_dir(Some(&root.join("app/Contents/MacOS/ninja")), baked.to_str().unwrap());
-        assert_eq!(got.as_deref(), Some(bundle.as_path()), "bundle 相对必须优先于烘入路径");
+        let got = resolve_resources_dir(
+            Some(&root.join("app/Contents/MacOS/ninja")),
+            baked.to_str().unwrap(),
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some(bundle.as_path()),
+            "bundle 相对必须优先于烘入路径"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -721,14 +746,24 @@ mod res_tests {
         std::fs::create_dir_all(root.join("target/release")).unwrap();
         std::fs::write(root.join("target/release/ninja"), b"").unwrap();
         let baked = mk_res_dir(&root.join("dev-ghostty"));
-        let got = resolve_resources_dir(Some(&root.join("target/release/ninja")), baked.to_str().unwrap());
+        let got = resolve_resources_dir(
+            Some(&root.join("target/release/ninja")),
+            baked.to_str().unwrap(),
+        );
         assert_eq!(got.as_deref(), Some(baked.as_path()));
         // bundle 布局在但 Resources/ghostty 缺 themes/（坏包）→ 走烘入。
         std::fs::create_dir_all(root.join("app2/Contents/MacOS")).unwrap();
         std::fs::write(root.join("app2/Contents/MacOS/ninja"), b"").unwrap();
         std::fs::create_dir_all(root.join("app2/Contents/Resources/ghostty")).unwrap();
-        let got = resolve_resources_dir(Some(&root.join("app2/Contents/MacOS/ninja")), baked.to_str().unwrap());
-        assert_eq!(got.as_deref(), Some(baked.as_path()), "无 themes/ 的 bundle 目录不算数");
+        let got = resolve_resources_dir(
+            Some(&root.join("app2/Contents/MacOS/ninja")),
+            baked.to_str().unwrap(),
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some(baked.as_path()),
+            "无 themes/ 的 bundle 目录不算数"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

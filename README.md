@@ -61,6 +61,8 @@ Terminal, window, and keys:
 ~/.config/ghostty/config
 ```
 
+Close confirmation is Ghostty's `confirm-close-surface` (default `true`: ask when a process is still running, including an agent). Set `false` to never ask, `always` to always ask.
+
 Plugins only:
 
 ```toml

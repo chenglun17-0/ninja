@@ -72,6 +72,7 @@ define_class!(
             let mtm = MainThreadMarker::new().expect("delegate on main thread");
             let app = NSApplication::sharedApplication(mtm);
             crate::tab_rename::install();
+            crate::notify::install();
 
             if !crate::session::restore(mtm) {
                 let window =
@@ -184,12 +185,19 @@ define_class!(
 
         /// ⌘Q：在 AppKit 拆标签组之前把窗/tab 树存下来。
         /// `applicationWillTerminate` 太晚——未选中 tab 那时可能已经不可见。
+        /// 有活进程时按 Ghostty `confirm-close-surface` 先确认。
         #[unsafe(method(applicationShouldTerminate:))]
         fn applicationShouldTerminate(
             &self,
             _sender: Option<&NSApplication>,
         ) -> NSApplicationTerminateReply {
             crate::session::save();
+            if crate::session::is_quitting() {
+                return NSApplicationTerminateReply::TerminateNow;
+            }
+            if shell::app_needs_confirm_quit() && !shell::confirm_quit() {
+                return NSApplicationTerminateReply::TerminateCancel;
+            }
             crate::session::begin_quit();
             NSApplicationTerminateReply::TerminateNow
         }
@@ -212,6 +220,7 @@ define_class!(
         #[unsafe(method(applicationWillTerminate:))]
         fn applicationWillTerminate(&self, _notification: &NSNotification) {
             crate::plugins::host_shutdown();
+            crate::notify::shutdown();
         }
 
         #[unsafe(method(applicationDidBecomeActive:))]
@@ -228,9 +237,9 @@ define_class!(
     unsafe impl NSWindowDelegate for AppDelegate {
         /// D-A：⌘W 只关「当前面」（决策群在 shell.rs，带单测）。裸 ⌘W
         /// （菜单 Close=performClose: / 系统 Close Tab）多 pane 窗只关
-        /// 焦点 pane、拦掉整窗 close；单 pane 放行原生语义。非 ⌘W 路径
-        /// （红绿灯、⇧⌘W/⌥⌘W、EOF、selftest）不受影响。须在
-        /// windowWillClose 之前（performClose 先问 shouldClose）。
+        /// 焦点 pane、拦掉整窗 close；单 pane 放行原生语义。活进程按
+        /// `confirm-close-surface` 确认后再关。须在 windowWillClose 之前
+        /// （performClose 先问 shouldClose）。
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, sender: &NSWindow) -> bool {
             let ok = shell::window_should_close(sender);
@@ -1008,7 +1017,7 @@ impl AppDelegate {
     }
 }
 
-/// 进程入口（q2 配置壳）：ghostty_init → 装载管线（宿主层/ODP 层/用户
+/// 进程入口（q2 配置壳）：ghostty_init → 装载管线（宿主层/用户
 /// 配置/finalize，见 crate::config）→ app → 菜单（键位自配置推导）→
 /// delegate/runloop + 热重载监视。⌘Q / 最后窗关闭 → NSApp.run 返回 →
 /// main 统一收尾 free。
@@ -1034,9 +1043,8 @@ pub fn run() {
         .to_string();
         let (config, load_info) = crate::config::load_pipeline();
         println!(
-            "ninja q2 shell — libghostty {version}；配置：用户 theme={} ODP={} 监视 {} 文件；资源目录 {:?}",
+            "ninja q2 shell — libghostty {version}；配置：用户 theme={} 监视 {} 文件；资源目录 {:?}",
             load_info.user_theme,
-            load_info.odp_applied,
             load_info.watched.len(),
             std::env::var("GHOSTTY_RESOURCES_DIR").unwrap_or_default()
         );

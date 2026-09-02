@@ -67,8 +67,7 @@ pub fn mods_from_flags(flags: u64) -> ghostty_input_mods_e {
 
 /// 「裸 ⌘ 键」判定（shell.rs ⌘W 决策用）：只有 SUPER，无 shift/option/ctrl。
 pub fn is_bare_super(flags: u64) -> bool {
-    flags & MASK_CMD != 0
-        && flags & (MASK_SHIFT | MASK_ALT | MASK_CTRL) == 0
+    flags & MASK_CMD != 0 && flags & (MASK_SHIFT | MASK_ALT | MASK_CTRL) == 0
 }
 
 /// consumed_mods 启发式（NSEvent+Extension.swift 同款）：ctrl/⌘ 从不参与
@@ -135,7 +134,10 @@ pub fn key_event(
 
 /// 滚轮 mods 打包（Ghostty.Input.ScrollMods 同款）：
 /// bit0 = precision（精确增量），bit1-3 = momentum（NSEventPhase → 枚举）。
-pub fn scroll_mods(precise: bool, momentum: objc2_app_kit::NSEventPhase) -> ghostty_input_scroll_mods_t {
+pub fn scroll_mods(
+    precise: bool,
+    momentum: objc2_app_kit::NSEventPhase,
+) -> ghostty_input_scroll_mods_t {
     let mut v: i32 = 0;
     if precise {
         v |= 1;
@@ -182,7 +184,10 @@ mod tests {
         assert_eq!(rs & GHOSTTY_MODS_SHIFT, GHOSTTY_MODS_SHIFT);
         assert_eq!(rs & GHOSTTY_MODS_SHIFT_RIGHT, GHOSTTY_MODS_SHIFT_RIGHT);
         // caps（alphaShift 位）→ CAPS。
-        assert_eq!(mods_from_flags(MASK_ALPHA_SHIFT) & GHOSTTY_MODS_CAPS, GHOSTTY_MODS_CAPS);
+        assert_eq!(
+            mods_from_flags(MASK_ALPHA_SHIFT) & GHOSTTY_MODS_CAPS,
+            GHOSTTY_MODS_CAPS
+        );
     }
 
     #[test]

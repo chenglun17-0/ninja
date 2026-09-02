@@ -25,10 +25,10 @@ use std::cell::{Cell, RefCell};
 
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSEvent, NSFocusRingType, NSResponder, NSTextInputClient, NSTrackingArea,
-    NSTrackingAreaOptions, NSView,
+    NSColor, NSEvent, NSFocusRingType, NSResponder, NSTextInputClient, NSTrackingArea,
+    NSTrackingAreaOptions, NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSRect, NSSize, NSString,
@@ -69,6 +69,8 @@ pub struct Ivars {
     pub pending_title: RefCell<Option<String>>,
     /// ⌘F 搜索栏（叠在 Metal 面上）。
     pub search_bar: RefCell<Option<Retained<crate::search::SearchBarView>>>,
+    /// 未聚焦分屏变淡层（Ghostty `unfocused-split-opacity`）。
+    dim: RefCell<Option<Retained<DimOverlayView>>>,
 }
 
 define_class!(
@@ -117,6 +119,13 @@ define_class!(
             if !s.is_null() {
                 unsafe { ghostty_surface_set_focus(s, true) };
             }
+            crate::notify::clear_delivered(self.pane_id());
+            // SAFETY: superview 平凡；容器寿命与窗口 contentView 同。
+            if let Some(super_v) = (unsafe { self.superview() })
+                && crate::pane::is_container(&super_v)
+            {
+                crate::pane::downcast_container(&super_v).note_leaf_focus(self);
+            }
             ok
         }
 
@@ -142,6 +151,9 @@ define_class!(
             // SAFETY: 标准 super 调用。
             let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
             self.push_size();
+            if let Some(ov) = self.ivars().dim.borrow().as_ref() {
+                ov.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
+            }
         }
 
         /// 跨屏（Retina ↔ 非 Retina / 不同缩放）：frame points 不变但
@@ -621,13 +633,11 @@ impl SurfaceHostView {
             last_pushed_pt: Cell::new(None),
             pending_title: RefCell::new(None),
             search_bar: RefCell::new(None),
+            dim: RefCell::new(None),
         });
         // Ghostty AppKit SurfaceView 默认 800×600；window-width/height
         // 都 >0 时 INITIAL_SIZE 再校准。
-        let frame = NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(800.0, 600.0),
-        );
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
         // SAFETY: super 的 initWithFrame:；ivars 已就位。
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.setFocusRingType(NSFocusRingType::None);
@@ -638,6 +648,17 @@ impl SurfaceHostView {
     pub fn surface_opt(&self) -> Option<ghostty_surface_t> {
         let s = self.ivars().surface.get();
         (!s.is_null()).then_some(s)
+    }
+
+    /// Ghostty `confirm-close-surface`：libghostty 已把配置 + 是否在
+    /// 提示符折成 bool。宿主只问，不重算。
+    pub fn needs_confirm_quit(&self) -> bool {
+        self.surface_opt()
+            .map(|s| {
+                // SAFETY: 公开 C API；surface 句柄由 surface_opt 保证非空。
+                unsafe { ghostty_surface_needs_confirm_quit(s) }
+            })
+            .unwrap_or(false)
     }
 
     pub fn pane_id(&self) -> u32 {
@@ -658,18 +679,14 @@ impl SurfaceHostView {
     /// 视口最下一个非空行（自底向上扫；zoom dump 的 last 字段，对齐
     /// v1 last_text_line 的取证用途——断言布局与内容）。
     pub fn last_text_line(&self) -> String {
-        let Some(s) = self.surface_opt() else { return String::new() };
+        let Some(s) = self.surface_opt() else {
+            return String::new();
+        };
         let sz = unsafe { ghostty_surface_size(s) };
         if sz.rows == 0 || sz.columns == 0 {
             return String::new();
         }
-        let all = crate::host::read_text(
-            s,
-            0,
-            0,
-            sz.columns as u32 - 1,
-            sz.rows as u32 - 1,
-        );
+        let all = crate::host::read_text(s, 0, 0, sz.columns as u32 - 1, sz.rows as u32 - 1);
         for line in all.lines().rev() {
             let t = line.trim_end();
             if !t.is_empty() {
@@ -687,14 +704,24 @@ impl SurfaceHostView {
         if b.size.width <= 0.0 || b.size.height <= 0.0 {
             return;
         }
-        let scale = self
+        // Ghostty SurfaceView_AppKit：framebuffer 用 convertToBacking，
+        // 不用 bounds × backingScaleFactor 再 round（1px 误差会让 CA 二次缩放，字发糊）。
+        let backing = self.convertSizeToBacking(b.size);
+        let px_w = backing.width.max(0.0) as u32;
+        let px_h = backing.height.max(0.0) as u32;
+        if px_w == 0 || px_h == 0 {
+            return;
+        }
+        let x_scale = backing.width / b.size.width;
+        let y_scale = backing.height / b.size.height;
+        let layer_scale = self
             .window()
             .map(|w| w.backingScaleFactor())
-            .unwrap_or(2.0)
+            .unwrap_or(x_scale)
             .max(1.0);
         if std::env::var_os("NINJA_Q1_DEBUG").is_some() {
             eprintln!(
-                "ninja: push_size pane={} bounds=({:.1},{:.1}) scale={scale}",
+                "ninja: push_size pane={} bounds=({:.1},{:.1}) backing=({px_w},{px_h}) scale=({x_scale:.3},{y_scale:.3})",
                 self.pane_id(),
                 b.size.width,
                 b.size.height
@@ -703,7 +730,12 @@ impl SurfaceHostView {
         // q3：几何变了 → 本 pane 的插件层回收（v0 层不跟随 resize 重排，
         // 收掉由插件下次 claim 重开）。
         let now = (b.size.width, b.size.height);
-        if self.ivars().last_pushed_pt.get().is_some_and(|prev| prev != now) {
+        if self
+            .ivars()
+            .last_pushed_pt
+            .get()
+            .is_some_and(|prev| prev != now)
+        {
             crate::plugins::host_close_layers_of_pane(self.pane_id());
         }
         self.ivars().last_pushed_pt.set(Some(now));
@@ -712,21 +744,17 @@ impl SurfaceHostView {
         // 渲染目标尺寸 = layer.bounds × contentsScale，不同步就与下面推的
         // px 对不上（帧被丢 / 合成器二次缩放）。关隐式动画避免缩放闪一下。
         if let Some(layer) = self.layer()
-            && (layer.contentsScale() - scale).abs() > f64::EPSILON
+            && (layer.contentsScale() - layer_scale).abs() > f64::EPSILON
         {
             CATransaction::begin();
             CATransaction::setDisableActions(true);
-            layer.setContentsScale(scale);
+            layer.setContentsScale(layer_scale);
             CATransaction::commit();
         }
         // SAFETY: `s` 是本 view 持有的活 surface；主线程串行更新其尺寸。
         unsafe {
-            ghostty_surface_set_content_scale(s, scale, scale);
-            ghostty_surface_set_size(
-                s,
-                (b.size.width * scale).round() as u32,
-                (b.size.height * scale).round() as u32,
-            );
+            ghostty_surface_set_content_scale(s, x_scale, y_scale);
+            ghostty_surface_set_size(s, px_w, px_h);
             // 主线程同步补一帧（resize 期间渲染线程外的文档化路径）。
             ghostty_surface_draw(s);
         }
@@ -823,13 +851,7 @@ impl SurfaceHostView {
         if !marked.is_empty() {
             // SAFETY: CString 生命周期在调用内。
             if let Ok(c) = std::ffi::CString::new(marked.as_str()) {
-                unsafe {
-                    ghostty_surface_preedit(
-                        s,
-                        c.as_ptr(),
-                        c.as_bytes().len(),
-                    )
-                };
+                unsafe { ghostty_surface_preedit(s, c.as_ptr(), c.as_bytes().len()) };
             }
         } else if clear_if_needed {
             unsafe { ghostty_surface_preedit(s, std::ptr::null(), 0) };
@@ -913,17 +935,106 @@ impl SurfaceHostView {
         false
     }
 
+    /// Ghostty `unfocused-split-opacity`：未聚焦分屏上盖一层半透明填色。
+    /// `dim=false` 或 overlay alpha≈0 则隐藏。叠在 Metal / 插件层之上、
+    /// 搜索栏之下；hitTest 穿透，点击仍由本面夺焦。
+    pub fn set_unfocused_dim(&self, dim: bool, fill: (u8, u8, u8), overlay_alpha: f64) {
+        let show = dim && overlay_alpha > 0.001;
+        if !show {
+            if let Some(ov) = self.ivars().dim.borrow().as_ref() {
+                ov.setHidden(true);
+            }
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let overlay = {
+            let mut slot = self.ivars().dim.borrow_mut();
+            if slot.is_none() {
+                let ov = DimOverlayView::new(mtm);
+                ov.setFrame(self.bounds());
+                self.addSubview(&ov);
+                *slot = Some(ov);
+            }
+            slot.clone().expect("dim overlay just inserted")
+        };
+        overlay.set_fill(fill);
+        overlay.setHidden(false);
+        overlay.setAlphaValue(overlay_alpha);
+        self.addSubview_positioned_relativeTo(overlay.as_super(), NSWindowOrderingMode::Above, None);
+        if let Some(bar) = self.ivars().search_bar.borrow().as_ref() {
+            self.addSubview_positioned_relativeTo(
+                bar.as_super(),
+                NSWindowOrderingMode::Above,
+                Some(overlay.as_super()),
+            );
+        }
+    }
+
     /// 按绑定动作名执行（Edit 菜单 copy/paste/selectAll 与 q2 菜单镜像项
     /// → ghostty 绑定动作；与键位同一条路径）。
     pub(crate) fn binding_action(&self, name: &str) {
         let Some(s) = self.surface_opt() else { return };
         unsafe {
-            ghostty_surface_binding_action(
-                s,
-                name.as_ptr() as *const std::ffi::c_char,
-                name.len(),
-            )
+            ghostty_surface_binding_action(s, name.as_ptr() as *const std::ffi::c_char, name.len())
         };
+    }
+}
+
+/// 未聚焦分屏变淡层：半透明填色，点击穿透到 `SurfaceHostView`。
+struct DimIvars {
+    rgb: Cell<(u8, u8, u8)>,
+}
+
+define_class!(
+    // SAFETY: NSView 子类化无强约束方法；hitTest 返回空指针 = 点击穿透。
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = DimIvars]
+    struct DimOverlayView;
+
+    impl DimOverlayView {
+        #[unsafe(method(isOpaque))]
+        fn is_opaque(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> *mut NSView {
+            std::ptr::null_mut()
+        }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let (r, g, b) = self.ivars().rgb.get();
+            NSColor::colorWithSRGBRed_green_blue_alpha(
+                f64::from(r) / 255.0,
+                f64::from(g) / 255.0,
+                f64::from(b) / 255.0,
+                1.0,
+            )
+            .set();
+            objc2_app_kit::NSRectFill(self.bounds());
+        }
+    }
+);
+
+impl DimOverlayView {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(DimIvars {
+            rgb: Cell::new((0, 0, 0)),
+        });
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+        // SAFETY: super 的 initWithFrame:；ivars 已就位。
+        let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        view.setHidden(true);
+        view
+    }
+
+    fn set_fill(&self, rgb: (u8, u8, u8)) {
+        self.ivars().rgb.set(rgb);
+        self.setNeedsDisplay(true);
     }
 }
 
@@ -931,4 +1042,3 @@ impl SurfaceHostView {
 pub fn as_responder(v: &SurfaceHostView) -> &NSResponder {
     v.as_super().as_super()
 }
-

@@ -8,8 +8,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObjectProtocol, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSButton, NSColor, NSControlTextEditingDelegate, NSEvent, NSImage, NSTextAlignment, NSTextField,
-    NSTextFieldDelegate, NSView,
+    NSButton, NSColor, NSControlTextEditingDelegate, NSEvent, NSImage, NSTextAlignment,
+    NSTextField, NSTextFieldDelegate, NSView,
 };
 use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString};
 

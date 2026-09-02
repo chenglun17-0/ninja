@@ -40,6 +40,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSAttributedString",
     "NSUserDefaults",
     "NSNotification",
+    "NSError",
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "AppKitDefines",
@@ -109,4 +110,18 @@ objc2-core-foundation = { version = "0.3", features = [
     "CFDictionary",
     "CFNumber",
     "CFData",
+] }
+# Ghostty OSC 桌面通知：UNUserNotificationCenter（空载接线，非 ADE 原语）。
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "bitflags",
+    "UNUserNotificationCenter",
+    "UNNotification",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSettings",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
 ] }

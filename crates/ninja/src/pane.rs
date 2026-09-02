@@ -5,6 +5,7 @@
 //! - 布局：`relayout` 递归按 ratio 切 bounds，叶子 `setFrame` →
 //!   `setFrameSize` → surface_set_size（resize 全链）；
 //! - 分隔条：子 NSView（可拖调 ratio）；
+//! - 未聚焦分屏变淡：Ghostty `unfocused-split-opacity` / `unfocused-split-fill`；
 //! - zoom（⌘⇧Enter）：放大叶占满、其余隐藏**不销毁**
 //!   （surface 数据继续喂不丢、隐藏面 set_occlusion(false) 停画，
 //!   网格冻结在分屏尺寸——还原即正确显示；等价 v1 语义）；
@@ -19,12 +20,14 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{
+    ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
+};
 use objc2_app_kit::{NSEvent, NSFocusRingType, NSResponder, NSView, NSWindowStyleMask};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use serde::{Deserialize, Serialize};
 
-use crate::surface::{as_responder, SurfaceHostView};
+use crate::surface::{SurfaceHostView, as_responder};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "t")]
@@ -179,6 +182,8 @@ pub struct Ivars {
     zoomed: RefCell<Option<Retained<SurfaceHostView>>>,
     title_override: RefCell<Option<String>>,
     last_osc_title: RefCell<Option<String>>,
+    /// 上次聚焦叶（窗口失焦时 first responder 会空，仍按这面不淡）。
+    last_focused: RefCell<Option<Retained<SurfaceHostView>>>,
 }
 
 define_class!(
@@ -284,17 +289,14 @@ impl PaneContainer {
             zoomed: RefCell::new(None),
             title_override: RefCell::new(None),
             last_osc_title: RefCell::new(None),
+            last_focused: RefCell::new(None),
         });
         // SAFETY: super 的 initWithFrame:；ivars 已就位。
-        let view: Retained<PaneContainer> =
-            unsafe { msg_send![super(this), initWithFrame: frame] };
+        let view: Retained<PaneContainer> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.setFocusRingType(NSFocusRingType::None);
         view.setClipsToBounds(true);
         view.addSubview(&first);
-        *view.ivars().tree.borrow_mut() = Some(Node::Leaf {
-            view: first,
-            frame,
-        });
+        *view.ivars().tree.borrow_mut() = Some(Node::Leaf { view: first, frame });
         view.relayout();
         view
     }
@@ -340,7 +342,11 @@ impl PaneContainer {
     }
 
     /// 用会话快照换掉占位叶子并挂 surface。
-    pub fn restore_layout(&self, dump: &LayoutNode, context: ghostty_sys::ghostty_surface_context_e) {
+    pub fn restore_layout(
+        &self,
+        dump: &LayoutNode,
+        context: ghostty_sys::ghostty_surface_context_e,
+    ) {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -416,7 +422,9 @@ impl PaneContainer {
     /// 指定叶子旁插新 pane（ghostty NEW_SPLIT 的 target 即焦点面，
     /// 宿主菜单/钩子可能指定其它叶子）。
     pub fn split_beside(&self, target: &SurfaceHostView, dir: Dir, before: bool) {
-        let Some(mtm) = MainThreadMarker::new() else { return };
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
         self.unzoom();
         if !self.contains(target) {
             return;
@@ -493,13 +501,9 @@ impl PaneContainer {
         // 持引用，先 resign 再释放视图，否则窗口后续事件路径触已释放
         // 对象——p2 实测关 pane/关窗 SEGFAULT 根因，v1 原样保留）。
         if let Some(w) = self.window() {
-            let removing_is_focused =
-                self.focused_leaf().is_some_and(|f| same_view(&f, view));
+            let removing_is_focused = self.focused_leaf().is_some_and(|f| same_view(&f, view));
             if removing_is_focused {
-                let other = self
-                    .leaves()
-                    .into_iter()
-                    .find(|v| !same_view(v, view));
+                let other = self.leaves().into_iter().find(|v| !same_view(v, view));
                 if let Some(o) = other {
                     w.makeFirstResponder(Some(as_responder(&o)));
                 }
@@ -541,7 +545,9 @@ impl PaneContainer {
     /// 焦点方向导航：按叶子 frame 找相邻重叠面上最近的那个（v1 原样）。
     pub fn focus_dir(&self, dir: Dir, forward: bool) {
         self.unzoom();
-        let Some(from) = self.focused_leaf() else { return };
+        let Some(from) = self.focused_leaf() else {
+            return;
+        };
         let Some((_, from_frame)) = self
             .leaves_with_frames()
             .into_iter()
@@ -568,9 +574,13 @@ impl PaneContainer {
                 continue; // 不在同一轴带上的不导航
             }
             let dist = match (dir, forward) {
-                (Dir::Horizontal, true) => f.origin.x - (from_frame.origin.x + from_frame.size.width),
+                (Dir::Horizontal, true) => {
+                    f.origin.x - (from_frame.origin.x + from_frame.size.width)
+                }
                 (Dir::Horizontal, false) => from_frame.origin.x - (f.origin.x + f.size.width),
-                (Dir::Vertical, true) => f.origin.y - (from_frame.origin.y + from_frame.size.height),
+                (Dir::Vertical, true) => {
+                    f.origin.y - (from_frame.origin.y + from_frame.size.height)
+                }
                 (Dir::Vertical, false) => from_frame.origin.y - (f.origin.y + f.size.height),
             };
             if dist < -0.5 {
@@ -594,9 +604,9 @@ impl PaneContainer {
         if leaves.len() < 2 {
             return;
         }
-        let idx = leaves.iter().position(|v| {
-            self.focused_leaf().is_some_and(|f| same_view(v, &f))
-        });
+        let idx = leaves
+            .iter()
+            .position(|v| self.focused_leaf().is_some_and(|f| same_view(v, &f)));
         let next = match (idx, step) {
             (Some(i), 1) => (i + 1) % leaves.len(),
             (Some(i), -1) => (i + leaves.len() - 1) % leaves.len(),
@@ -659,6 +669,7 @@ impl PaneContainer {
                 d.setHidden(false);
             }
             self.relayout();
+            self.refresh_unfocused_dim();
         }
     }
 
@@ -698,7 +709,11 @@ impl PaneContainer {
     pub fn zoom_state_json(&self) -> String {
         let zoomed_pane = self.zoomed_pane_id();
         let mut s = String::from("{\"zoomed\":");
-        s.push_str(if zoomed_pane.is_some() { "true" } else { "false" });
+        s.push_str(if zoomed_pane.is_some() {
+            "true"
+        } else {
+            "false"
+        });
         match zoomed_pane {
             Some(p) => s.push_str(&format!(",\"zoomed_pane\":{p}")),
             None => s.push_str(",\"zoomed_pane\":null"),
@@ -760,6 +775,35 @@ impl PaneContainer {
     fn set_tree_and_layout(&self, tree: Node) {
         *self.ivars().tree.borrow_mut() = Some(tree);
         self.relayout();
+        self.refresh_unfocused_dim();
+    }
+
+    /// 某叶成为 first responder：记下并刷新未聚焦变淡。
+    pub fn note_leaf_focus(&self, view: &SurfaceHostView) {
+        // SAFETY: 同类指针 retain；树里已持有该叶。
+        *self.ivars().last_focused.borrow_mut() = Some(unsafe {
+            Retained::retain(std::ptr::from_ref(view) as *mut SurfaceHostView).expect("view")
+        });
+        self.refresh_unfocused_dim();
+    }
+
+    /// Ghostty `unfocused-split-opacity` / `unfocused-split-fill`：
+    /// 多 pane 时未聚焦叶盖半透明填色。单 pane / 配置 1.0 不盖。
+    pub fn refresh_unfocused_dim(&self) {
+        let split = self.leaf_count() > 1;
+        let focused = self.focused_leaf().or_else(|| {
+            self.ivars()
+                .last_focused
+                .borrow()
+                .as_ref()
+                .filter(|v| self.contains(v))
+                .cloned()
+        });
+        let (fill, overlay_alpha) = unfocused_dim_params();
+        for v in self.leaves() {
+            let dim = split && focused.as_ref().is_none_or(|f| !same_view(f, &v));
+            v.set_unfocused_dim(dim, fill, overlay_alpha);
+        }
     }
 
     fn leaves_with_frames(&self) -> Vec<(Retained<SurfaceHostView>, NSRect)> {
@@ -781,7 +825,7 @@ impl PaneContainer {
         {
             let mut tree = self.ivars().tree.borrow_mut();
             if let Some(node) = tree.as_mut() {
-                layout_node(node, bounds, &self.ivars().dividers, zoomed_ptr);
+                layout_node(node, bounds, &self.ivars().dividers, zoomed_ptr, self);
             }
         }
     }
@@ -847,14 +891,13 @@ impl PaneContainer {
                 return;
             }
             let delta = amount_px / axis_len;
-            let new_ratio = (ratio + if positive { delta } else { -delta })
-                .clamp(RATIO_MIN, RATIO_MAX);
+            let new_ratio =
+                (ratio + if positive { delta } else { -delta }).clamp(RATIO_MIN, RATIO_MAX);
             set_node_ratio(node, id, new_ratio);
             drop(tree);
             self.relayout();
         }
     }
-
 }
 
 /// RESIZE_SPLIT 方向（ghostty_action_resize_split_direction_e 的 Rust 面）。
@@ -867,10 +910,27 @@ pub enum ResizeDir {
 }
 
 fn same_view(a: &SurfaceHostView, b: &SurfaceHostView) -> bool {
-    std::ptr::eq(
-        a as *const SurfaceHostView,
-        b as *const SurfaceHostView,
-    )
+    std::ptr::eq(a as *const SurfaceHostView, b as *const SurfaceHostView)
+}
+
+/// Ghostty：配置值是「未聚焦分屏自身不透明度」，盖层 alpha = 1 - 该值。
+/// 配置 finalize 夹到 `[0.15, 1]`；缺省 0.7 → 盖层 0.3。设 1 关闭变淡。
+pub(crate) fn unfocused_overlay_alpha(split_opacity: f64) -> f64 {
+    1.0 - split_opacity.clamp(0.15, 1.0)
+}
+
+fn unfocused_dim_params() -> ((u8, u8, u8), f64) {
+    let Some(cfg) = crate::host::config() else {
+        return (
+            crate::config::GHOSTTY_DEFAULT_BACKGROUND,
+            unfocused_overlay_alpha(0.7),
+        );
+    };
+    let opacity = crate::config::get_f64(cfg, "unfocused-split-opacity").unwrap_or(0.7);
+    let fill = crate::config::get_color(cfg, "unfocused-split-fill")
+        .or_else(|| crate::config::get_color(cfg, "background"))
+        .unwrap_or(crate::config::GHOSTTY_DEFAULT_BACKGROUND);
+    (fill, unfocused_overlay_alpha(opacity))
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,15 +1064,22 @@ fn node_leaf_frame(node: Option<&Node>, view: &SurfaceHostView) -> Option<NSRect
                 None
             }
         }
-        Some(Node::Split { first, second, .. }) => node_leaf_frame(Some(first), view)
-            .or_else(|| node_leaf_frame(Some(second), view)),
+        Some(Node::Split { first, second, .. }) => {
+            node_leaf_frame(Some(first), view).or_else(|| node_leaf_frame(Some(second), view))
+        }
         None => None,
     }
 }
 
 fn node_split_frame(node: Option<&Node>, id: u64) -> Option<NSRect> {
     match node {
-        Some(Node::Split { id: sid, frame, first, second, .. }) => {
+        Some(Node::Split {
+            id: sid,
+            frame,
+            first,
+            second,
+            ..
+        }) => {
             if *sid == id {
                 Some(*frame)
             } else {
@@ -1026,7 +1093,13 @@ fn node_split_frame(node: Option<&Node>, id: u64) -> Option<NSRect> {
 fn set_node_ratio(node: &mut Node, id: u64, ratio: f64) -> bool {
     match node {
         Node::Leaf { .. } => false,
-        Node::Split { id: sid, ratio: r, first, second, .. } => {
+        Node::Split {
+            id: sid,
+            ratio: r,
+            first,
+            second,
+            ..
+        } => {
             if *sid == id {
                 *r = ratio;
                 true
@@ -1040,7 +1113,12 @@ fn set_node_ratio(node: &mut Node, id: u64, ratio: f64) -> bool {
 fn set_all_ratios(node: &mut Node, ratio: f64) {
     match node {
         Node::Leaf { .. } => {}
-        Node::Split { ratio: r, first, second, .. } => {
+        Node::Split {
+            ratio: r,
+            first,
+            second,
+            ..
+        } => {
             *r = ratio;
             set_all_ratios(first, ratio);
             set_all_ratios(second, ratio);
@@ -1057,14 +1135,25 @@ fn find_ancestor_split(
     match node {
         // 叶子无祖先 split 可调（containment 由父 Split 预判）。
         Node::Leaf { .. } => None,
-        Node::Split { dir: d, id, ratio, first, second, frame } => {
+        Node::Split {
+            dir: d,
+            id,
+            ratio,
+            first,
+            second,
+            frame,
+        } => {
             let in_first = node_contains(Some(first), target);
             let in_second = node_contains(Some(second), target);
             if !in_first && !in_second {
                 return None;
             }
             // 先问更近的祖先（子树深处优先）。
-            let child = if in_first { first.as_mut() } else { second.as_mut() };
+            let child = if in_first {
+                first.as_mut()
+            } else {
+                second.as_mut()
+            };
             if let Some(found) = find_ancestor_split(child, target, dir) {
                 return Some(found);
             }
@@ -1076,12 +1165,29 @@ fn find_ancestor_split(
     }
 }
 
+/// 把容器坐标系里的 rect 对齐到物理像素，避免 CA 二次缩放把字画糊。
+fn snap_to_backing(host: &NSView, rect: NSRect) -> NSRect {
+    let b = host.convertRectToBacking(rect);
+    host.convertRectFromBacking(NSRect {
+        origin: NSPoint {
+            x: b.origin.x.round(),
+            y: b.origin.y.round(),
+        },
+        size: NSSize {
+            width: b.size.width.round().max(0.0),
+            height: b.size.height.round().max(0.0),
+        },
+    })
+}
+
 fn layout_node(
     node: &mut Node,
     rect: NSRect,
     dividers: &RefCell<HashMap<u64, Retained<DividerView>>>,
     zoomed: Option<*const SurfaceHostView>,
+    host: &NSView,
 ) {
+    let rect = snap_to_backing(host, rect);
     match node {
         Node::Leaf { view, frame } => {
             if let Some(z) = zoomed {
@@ -1100,24 +1206,32 @@ fn layout_node(
             }
             *frame = rect;
         }
-        Node::Split { dir, id, ratio, first, second, frame } => {
+        Node::Split {
+            dir,
+            id,
+            ratio,
+            first,
+            second,
+            frame,
+        } => {
             *frame = rect;
             if zoomed.is_some() {
                 // 放大态：不切分——两侧子树都拿整 rect，放大叶子落到整窗
                 // bounds，隐藏叶子自行跳过；分隔条已隐藏，几何冻结。
-                layout_node(first, rect, dividers, zoomed);
-                layout_node(second, rect, dividers, zoomed);
+                layout_node(first, rect, dividers, zoomed, host);
+                layout_node(second, rect, dividers, zoomed, host);
                 return;
             }
             let (ra, rb, rdiv) = split_rects(rect, *dir, *ratio);
+            let rdiv = snap_to_backing(host, rdiv);
             let divider_view = dividers.borrow().get(id).cloned();
             if let Some(d) = divider_view
                 && d.frame() != rdiv
             {
                 d.setFrame(rdiv);
             }
-            layout_node(first, ra, dividers, zoomed);
-            layout_node(second, rb, dividers, zoomed);
+            layout_node(first, ra, dividers, zoomed, host);
+            layout_node(second, rb, dividers, zoomed, host);
         }
     }
 }
@@ -1150,11 +1264,7 @@ fn insert_beside(
             unreachable!("just matched Leaf");
         };
         let (first_view, first_frame, second_view) = if before {
-            (
-                new_view.clone(),
-                NSRect::ZERO,
-                old_view,
-            )
+            (new_view.clone(), NSRect::ZERO, old_view)
         } else {
             (old_view, old_frame, new_view.clone())
         };
@@ -1198,28 +1308,33 @@ fn remove_leaf(node: Node, target: &SurfaceHostView, dropped: &mut Vec<u64>) -> 
                 })
             }
         }
-        Node::Split { id, first, second, dir, ratio, .. } => {
-            match remove_leaf(*first, target, dropped) {
+        Node::Split {
+            id,
+            first,
+            second,
+            dir,
+            ratio,
+            ..
+        } => match remove_leaf(*first, target, dropped) {
+            None => {
+                dropped.push(id);
+                Some(*second)
+            }
+            Some(f) => match remove_leaf(*second, target, dropped) {
                 None => {
                     dropped.push(id);
-                    Some(*second)
+                    Some(f)
                 }
-                Some(f) => match remove_leaf(*second, target, dropped) {
-                    None => {
-                        dropped.push(id);
-                        Some(f)
-                    }
-                    Some(s) => Some(Node::Split {
-                        dir,
-                        id,
-                        ratio,
-                        first: Box::new(f),
-                        second: Box::new(s),
-                        frame: NSRect::ZERO,
-                    }),
-                },
-            }
-        }
+                Some(s) => Some(Node::Split {
+                    dir,
+                    id,
+                    ratio,
+                    first: Box::new(f),
+                    second: Box::new(s),
+                    frame: NSRect::ZERO,
+                }),
+            },
+        },
     }
 }
 
@@ -1358,7 +1473,10 @@ mod tests {
     fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
         NSRect {
             origin: NSPoint { x, y },
-            size: NSSize { width: w, height: h },
+            size: NSSize {
+                width: w,
+                height: h,
+            },
         }
     }
 
@@ -1434,5 +1552,15 @@ mod tests {
                 assert!((0.14..=0.86).contains(&frac), "frac={frac}");
             }
         }
+    }
+
+    #[test]
+    fn unfocused_overlay_alpha_matches_ghostty() {
+        // 配置是分屏自身不透明度；盖层 = 1 - 该值。1 = 关闭变淡。
+        assert!((super::unfocused_overlay_alpha(0.7) - 0.3).abs() < 1e-9);
+        assert!((super::unfocused_overlay_alpha(1.0) - 0.0).abs() < 1e-9);
+        assert!((super::unfocused_overlay_alpha(0.15) - 0.85).abs() < 1e-9);
+        assert_eq!(super::unfocused_overlay_alpha(0.0), super::unfocused_overlay_alpha(0.15));
+        assert_eq!(super::unfocused_overlay_alpha(2.0), 0.0);
     }
 }
