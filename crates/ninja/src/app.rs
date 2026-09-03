@@ -265,7 +265,7 @@ define_class!(
                     crate::session::save();
                 }
                 if let Some(content) = w.contentView() {
-                    shell::window_closed(&content);
+                    shell::window_closed(w, &content);
                 }
                 // close 完成后延迟释放登记的强引用（现在放会把窗口拆在
                 // 它自己的 close 调用栈里）。

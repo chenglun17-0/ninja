@@ -378,6 +378,30 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     next_handle: 1,
 });
 
+/// 关层时 PluginHost 锁正被握手占着：先记下，泵排干时补发 `layer.close`。
+static PENDING_CLOSES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// 通知插件层已关。拿不到宿主锁就入队，避免插件仍以为层活着。
+pub(crate) fn notify_layer_closed(conn: u64, handle: u64) {
+    if let Some(host) = take_dispatcher()
+        && let Ok(mut h) = host.try_lock()
+    {
+        let _ = h.send_layer_close(conn, handle);
+        return;
+    }
+    if let Ok(mut q) = PENDING_CLOSES.lock() {
+        q.push((conn, handle));
+    }
+}
+
+pub(crate) fn take_pending_layer_closes() -> Vec<(u64, u64)> {
+    PENDING_CLOSES
+        .lock()
+        .ok()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}
+
 /// present：IOSurface 像素 → CGImage（LayerView 的 drawRect 画进
 /// layer-backed 内容）。
 ///
@@ -885,6 +909,13 @@ pub(crate) fn layer_post_msg(handle: u64, name: &str, body: &str) {
     let Some(web) = e.web.as_ref() else {
         return; // 像素层：不透明邮箱不适用
     };
+    if web.window().is_none() {
+        let conn = e.conn;
+        drop(reg);
+        layer_close(handle);
+        notify_layer_closed(conn, handle);
+        return;
+    }
     let payload = serde_json::json!({ "name": name, "body": body });
     let js = format!(
         "(function(){{var d={payload};window.dispatchEvent(new CustomEvent('layer-msg',{{detail:d}}));}})();"
@@ -924,39 +955,40 @@ fn parse_script_msg_body(obj: &AnyObject) -> (String, String) {
     (name, body)
 }
 
-/// 插件层标签 windowWillClose：收层并通知插件（不再 performClose）。
-pub fn layer_tab_closed(content: &NSView) {
-    let handle = if content.class() == LayerWebView::class() {
-        let view: &LayerWebView = unsafe { &*std::ptr::from_ref(content).cast() };
-        view.ivars().handle.get()
-    } else if content.class() == LayerView::class() {
-        let view: &LayerView = unsafe { &*std::ptr::from_ref(content).cast() };
-        view.ivars().handle.get()
-    } else {
+/// 插件层标签 windowWillClose：按窗对上并通知插件（不再 performClose）。
+/// contentView 不一定是层视图本身（标题栏采样会改树），所以先用窗口指针。
+pub fn layer_tab_closed(window: &NSWindow, content: &NSView) {
+    let found = {
+        let Ok(reg) = REGISTRY.lock() else {
+            return;
+        };
+        if let Some(e) = reg.layers.iter().find(|e| {
+            e.tab_window
+                .as_ref()
+                .is_some_and(|w| std::ptr::eq(&**w, window))
+        }) {
+            Some((e.handle, e.conn))
+        } else if content.isKindOfClass(LayerWebView::class()) {
+            let view: &LayerWebView = unsafe { &*std::ptr::from_ref(content).cast() };
+            Some((view.ivars().handle.get(), view.ivars().conn.get()))
+        } else if content.isKindOfClass(LayerView::class()) {
+            let view: &LayerView = unsafe { &*std::ptr::from_ref(content).cast() };
+            Some((view.ivars().handle.get(), view.ivars().conn.get()))
+        } else {
+            None
+        }
+    };
+    let Some((handle, conn)) = found else {
         return;
     };
     if handle == 0 {
         return;
     }
+    eprintln!("ninja: layer tab closed handle={handle}");
     CLOSING_LAYER_TAB.set(true);
-    let conn = {
-        let Ok(reg) = REGISTRY.lock() else {
-            CLOSING_LAYER_TAB.set(false);
-            return;
-        };
-        reg.layers
-            .iter()
-            .find(|e| e.handle == handle)
-            .map(|e| e.conn)
-    };
     layer_close(handle);
     CLOSING_LAYER_TAB.set(false);
-    if let Some(conn) = conn
-        && let Some(host) = take_dispatcher()
-        && let Ok(mut h) = host.try_lock()
-    {
-        let _ = h.send_layer_close(conn, handle);
-    }
+    notify_layer_closed(conn, handle);
 }
 
 /// present：插件画完本帧——重设 contents（nil→surface）强制 CA 重采样

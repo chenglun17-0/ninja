@@ -104,7 +104,8 @@ use classify::{file_url_to_fs_path, overlay_rect};
 pub use layer::{LayerGeom, layer_tab_closed};
 pub(crate) use layer::{
     layer_close, layer_close_all, layer_close_by_conn, layer_close_pane, layer_foreground,
-    layer_load_html, layer_open, layer_post_msg, layer_present,
+    layer_load_html, layer_open, layer_post_msg, layer_present, notify_layer_closed,
+    take_pending_layer_closes,
 };
 
 use std::io::{Read, Write};
@@ -115,8 +116,8 @@ use std::time::{Duration, Instant};
 
 use ninja_protocol::frame::{FrameDecoder, encode_frame};
 use ninja_protocol::{
-    Hit, HitKind, InputHotkey, InputHotkeyDenied, InputHotkeyGranted, InputKey, LayerClose,
-    Message, Modifier, PaneInfo, PaneInput, PaneSnapshot, Surface, ThemeSet,
+    Hit, HitKind, InputHotkey, InputHotkeyDenied, InputHotkeyGranted, InputKey, LayerClose, LayerOpen, Message, Modifier, PaneInfo, PaneInput, PaneSnapshot, Surface,
+    ThemeSet,
 };
 
 use objc2::rc::Retained;
@@ -1052,6 +1053,12 @@ impl PluginHost {
                 layer_close(m.layer);
                 HandshakeStep::Continue
             }
+            Ok(Some(Message::LayerMsg(m))) => {
+                // 同路径已开：插件发 goto 而不是再 open。结束握手，
+                // 别空等 1.5s 的 layer.open。
+                layer_post_msg(m.layer, &m.name, &m.body);
+                HandshakeStep::Presented
+            }
             Ok(Some(other)) => {
                 // 握手期也可推色板/热键（认领型插件顺带换色）。
                 self.handle_async_message(&other, conn_id);
@@ -1061,9 +1068,26 @@ impl PluginHost {
         }
     }
 
-    /// 回执/握手窗口外的插件消息（泵与回执窗口共用）：theme.set 应用、
-    /// input.hotkey 授予/拒绝、layer.close 摘层；其余（spawn.*：协议面
-    /// 保留，宿主不接线）记 debug 忽略。
+    /// 握手窗外到达的 `layer.open`（关层通知晚到时插件会再 open）。
+    fn open_layer_async(&mut self, m: &LayerOpen, conn_id: u64) {
+        let Some(view) = crate::host::current_surface_view() else {
+            ade_debug("layer.open：无焦点面，忽略");
+            return;
+        };
+        let Some(geom) = collect_geom(&view) else {
+            ade_debug("layer.open：无几何，忽略");
+            return;
+        };
+        match layer_open(&geom, m, conn_id) {
+            Some(ready) => {
+                let _ = self.send_message(conn_id, &Message::LayerReady(ready));
+            }
+            None => {
+                let _ = self.send_message(conn_id, &Message::LayerClose(LayerClose::new(0)));
+            }
+        }
+    }
+
     fn handle_async_message(&mut self, msg: &Message, conn_id: u64) {
         match msg {
             Message::ThemeSet(m) => handle_theme_set(m, conn_id),
@@ -1078,6 +1102,7 @@ impl PluginHost {
             Message::LayerClose(m) => {
                 layer_close(m.layer);
             }
+            Message::LayerOpen(m) => self.open_layer_async(m, conn_id),
             Message::LayerHtml(m) => layer_load_html(m.layer, &m.html),
             Message::LayerMsg(m) => layer_post_msg(m.layer, &m.name, &m.body),
             Message::SpawnRequest(m) => {
@@ -1130,6 +1155,9 @@ impl PluginHost {
     /// 泵：层打开/主题覆盖期间轮询所有连接，消化插件异步消息
     /// （present 重合成 / close 摘层 / EOF 收层）。主 runloop timer 调用。
     pub fn pump_plugins(&mut self) {
+        for (conn, handle) in take_pending_layer_closes() {
+            let _ = self.send_layer_close(conn, handle);
+        }
         self.pump_accept();
         let mut buf = [0u8; 8192];
         let mut i = 0;
@@ -1600,11 +1628,7 @@ pub fn toggle_plugin(name: &str, on: bool) -> bool {
 /// `layer.close`。PRODUCT：「任何插件层都能立刻关掉」。
 pub fn host_close_layers_of_pane(pane: u32) {
     for (handle, conn) in layer_close_pane(pane) {
-        if let Some(host) = take_dispatcher()
-            && let Ok(mut h) = host.try_lock()
-        {
-            let _ = h.send_layer_close(conn, handle);
-        }
+        notify_layer_closed(conn, handle);
     }
 }
 
@@ -1901,7 +1925,7 @@ impl PluginHost {
     }
 
     /// send_layer_close（host_close_layers_of_pane 的公开包装）。
-    fn send_layer_close(&mut self, conn_id: u64, handle: u64) -> std::io::Result<()> {
+    pub(crate) fn send_layer_close(&mut self, conn_id: u64, handle: u64) -> std::io::Result<()> {
         self.send_message(conn_id, &Message::LayerClose(LayerClose::new(handle)))
     }
 }

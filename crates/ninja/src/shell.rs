@@ -875,8 +875,8 @@ pub fn shutdown_all_windows(mtm: MainThreadMarker) {
 }
 
 /// windowWillClose：单窗收尾（contentView 的 pane 容器，全叶延迟 free）。
-pub fn window_closed(content: &objc2_app_kit::NSView) {
-    crate::plugins::layer_tab_closed(content);
+pub fn window_closed(window: &NSWindow, content: &objc2_app_kit::NSView) {
+    crate::plugins::layer_tab_closed(window, content);
     if !crate::pane::is_container(content) {
         return;
     }
