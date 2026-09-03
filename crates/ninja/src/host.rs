@@ -20,6 +20,7 @@ use objc2_foundation::NSString;
 
 use ghostty_sys::*;
 
+use crate::clipboard;
 use crate::pane;
 use crate::shell;
 use crate::surface::SurfaceHostView;
@@ -970,18 +971,15 @@ unsafe extern "C" fn read_clipboard_cb(
     let Some(surface) = view.surface_opt() else {
         return false;
     };
-    unsafe {
-        let pb = NSPasteboard::generalPasteboard();
-        match pb.stringForType(NSPasteboardTypeString) {
-            None => {
-                ghostty_surface_complete_clipboard_request(surface, c"".as_ptr(), request, false)
-            }
-            Some(s) => {
-                let c = CString::new(s.to_string()).unwrap_or_default();
-                ghostty_surface_complete_clipboard_request(surface, c.as_ptr(), request, true);
-            }
-        }
-    }
+    let pb = NSPasteboard::generalPasteboard();
+    let Some(s) = clipboard::paste_text(&pb) else {
+        // 无文本也无图：performable ⌘V 放行（Ghostty 同款）。
+        return false;
+    };
+    let Ok(c) = CString::new(s) else {
+        return false;
+    };
+    unsafe { ghostty_surface_complete_clipboard_request(surface, c.as_ptr(), request, true) };
     true
 }
 

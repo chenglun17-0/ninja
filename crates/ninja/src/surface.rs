@@ -25,10 +25,12 @@ use std::cell::{Cell, RefCell};
 
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::AnyObject;
+use objc2::runtime::ProtocolObject;
 use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSColor, NSEvent, NSFocusRingType, NSResponder, NSTextInputClient, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSWindowOrderingMode,
+    NSColor, NSDragOperation, NSDraggingInfo, NSEvent, NSFocusRingType, NSPasteboardTypeFileURL,
+    NSPasteboardTypeString, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions,
+    NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSRect, NSSize, NSString,
@@ -37,6 +39,7 @@ use objc2_quartz_core::CATransaction;
 
 use ghostty_sys::*;
 
+use crate::clipboard;
 use crate::host;
 use crate::keymap;
 
@@ -450,6 +453,28 @@ define_class!(
         fn select_all_action(&self, _sender: Option<&AnyObject>) {
             self.binding_action("select_all");
         }
+
+        // Ghostty SurfaceView：string / fileURL 拖进终端，路径或文本 insertText。
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            if clipboard::has_drop_type(&sender.draggingPasteboard()) {
+                NSDragOperation::Copy
+            } else {
+                NSDragOperation::None
+            }
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag_operation(
+            &self,
+            sender: &ProtocolObject<dyn NSDraggingInfo>,
+        ) -> objc2::runtime::Bool {
+            let Some(text) = clipboard::opinionated_text(&sender.draggingPasteboard()) else {
+                return objc2::runtime::Bool::NO;
+            };
+            self.insert_pty_text(&text);
+            objc2::runtime::Bool::YES
+        }
     }
 
     unsafe impl NSTextInputClient for SurfaceHostView {
@@ -642,7 +667,21 @@ impl SurfaceHostView {
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.setFocusRingType(NSFocusRingType::None);
         view.setClipsToBounds(true);
+        let drop_types = NSArray::from_slice(&[unsafe { NSPasteboardTypeString }, unsafe {
+            NSPasteboardTypeFileURL
+        }]);
+        view.registerForDraggedTypes(&drop_types);
         view
+    }
+
+    fn insert_pty_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(s) = self.surface_opt() else {
+            return;
+        };
+        unsafe { ghostty_surface_text(s, text.as_ptr() as *const std::ffi::c_char, text.len()) };
     }
 
     pub fn surface_opt(&self) -> Option<ghostty_surface_t> {
@@ -962,7 +1001,11 @@ impl SurfaceHostView {
         overlay.set_fill(fill);
         overlay.setHidden(false);
         overlay.setAlphaValue(overlay_alpha);
-        self.addSubview_positioned_relativeTo(overlay.as_super(), NSWindowOrderingMode::Above, None);
+        self.addSubview_positioned_relativeTo(
+            overlay.as_super(),
+            NSWindowOrderingMode::Above,
+            None,
+        );
         if let Some(bar) = self.ivars().search_bar.borrow().as_ref() {
             self.addSubview_positioned_relativeTo(
                 bar.as_super(),

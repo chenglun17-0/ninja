@@ -2,6 +2,7 @@
 //! 全量装载与热重载 + ADE 插件系统（[`app::run`]）。
 
 mod app;
+mod clipboard;
 mod config;
 mod host;
 mod keymap;

@@ -1560,7 +1560,10 @@ mod tests {
         assert!((super::unfocused_overlay_alpha(0.7) - 0.3).abs() < 1e-9);
         assert!((super::unfocused_overlay_alpha(1.0) - 0.0).abs() < 1e-9);
         assert!((super::unfocused_overlay_alpha(0.15) - 0.85).abs() < 1e-9);
-        assert_eq!(super::unfocused_overlay_alpha(0.0), super::unfocused_overlay_alpha(0.15));
+        assert_eq!(
+            super::unfocused_overlay_alpha(0.0),
+            super::unfocused_overlay_alpha(0.15)
+        );
         assert_eq!(super::unfocused_overlay_alpha(2.0), 0.0);
     }
 }
